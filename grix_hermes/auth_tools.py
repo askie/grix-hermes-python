@@ -7,10 +7,10 @@ invoked through the tool registry alongside the WS-based grix_invoke.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any, Dict
 
+from .bool_utils import to_bool
 from . import http_client
 
 logger = logging.getLogger(__name__)
@@ -127,7 +127,7 @@ async def _grix_auth_handler(args: dict, **kwargs) -> str:
             result = await http_client.create_api_agent(
                 access_token=_require(params, "access_token"),
                 agent_name=_require(params, "agent_name"),
-                is_main=bool(params.get("is_main", True)),
+                is_main=to_bool(params.get("is_main"), default=True),
                 avatar_url=params.get("avatar_url"),
                 base_url=base_url,
             )
@@ -135,16 +135,16 @@ async def _grix_auth_handler(args: dict, **kwargs) -> str:
             result = await http_client.rotate_api_key(
                 access_token=_require(params, "access_token"),
                 agent_id=_require(params, "agent_id"),
-                is_main=bool(params.get("is_main", True)),
+                is_main=to_bool(params.get("is_main"), default=True),
                 base_url=base_url,
             )
         elif action == "create_or_reuse_agent":
             result = await http_client.create_or_reuse_agent(
                 access_token=_require(params, "access_token"),
                 agent_name=_require(params, "agent_name"),
-                is_main=bool(params.get("is_main", True)),
-                prefer_existing=bool(params.get("prefer_existing", True)),
-                rotate_on_reuse=bool(params.get("rotate_on_reuse", True)),
+                is_main=to_bool(params.get("is_main"), default=True),
+                prefer_existing=to_bool(params.get("prefer_existing"), default=True),
+                rotate_on_reuse=to_bool(params.get("rotate_on_reuse"), default=True),
                 base_url=base_url,
             )
         else:

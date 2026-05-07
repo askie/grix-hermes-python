@@ -6,11 +6,11 @@ Provides the `grix_egg` tool that runs the 7-step agent incubation flow:
 
 from __future__ import annotations
 
-import json
 import logging
 import secrets
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
+from .bool_utils import to_bool
 from .egg_state import (
     StateFile,
     iso_now,
@@ -19,7 +19,6 @@ from .egg_state import (
     record_delivery,
     save_state,
     state_file_path,
-    step_is_done,
 )
 from .egg_state import STEP_NAMES
 from .egg_steps import (
@@ -201,12 +200,13 @@ GRIX_EGG_SCHEMA = {
 
 
 async def _run_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
-    from .egg_steps import _clean, _resolve_hermes_home, _resolve_profile_dir, _resolve_profile_root, _default_install_dir
+    from .egg_steps import _resolve_hermes_home
 
     agent_name = params.get("agent_name", "")
     install_id = params.get("install_id", "") or f"egg-{secrets.token_hex(4)}"
     route = params.get("route", "create_new")
-    resume = bool(params.get("resume", False))
+    resume = to_bool(params.get("resume"), default=False)
+    is_main = to_bool(params.get("is_main"), default=True)
     hermes_home = params.get("hermes_home", "")
     delivery_target = params.get("delivery_target", "")
 
@@ -271,7 +271,7 @@ async def _run_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
         credentials = await step_create(
             state,
             agent_name=agent_name,
-            is_main=params.get("is_main", "true") != "false",
+            is_main=is_main,
             access_token=params.get("access_token", ""),
             email=params.get("email", ""),
             account=params.get("account", ""),
@@ -295,7 +295,7 @@ async def _run_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
             hermes_home=hermes_home,
             profile_name=params.get("profile_name", ""),
             agent_name=agent_name,
-            is_main=params.get("is_main", "true"),
+            is_main="true" if is_main else "false",
             account_id=params.get("account_id", ""),
             allowed_users=params.get("allowed_users", ""),
             allow_all_users=params.get("allow_all_users", ""),
@@ -429,8 +429,11 @@ def _try_send_delivery(state: StateFile, target: str, kind: str, message: str) -
 
 
 def _backup_existing_state(hermes_home: str, state: StateFile) -> str:
+    import os
     import shutil
     from datetime import datetime
+    from .egg_steps import _default_install_dir, _resolve_profile_dir, _resolve_profile_root
+
     profile_dir = _resolve_profile_dir(_resolve_profile_root(hermes_home), state.profile_name)
     install_dir = _default_install_dir(hermes_home)
     candidates = [
@@ -516,7 +519,6 @@ async def _grix_egg_handler(args: dict, **kwargs) -> str:
         install_id = params.get("install_id", "") or f"egg-{secrets.token_hex(4)}"
         route = params.get("route", "create_new")
         hermes_home = _resolve_hermes_home(params.get("hermes_home", ""))
-        dry_state = make_fresh_state(install_id, agent_name, route=route)
         return tool_result({
             "ok": True,
             "dry_run": True,

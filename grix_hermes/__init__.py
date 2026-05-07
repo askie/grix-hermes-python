@@ -69,16 +69,6 @@ def _register_skill_with_metadata(ctx, name: str, skill_md: Path, skill_def: dic
 
     register_skill(name, skill_md, description, **kwargs)
 
-    manager = getattr(ctx, "_manager", None)
-    manifest = getattr(ctx, "manifest", None)
-    plugin_name = getattr(manifest, "name", "")
-    if manager is not None and plugin_name:
-        plugin_skills = getattr(manager, "_plugin_skills", None)
-        if isinstance(plugin_skills, dict):
-            registered = plugin_skills.get(f"{plugin_name}:{name}")
-            if isinstance(registered, dict):
-                registered.update(metadata)
-
 
 def _register_plugin_skills(ctx) -> None:
     skills_root = Path(__file__).resolve().parent / "plugin_skills"
