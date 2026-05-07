@@ -10,53 +10,34 @@ PLUGIN_SKILLS = {
     "grix-admin": {
         "description": "Manage Grix agents, API keys, and categories through Hermes.",
         "tools": ["grix_invoke"],
-        "entrypoints": ["scripts/admin.js"],
     },
     "grix-egg": {
         "description": "Install and wire a Hermes profile to Grix with grix-hermes.",
         "tools": ["grix_egg", "grix_auth", "grix_invoke", "grix_card"],
-        "entrypoints": [
-            "scripts/bootstrap.js",
-            "scripts/bind_local.js",
-            "scripts/install_flow.js",
-            "scripts/patch_profile_config.js",
-            "scripts/start_gateway.js",
-            "scripts/validate_install_context.js",
-            "scripts/verify_acceptance.js",
-        ],
     },
     "grix-group": {
         "description": "Use Grix group operation tools through Hermes.",
         "tools": ["grix_invoke"],
-        "entrypoints": ["scripts/group.js"],
     },
     "grix-query": {
         "description": "Query Grix contacts, sessions, messages, and related read-only data.",
         "tools": ["grix_invoke"],
-        "entrypoints": ["scripts/query.js"],
     },
     "grix-register": {
         "description": "Register, authenticate, create API agents, and hand off Grix credentials.",
         "tools": ["grix_auth", "grix_egg"],
-        "entrypoints": [
-            "scripts/grix_auth.js",
-            "scripts/create_api_agent_and_bind.js",
-        ],
     },
     "grix-update": {
         "description": "Update and maintain the grix-hermes installation.",
-        "tools": [],
-        "entrypoints": ["scripts/grix_update.js"],
+        "tools": ["grix_update"],
     },
     "message-send": {
         "description": "Send Grix messages and cards through Hermes.",
         "tools": ["grix_invoke", "grix_card"],
-        "entrypoints": ["scripts/send.js", "scripts/card-link.js"],
     },
     "message-unsend": {
         "description": "Silently recall Grix messages through Hermes.",
         "tools": ["grix_invoke"],
-        "entrypoints": ["scripts/unsend.js"],
     },
 }
 
@@ -65,7 +46,6 @@ def _skill_metadata(skill_def: dict) -> dict:
     return {
         "tools": list(skill_def["tools"]),
         "tool_names": list(skill_def["tools"]),
-        "entrypoints": list(skill_def["entrypoints"]),
     }
 
 
@@ -135,6 +115,7 @@ def register(ctx):
         ("invoke_tool", "register_invoke_tool"),
         ("auth_tools", "register_auth_tools"),
         ("egg_tool", "register_egg_tool"),
+        ("update_tool", "register_update_tool"),
     ]:
         try:
             _mod = importlib.import_module(f".{_module}", __name__)
