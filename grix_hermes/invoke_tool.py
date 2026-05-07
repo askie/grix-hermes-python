@@ -127,16 +127,29 @@ async def _grix_invoke_handler(args: dict, **kwargs) -> str:
         return tool_error(f"agent_invoke failed: {exc}")
 
 
-def register_invoke_tool() -> None:
-    from tools.registry import registry
+def register_invoke_tool(ctx=None) -> None:
+    _register = ctx.register_tool if ctx else None
+    if _register:
+        _register(
+            name="grix_invoke",
+            toolset="grix",
+            schema=GRIX_INVOKE_SCHEMA,
+            handler=_grix_invoke_handler,
+            check_fn=_check_grix_invoke,
+            is_async=True,
+            description="Unified Grix API: send/delete messages, query contacts, manage groups, admin agents.",
+            emoji="🔗",
+        )
+    else:
+        from tools.registry import registry
 
-    registry.register(
-        name="grix_invoke",
-        toolset="grix",
-        schema=GRIX_INVOKE_SCHEMA,
-        handler=_grix_invoke_handler,
-        check_fn=_check_grix_invoke,
-        is_async=True,
-        description="Unified Grix API: send/delete messages, query contacts, manage groups, admin agents.",
-        emoji="🔗",
-    )
+        registry.register(
+            name="grix_invoke",
+            toolset="grix",
+            schema=GRIX_INVOKE_SCHEMA,
+            handler=_grix_invoke_handler,
+            check_fn=_check_grix_invoke,
+            is_async=True,
+            description="Unified Grix API: send/delete messages, query contacts, manage groups, admin agents.",
+            emoji="🔗",
+        )

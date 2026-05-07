@@ -536,16 +536,29 @@ async def _grix_egg_handler(args: dict, **kwargs) -> str:
         return tool_error(f"egg bootstrap failed: {exc}")
 
 
-def register_egg_tool() -> None:
-    from tools.registry import registry
+def register_egg_tool(ctx=None) -> None:
+    _register = ctx.register_tool if ctx else None
+    if _register:
+        _register(
+            name="grix_egg",
+            toolset="grix",
+            schema=GRIX_EGG_SCHEMA,
+            handler=_grix_egg_handler,
+            check_fn=lambda: True,
+            is_async=True,
+            description="Grix agent incubation: 7-step bootstrap (detect→install→create→bind→soul→gateway→accept) with checkpoint/resume.",
+            emoji="🥚",
+        )
+    else:
+        from tools.registry import registry
 
-    registry.register(
-        name="grix_egg",
-        toolset="grix",
-        schema=GRIX_EGG_SCHEMA,
-        handler=_grix_egg_handler,
-        check_fn=lambda: True,
-        is_async=True,
-        description="Grix agent incubation: 7-step bootstrap (detect→install→create→bind→soul→gateway→accept) with checkpoint/resume.",
-        emoji="🥚",
-    )
+        registry.register(
+            name="grix_egg",
+            toolset="grix",
+            schema=GRIX_EGG_SCHEMA,
+            handler=_grix_egg_handler,
+            check_fn=lambda: True,
+            is_async=True,
+            description="Grix agent incubation: 7-step bootstrap (detect→install→create→bind→soul→gateway→accept) with checkpoint/resume.",
+            emoji="🥚",
+        )

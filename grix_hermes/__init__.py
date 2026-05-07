@@ -1,6 +1,20 @@
 """Grix/aibot protocol platform adapter plugin for Hermes Agent."""
 
+from pathlib import Path
+
 __all__ = ["register"]
+
+
+def _register_plugin_skills(ctx) -> None:
+    skills_root = Path(__file__).resolve().parent / "plugin_skills"
+    skill_defs = {
+        "group-ops": "Use Grix group operation tools through Hermes.",
+        "agent-bootstrap": "Install and wire a Hermes profile to Grix with grix-hermes.",
+    }
+    for skill_name, description in skill_defs.items():
+        skill_md = skills_root / skill_name / "SKILL.md"
+        if skill_md.exists():
+            ctx.register_skill(skill_name, skill_md, description)
 
 
 def register(ctx):
@@ -33,7 +47,9 @@ def register(ctx):
     ]:
         try:
             _mod = importlib.import_module(f".{_module}", __name__)
-            getattr(_mod, _fn_name)()
+            getattr(_mod, _fn_name)(ctx)
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Failed to register %s: %s", _module, exc)
+
+    _register_plugin_skills(ctx)

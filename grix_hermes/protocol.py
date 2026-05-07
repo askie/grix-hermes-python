@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
+from .compat import sanitize_card_action_tag
 from .contract import (
     AIBOT_DEFAULT_CONTRACT_VERSION,
     AIBOT_PROTOCOL_VERSION,
@@ -463,8 +464,6 @@ def _is_card_action_event_type(value: Any) -> bool:
 
 
 def _extract_action_tag(value: Dict[str, Any]) -> str:
-    from gateway.platforms.card_actions import sanitize_card_action_tag
-
     for key in _CARD_ACTION_TAG_KEYS:
         tag = normalize_text(value.get(key))
         if tag:

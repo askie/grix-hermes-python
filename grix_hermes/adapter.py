@@ -17,10 +17,9 @@ from typing import Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
-from gateway.platforms.card_actions import build_card_action_user_text
-from gateway.platforms.hermes_exec_approval import build_exec_approval_message
 from gateway.session import build_session_key
 
+from .compat import build_card_action_user_text, build_exec_approval_message
 from .contract import (
     CMD_EVENT_EDIT,
     CMD_EVENT_MSG,

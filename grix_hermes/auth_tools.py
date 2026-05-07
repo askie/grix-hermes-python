@@ -178,27 +178,49 @@ async def _grix_card_handler(args: dict, **kwargs) -> str:
         return tool_error(str(exc))
 
 
-def register_auth_tools() -> None:
-    from tools.registry import registry
+def register_auth_tools(ctx=None) -> None:
+    _register = ctx.register_tool if ctx else None
+    if _register:
+        _register(
+            name="grix_auth",
+            toolset="grix",
+            schema=GRIX_AUTH_SCHEMA,
+            handler=_grix_auth_handler,
+            check_fn=lambda: True,
+            is_async=True,
+            description="Grix HTTP auth: send email code, register, login, create/rotate agent API keys.",
+            emoji="🔑",
+        )
+        _register(
+            name="grix_card",
+            toolset="grix",
+            schema=GRIX_CARD_SCHEMA,
+            handler=_grix_card_handler,
+            check_fn=lambda: True,
+            is_async=True,
+            description="Generate Grix deep-link cards for conversations, profiles, and install status.",
+            emoji="🃏",
+        )
+    else:
+        from tools.registry import registry
 
-    registry.register(
-        name="grix_auth",
-        toolset="grix",
-        schema=GRIX_AUTH_SCHEMA,
-        handler=_grix_auth_handler,
-        check_fn=lambda: True,
-        is_async=True,
-        description="Grix HTTP auth: send email code, register, login, create/rotate agent API keys.",
-        emoji="🔑",
-    )
-
-    registry.register(
-        name="grix_card",
-        toolset="grix",
-        schema=GRIX_CARD_SCHEMA,
-        handler=_grix_card_handler,
-        check_fn=lambda: True,
-        is_async=True,
-        description="Generate Grix deep-link cards for conversations, profiles, and install status.",
-        emoji="🃏",
-    )
+        registry.register(
+            name="grix_auth",
+            toolset="grix",
+            schema=GRIX_AUTH_SCHEMA,
+            handler=_grix_auth_handler,
+            check_fn=lambda: True,
+            is_async=True,
+            description="Grix HTTP auth: send email code, register, login, create/rotate agent API keys.",
+            emoji="🔑",
+        )
+        registry.register(
+            name="grix_card",
+            toolset="grix",
+            schema=GRIX_CARD_SCHEMA,
+            handler=_grix_card_handler,
+            check_fn=lambda: True,
+            is_async=True,
+            description="Generate Grix deep-link cards for conversations, profiles, and install status.",
+            emoji="🃏",
+        )

@@ -8,6 +8,18 @@ Grix/aibot protocol platform adapter plugin for Hermes Agent.
 pip install grix-hermes
 ```
 
+Or install it as a Hermes plugin:
+
+```bash
+hermes plugins install <git-url-or-owner/repo> --enable
+```
+
+For local development:
+
+```bash
+hermes plugins install file:///absolute/path/to/grix-hermes --enable
+```
+
 ## 获取连接参数
 
 访问 [https://grix.dhf.pub/](https://grix.dhf.pub/)，在 **AI** 标签页中创建一个 **API Agent** 类型的 Agent，即可获得以下三个参数：
@@ -31,13 +43,13 @@ Then enable the plugin in `~/.hermes/config.yaml`:
 ```yaml
 plugins:
   enabled:
-    - grix-platform
+    - grix-hermes
 ```
 
 Or install as a user plugin:
 
 ```bash
-cp -r grix_hermes ~/.hermes/plugins/grix-platform/
+cp -r /absolute/path/to/grix-hermes ~/.hermes/plugins/grix-hermes/
 ```
 
 ## Provided Tools
@@ -48,6 +60,13 @@ cp -r grix_hermes ~/.hermes/plugins/grix-platform/
 | `grix_auth` | HTTP auth: send email code, register, login, create/rotate agent API keys |
 | `grix_card` | Generate Grix deep-link cards for conversations, profiles, and install status |
 | `grix_egg` | Agent incubation: 7-step bootstrap (detect → install → create → bind → soul → gateway → accept) |
+
+## Plugin Skills
+
+After installing the plugin, Hermes can load these namespaced skills:
+
+- `grix-hermes:group-ops` — group creation, member management, mute and speaking controls
+- `grix-hermes:agent-bootstrap` — install, bind, enable, and verify a Grix-backed Hermes profile
 
 ## License
 
