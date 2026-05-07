@@ -8,9 +8,17 @@ Grix/aibot protocol platform adapter plugin for Hermes Agent.
 pip install grix-hermes
 ```
 
+## 获取连接参数
+
+访问 [https://grix.dhf.pub/](https://grix.dhf.pub/)，在 **AI** 标签页中创建一个 **API Agent** 类型的 Agent，即可获得以下三个参数：
+
+- `GRIX_ENDPOINT` — WebSocket 连接地址
+- `GRIX_AGENT_ID` — Agent ID
+- `GRIX_API_KEY` — API Key
+
 ## Setup
 
-Set the following environment variables (or configure via Hermes config):
+将获得的参数配置为环境变量（或通过 Hermes 配置文件设置）：
 
 ```bash
 export GRIX_ENDPOINT=wss://your-grix-endpoint
