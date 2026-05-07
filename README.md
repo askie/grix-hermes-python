@@ -1,6 +1,6 @@
 # grix-hermes
 
-Standard Grix platform plugin for Hermes Agent.
+Grix/aibot protocol platform adapter plugin for [Hermes Agent](https://github.com/nicobailon/hermes-agent).
 
 ## Get Grix credentials
 
@@ -18,14 +18,14 @@ You will get:
 Install and enable it with Hermes:
 
 ```bash
-hermes plugins install <git-url-or-owner/repo> --enable
+hermes plugins install askie/grix-hermes-python --enable
 ```
 
 If you use a Hermes profile, set `HERMES_HOME` to that profile first:
 
 ```bash
 export HERMES_HOME=/Users/you/.hermes/profiles/<profile-name>
-hermes plugins install <git-url-or-owner/repo> --enable
+hermes plugins install askie/grix-hermes-python --enable
 ```
 
 ## Plugin skills
