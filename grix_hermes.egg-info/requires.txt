@@ -1,4 +1,0 @@
-aiohttp>=3.9
-
-[yaml]
-pyyaml>=6.0
