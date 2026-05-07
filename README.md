@@ -28,6 +28,36 @@ export HERMES_HOME=/Users/you/.hermes/profiles/<profile-name>
 hermes plugins install askie/grix-hermes-python --enable
 ```
 
+## Configure credentials
+
+After installing, write the three environment variables into the profile's `.env` file.
+
+**Default profile:**
+
+```bash
+cat >> ~/.hermes/.env <<EOF
+GRIX_ENDPOINT=wss://your-endpoint
+GRIX_AGENT_ID=your-agent-id
+GRIX_API_KEY=your-api-key
+EOF
+```
+
+**Named profile:**
+
+```bash
+cat >> ~/.hermes/profiles/<profile-name>/.env <<EOF
+GRIX_ENDPOINT=wss://your-endpoint
+GRIX_AGENT_ID=your-agent-id
+GRIX_API_KEY=your-api-key
+EOF
+```
+
+Then restart the gateway:
+
+```bash
+hermes gateway restart
+```
+
 ## Plugin skills
 
 After installation, Hermes can load these namespaced skills:
