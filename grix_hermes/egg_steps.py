@@ -29,7 +29,7 @@ from .egg_state import (
 logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "grix-hermes"
-PLUGIN_VERSION = "1.0.3"
+PLUGIN_VERSION = "1.0.4"
 
 PROFILE_NAME_RE = re.compile(r"^(default|[a-z0-9][a-z0-9_-]{0,63})$")
 LLM_KEY_RE = re.compile(r"^(?:.*_)?(?:API_KEY|BASE_URL|MODEL|URL)$")
