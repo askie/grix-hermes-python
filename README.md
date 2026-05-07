@@ -216,8 +216,14 @@ Fix:
 
 After installation, Hermes can load these namespaced skills:
 
-- `grix-hermes:group-ops` - group creation, member management, mute controls, and speaking permissions
-- `grix-hermes:agent-bootstrap` - install, bind, enable, and verify a Grix-backed Hermes profile
+- `grix-hermes:grix-admin` - agent, API key, and category management
+- `grix-hermes:grix-egg` - install, bind, enable, and verify a Grix-backed Hermes profile
+- `grix-hermes:grix-group` - group creation, member management, mute controls, and speaking permissions
+- `grix-hermes:grix-query` - read-only Grix contacts, sessions, and message queries
+- `grix-hermes:grix-register` - Grix auth, registration, API agent creation, and credential handoff
+- `grix-hermes:grix-update` - grix-hermes update and maintenance flow
+- `grix-hermes:message-send` - send Grix messages and cards
+- `grix-hermes:message-unsend` - silently recall Grix messages
 
 ## Recommended install checklist
 

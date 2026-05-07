@@ -1,20 +1,111 @@
 """Grix/aibot protocol platform adapter plugin for Hermes Agent."""
 
+import inspect
 from pathlib import Path
 
 __all__ = ["register"]
 
 
+PLUGIN_SKILLS = {
+    "grix-admin": {
+        "description": "Manage Grix agents, API keys, and categories through Hermes.",
+        "tools": ["grix_invoke"],
+        "entrypoints": ["scripts/admin.js"],
+    },
+    "grix-egg": {
+        "description": "Install and wire a Hermes profile to Grix with grix-hermes.",
+        "tools": ["grix_egg", "grix_auth", "grix_invoke", "grix_card"],
+        "entrypoints": [
+            "scripts/bootstrap.js",
+            "scripts/bind_local.js",
+            "scripts/install_flow.js",
+            "scripts/patch_profile_config.js",
+            "scripts/start_gateway.js",
+            "scripts/validate_install_context.js",
+            "scripts/verify_acceptance.js",
+        ],
+    },
+    "grix-group": {
+        "description": "Use Grix group operation tools through Hermes.",
+        "tools": ["grix_invoke"],
+        "entrypoints": ["scripts/group.js"],
+    },
+    "grix-query": {
+        "description": "Query Grix contacts, sessions, messages, and related read-only data.",
+        "tools": ["grix_invoke"],
+        "entrypoints": ["scripts/query.js"],
+    },
+    "grix-register": {
+        "description": "Register, authenticate, create API agents, and hand off Grix credentials.",
+        "tools": ["grix_auth", "grix_egg"],
+        "entrypoints": [
+            "scripts/grix_auth.js",
+            "scripts/create_api_agent_and_bind.js",
+        ],
+    },
+    "grix-update": {
+        "description": "Update and maintain the grix-hermes installation.",
+        "tools": [],
+        "entrypoints": ["scripts/grix_update.js"],
+    },
+    "message-send": {
+        "description": "Send Grix messages and cards through Hermes.",
+        "tools": ["grix_invoke", "grix_card"],
+        "entrypoints": ["scripts/send.js", "scripts/card-link.js"],
+    },
+    "message-unsend": {
+        "description": "Silently recall Grix messages through Hermes.",
+        "tools": ["grix_invoke"],
+        "entrypoints": ["scripts/unsend.js"],
+    },
+}
+
+
+def _skill_metadata(skill_def: dict) -> dict:
+    return {
+        "tools": list(skill_def["tools"]),
+        "tool_names": list(skill_def["tools"]),
+        "entrypoints": list(skill_def["entrypoints"]),
+    }
+
+
+def _register_skill_with_metadata(ctx, name: str, skill_md: Path, skill_def: dict) -> None:
+    register_skill = ctx.register_skill
+    description = skill_def["description"]
+    metadata = _skill_metadata(skill_def)
+    kwargs = {}
+
+    try:
+        params = inspect.signature(register_skill).parameters
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if accepts_kwargs or "tools" in params:
+            kwargs["tools"] = metadata["tools"]
+        elif "tool_names" in params:
+            kwargs["tool_names"] = metadata["tool_names"]
+        if accepts_kwargs or "metadata" in params:
+            kwargs["metadata"] = metadata
+    except (TypeError, ValueError):
+        pass
+
+    register_skill(name, skill_md, description, **kwargs)
+
+    manager = getattr(ctx, "_manager", None)
+    manifest = getattr(ctx, "manifest", None)
+    plugin_name = getattr(manifest, "name", "")
+    if manager is not None and plugin_name:
+        plugin_skills = getattr(manager, "_plugin_skills", None)
+        if isinstance(plugin_skills, dict):
+            registered = plugin_skills.get(f"{plugin_name}:{name}")
+            if isinstance(registered, dict):
+                registered.update(metadata)
+
+
 def _register_plugin_skills(ctx) -> None:
     skills_root = Path(__file__).resolve().parent / "plugin_skills"
-    skill_defs = {
-        "group-ops": "Use Grix group operation tools through Hermes.",
-        "agent-bootstrap": "Install and wire a Hermes profile to Grix with grix-hermes.",
-    }
-    for skill_name, description in skill_defs.items():
+    for skill_name, skill_def in PLUGIN_SKILLS.items():
         skill_md = skills_root / skill_name / "SKILL.md"
         if skill_md.exists():
-            ctx.register_skill(skill_name, skill_md, description)
+            _register_skill_with_metadata(ctx, skill_name, skill_md, skill_def)
 
 
 def register(ctx):
