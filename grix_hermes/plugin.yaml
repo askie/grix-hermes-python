@@ -1,0 +1,8 @@
+name: grix-platform
+kind: platform
+version: 1.0.0
+description: Grix/aibot protocol adapter for Hermes Agent
+requires_env:
+  - GRIX_ENDPOINT
+  - GRIX_AGENT_ID
+  - GRIX_API_KEY
