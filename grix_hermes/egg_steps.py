@@ -10,9 +10,7 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,7 +27,7 @@ from .egg_state import (
 logger = logging.getLogger(__name__)
 
 PLUGIN_NAME = "grix-hermes"
-PLUGIN_VERSION = "1.0.4"
+PLUGIN_GIT_REPO = "askie/grix-hermes-python"
 
 PROFILE_NAME_RE = re.compile(r"^(default|[a-z0-9][a-z0-9_-]{0,63})$")
 LLM_KEY_RE = re.compile(r"^(?:.*_)?(?:API_KEY|BASE_URL|MODEL|URL)$")
@@ -101,62 +99,33 @@ def _default_install_dir(hermes_home: str) -> str:
     return os.path.join(_resolve_profile_root(hermes_home), "plugins", PLUGIN_NAME)
 
 
-def _plugin_wrapper_manifest() -> str:
-    return (
-        f"name: {PLUGIN_NAME}\n"
-        "kind: platform\n"
-        f"version: {PLUGIN_VERSION}\n"
-        "description: Grix/aibot protocol platform adapter plugin for Hermes Agent\n"
-        "requires_env:\n"
-        "  - GRIX_ENDPOINT\n"
-        "  - GRIX_AGENT_ID\n"
-        "  - GRIX_API_KEY\n"
-    )
-
-
-def _plugin_wrapper_init() -> str:
-    return (
-        '"""Hermes plugin entrypoint wrapper for grix-hermes."""\n\n'
-        "from .grix_hermes import register\n\n"
-        '__all__ = ["register"]\n'
-    )
-
-
-def _write_plugin_wrapper(target: str) -> None:
-    _write_private_file(os.path.join(target, "plugin.yaml"), _plugin_wrapper_manifest())
-    _write_private_file(os.path.join(target, "__init__.py"), _plugin_wrapper_init())
-
-
-def _replace_path(path: str) -> None:
-    if os.path.islink(path) or os.path.isfile(path):
-        os.unlink(path)
-    elif os.path.isdir(path):
-        shutil.rmtree(path)
-
-
-def _link_profile_plugin(profile_dir: str, install_dir: str) -> str:
+def _plugin_installed(profile_dir: str) -> bool:
     target = os.path.join(profile_dir, "plugins", PLUGIN_NAME)
-    source = os.path.abspath(install_dir)
-    if os.path.abspath(target) == source:
-        return target
+    return os.path.isdir(target) and os.path.isfile(os.path.join(target, "plugin.yaml"))
 
-    _ensure_private_dir(os.path.dirname(target))
-    if os.path.lexists(target):
-        if os.path.islink(target) and os.path.abspath(os.readlink(target)) == source:
-            return target
-        if not _is_managed_grix_path(target):
-            raise EggError(
-                "bind", 4,
-                f"目标插件目录已存在且不是受管路径: {target}",
-                "请先清理已有的 grix-hermes 插件目录，或指定不同 profile",
-            )
-        _replace_path(target)
 
-    try:
-        os.symlink(source, target)
-    except OSError:
-        shutil.copytree(source, target)
-    return target
+def _run_plugins_install(hermes_bin: str, profile_name: str, hermes_home: str) -> None:
+    """Install grix-hermes plugin via hermes CLI. Updates if already installed."""
+    profile_root = _resolve_profile_root(hermes_home)
+    env = {"HERMES_HOME": profile_root}
+
+    # Try update first (plugin may already exist in this profile)
+    cmd_prefix = [hermes_bin]
+    if profile_name and profile_name != "default":
+        cmd_prefix += ["--profile", profile_name]
+
+    code, stdout, stderr = _run_command(
+        cmd_prefix + ["plugins", "update", PLUGIN_NAME],
+        env=env, check=False,
+    )
+    if code == 0:
+        return
+
+    # Install from git repo
+    _run_command(
+        cmd_prefix + ["plugins", "install", PLUGIN_GIT_REPO, "--enable"],
+        env=env, check=True, timeout=120,
+    )
 
 
 def _is_valid_profile_name(name: str) -> bool:
@@ -321,41 +290,25 @@ def step_install(
     hermes_home: str = "",
     install_dir: str = "",
     source_dir: str = "",
+    hermes_bin: str = "hermes",
 ) -> None:
     if step_is_done(state, "install"):
         return
 
     hermes_home = _resolve_hermes_home(hermes_home)
-    target = _clean(install_dir) or _default_install_dir(hermes_home)
+    profile_root = _resolve_profile_root(hermes_home)
+    pname = state.profile_name or state.agent_name
+    profile_dir = _resolve_profile_dir(profile_root, pname)
 
-    # If install_dir already exists and looks valid, skip
-    marker = os.path.join(target, "grix_hermes", "__init__.py")
-    if os.path.isfile(marker) and os.path.isfile(os.path.join(target, "plugin.yaml")) and os.path.isfile(os.path.join(target, "__init__.py")):
-        mark_step_done(state, "install", {"install_dir": target, "skipped": "already_installed"})
+    # If plugin already installed and valid, skip
+    if _plugin_installed(profile_dir):
+        mark_step_done(state, "install", {"install_dir": _default_install_dir(hermes_home), "skipped": "already_installed"})
         return
 
-    # Copy from source_dir if provided
-    source = _clean(source_dir)
-    if source and os.path.isdir(source):
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        if os.path.exists(target):
-            shutil.rmtree(target)
-        shutil.copytree(
-            source,
-            target,
-            ignore=shutil.ignore_patterns(".git", ".claude", "dist", "*.egg-info", "__pycache__"),
-        )
-        _write_plugin_wrapper(target)
-    else:
-        # pip install approach
-        os.makedirs(target, exist_ok=True)
-        _run_command(
-            [sys.executable, "-m", "pip", "install", "--target", target, "grix-hermes"],
-            check=False,
-        )
-        _write_plugin_wrapper(target)
+    # Use hermes CLI to install from git repo
+    _run_plugins_install(hermes_bin, pname, hermes_home)
 
-    mark_step_done(state, "install", {"install_dir": target})
+    mark_step_done(state, "install", {"install_dir": _default_install_dir(hermes_home)})
 
 
 # ---------------------------------------------------------------------------
@@ -671,8 +624,7 @@ def step_bind(
     # Patch config.yaml
     config_path = os.path.join(profile_dir, "config.yaml")
     management_policy = _resolve_management_policy(os.path.isdir(profile_dir) and not profile_created, is_main)
-    _patch_config(config_path, inst_dir, management_policy, final_endpoint)
-    linked_plugin_dir = _link_profile_plugin(profile_dir, inst_dir)
+    _patch_config(config_path, management_policy, final_endpoint)
 
     # Inherit LLM keys
     inherited_keys: List[str] = []
@@ -686,7 +638,6 @@ def step_bind(
         "profile_dir": profile_dir,
         "env_path": env_path,
         "config_path": config_path,
-        "plugin_dir": linked_plugin_dir,
         "profile_created": profile_created,
     })
 
@@ -740,7 +691,6 @@ def _resolve_management_policy(profile_exists: bool, is_main: str) -> str:
 
 def _patch_config(
     config_path: str,
-    external_dir: str,
     management_policy: str,
     ws_url: str,
 ) -> None:
@@ -761,15 +711,13 @@ def _patch_config(
         skills = {}
     config["skills"] = skills
 
-    # External dirs — remove stale grix-hermes paths, then add new one
+    # External dirs — clean up stale grix-hermes paths (plugins manage their own)
     ext_dirs = skills.get("external_dirs") or []
     if isinstance(ext_dirs, str):
         ext_dirs = [e.strip() for e in ext_dirs.split(",") if e.strip()]
     if not isinstance(ext_dirs, list):
         ext_dirs = []
     ext_dirs = [e for e in ext_dirs if not _is_managed_grix_path(e)]
-    if external_dir and not _is_managed_grix_path(external_dir) and external_dir not in ext_dirs:
-        ext_dirs.append(external_dir)
     skills["external_dirs"] = ext_dirs
 
     # Management skills

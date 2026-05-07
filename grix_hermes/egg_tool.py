@@ -263,6 +263,7 @@ async def _run_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
             state,
             hermes_home=hermes_home,
             install_dir=params.get("install_dir", ""),
+            hermes_bin=params.get("hermes_bin", "hermes"),
         )
         save_state(sf_path, state)
 
