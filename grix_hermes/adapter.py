@@ -326,6 +326,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._busy_ack_msg_ids: Dict[str, tuple[str, str]] = {}
         self._last_send_at: float = 0.0
         self._send_lock = asyncio.Lock()
+        self._tool_progress_msg_ids: set[str] = set()
 
     def format_message(self, content: str) -> str:
         return content.strip()
@@ -479,6 +480,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._completed_event_results.clear()
         self._completed_stop_results.clear()
         self._completed_event_ids.clear()
+        self._tool_progress_msg_ids.clear()
         await self._safe_release_lock()
         self._mark_disconnected()
 
@@ -553,6 +555,9 @@ class GrixAdapter(BasePlatformAdapter):
                 raw_response=receipt,
                 retryable=False,
             )
+            # Track tool progress messages so edit_message can intercept them.
+            if tp and result.success and result.message_id:
+                self._tool_progress_msg_ids.add(result.message_id)
             if result.message_id and reply_to:
                 _normalized_reply_to = str(reply_to).strip()
                 for _sk, _pe in self._pending_messages.items():
@@ -652,9 +657,11 @@ class GrixAdapter(BasePlatformAdapter):
         finalize: bool = False,
     ) -> SendResult:
         # Tool progress edits should become separate card messages.
-        # Return failure so the gateway falls back to adapter.send()
-        # for each tool call, allowing structured channel_data injection.
-        if detect_tool_progress(content):
+        # Only intercept edits to messages we previously identified as
+        # tool progress (tracked via _tool_progress_msg_ids) to avoid
+        # false positives on regular streaming AI text.
+        if message_id in self._tool_progress_msg_ids:
+            self._tool_progress_msg_ids.discard(message_id)
             return SendResult(success=False, error="tool_progress_card_fallback")
 
         _ = finalize
