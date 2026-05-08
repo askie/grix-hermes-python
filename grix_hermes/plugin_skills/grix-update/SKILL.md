@@ -1,16 +1,19 @@
 ---
 name: grix-update
-description: Update the Python grix-hermes package through the Python grix_update Hermes tool.
+description: Update the grix-hermes plugin via hermes CLI (source install from GitHub).
 ---
 
 # Grix Update
 
-Use the Python Hermes tool `grix_update`.
+Use the Hermes tool `grix_update` to update grix-hermes from source.
+
+The tool runs `hermes plugins update grix-hermes` first; if the plugin is not
+installed, it falls back to `hermes plugins install askie/grix-hermes-python --enable`.
 
 Supported actions:
 
-- `dry_run`
-- `update`
+- `dry_run` — preview the commands without executing
+- `update` — execute the update
 
 Call pattern:
 
@@ -18,5 +21,4 @@ Call pattern:
 grix_update(action="<ACTION>", params={...})
 ```
 
-Run `dry_run` first unless the user explicitly asks to update immediately. The
-default package target is `grix-hermes`.
+Run `dry_run` first unless the user explicitly asks to update immediately.

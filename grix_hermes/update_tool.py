@@ -1,18 +1,18 @@
-"""grix-hermes update tool registration for Hermes Agent."""
+"""grix-hermes update tool — upgrades via hermes plugins update."""
 
 from __future__ import annotations
 
 import os
 import subprocess
-import sys
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
+PLUGIN_NAME = "grix-hermes"
+PLUGIN_GIT_REPO = "askie/grix-hermes-python"
 
 GRIX_UPDATE_SCHEMA = {
     "name": "grix_update",
     "description": (
-        "Update the Python grix-hermes package or preview the update command. "
+        "Update the grix-hermes plugin via hermes CLI. "
         "Use dry_run first when the user only wants to inspect the plan."
     ),
     "parameters": {
@@ -24,19 +24,18 @@ GRIX_UPDATE_SCHEMA = {
                 "enum": ["dry_run", "update"],
                 "default": "dry_run",
             },
-            "package": {
+            "hermes_bin": {
                 "type": "string",
-                "description": "Package spec to upgrade.",
-                "default": "grix-hermes",
+                "description": "Path to hermes CLI binary.",
+                "default": "hermes",
             },
-            "python": {
+            "profile_name": {
                 "type": "string",
-                "description": "Python executable to use. Defaults to the current interpreter.",
+                "description": "Hermes profile name (optional, uses default if empty).",
             },
-            "extra_args": {
-                "type": "array",
-                "description": "Additional pip arguments, such as --index-url.",
-                "items": {"type": "string"},
+            "hermes_home": {
+                "type": "string",
+                "description": "Override HERMES_HOME directory.",
             },
         },
         "required": [],
@@ -48,38 +47,69 @@ def _clean(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _build_command(params: Dict[str, Any]) -> List[str]:
-    python_bin = _clean(params.get("python")) or sys.executable
-    package = _clean(params.get("package")) or "grix-hermes"
-    extra_args = params.get("extra_args") or []
-    if not isinstance(extra_args, list):
-        raise ValueError("extra_args must be a list of strings")
-    return [
-        python_bin,
-        "-m",
-        "pip",
-        "install",
-        "--upgrade",
-        package,
-        *[str(item) for item in extra_args],
+def _expand_home(value: str) -> str:
+    if not value:
+        return value
+    if value == "~":
+        return os.path.expanduser("~")
+    if value.startswith("~/"):
+        return os.path.join(os.path.expanduser("~"), value[2:])
+    return value
+
+
+def _resolve_hermes_home(explicit: str = "") -> str:
+    return os.path.abspath(
+        _expand_home(_clean(explicit) or os.environ.get("HERMES_HOME", "") or "~/.hermes")
+    )
+
+
+def _resolve_profile_root(hermes_home: str) -> str:
+    current = os.path.abspath(hermes_home)
+    while os.path.basename(os.path.dirname(current)) == "profiles":
+        current = os.path.dirname(os.path.dirname(current))
+    return current
+
+
+def _build_cmd_prefix(hermes_bin: str, profile_name: str) -> List[str]:
+    cmd = [hermes_bin]
+    if profile_name and profile_name != "default":
+        cmd += ["--profile", profile_name]
+    return cmd
+
+
+def _build_update_commands(params: Dict[str, Any]) -> Tuple[List[List[str]], Dict[str, str]]:
+    hermes_bin = _clean(params.get("hermes_bin")) or "hermes"
+    profile_name = _clean(params.get("profile_name"))
+    hermes_home = _resolve_hermes_home(params.get("hermes_home"))
+    profile_root = _resolve_profile_root(hermes_home)
+
+    env = {"HERMES_HOME": profile_root}
+    prefix = _build_cmd_prefix(hermes_bin, profile_name)
+
+    commands = [
+        prefix + ["plugins", "update", PLUGIN_NAME],
+        prefix + ["plugins", "install", PLUGIN_GIT_REPO, "--enable"],
     ]
+    return commands, env
 
 
-def _run_command(cmd: List[str]) -> Dict[str, Any]:
+def _run_command(
+    cmd: List[str],
+    *,
+    env: Optional[Dict[str, str]] = None,
+    timeout: int = 120,
+) -> Tuple[int, str, str]:
+    merged_env = dict(os.environ)
+    if env:
+        merged_env.update(env)
     result = subprocess.run(
         cmd,
-        cwd=str(Path.cwd()),
-        env=os.environ.copy(),
-        text=True,
         capture_output=True,
-        check=False,
+        text=True,
+        env=merged_env,
+        timeout=timeout,
     )
-    return {
-        "cmd": cmd,
-        "code": result.returncode,
-        "stdout": result.stdout.strip(),
-        "stderr": result.stderr.strip(),
-    }
+    return result.returncode, result.stdout.strip(), result.stderr.strip()
 
 
 async def _grix_update_handler(args: dict, **kwargs) -> str:
@@ -91,15 +121,40 @@ async def _grix_update_handler(args: dict, **kwargs) -> str:
         return tool_error("action must be dry_run or update")
 
     try:
-        cmd = _build_command(params)
-        if action == "dry_run":
-            return tool_result({"ok": True, "dry_run": True, "cmd": cmd})
+        commands, env = _build_update_commands(params)
 
-        result = _run_command(cmd)
+        if action == "dry_run":
+            return tool_result({
+                "ok": True,
+                "dry_run": True,
+                "commands": commands,
+                "env": env,
+                "note": "Will try update first, then install from source if needed.",
+            })
+
+        # Try update first
+        code, stdout, stderr = _run_command(commands[0], env=env)
+        if code == 0:
+            return tool_result({
+                "ok": True,
+                "dry_run": False,
+                "method": "update",
+                "cmd": commands[0],
+                "code": code,
+                "stdout": stdout,
+                "stderr": stderr,
+            })
+
+        # Fallback: install from GitHub source
+        code2, stdout2, stderr2 = _run_command(commands[1], env=env)
         return tool_result({
-            "ok": result["code"] == 0,
+            "ok": code2 == 0,
             "dry_run": False,
-            **result,
+            "method": "install_from_source",
+            "cmd": commands[1],
+            "code": code2,
+            "stdout": stdout2,
+            "stderr": stderr2,
         })
     except Exception as exc:
         return tool_error(str(exc))
@@ -114,7 +169,7 @@ def register_update_tool(ctx=None) -> None:
         handler=_grix_update_handler,
         check_fn=lambda: True,
         is_async=True,
-        description="Update the Python grix-hermes package with pip.",
+        description="Update grix-hermes plugin via hermes CLI (source install).",
         emoji="UP",
     )
     if _register:
