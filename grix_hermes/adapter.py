@@ -20,6 +20,10 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from gateway.session import build_session_key
 
 from .compat import build_card_action_user_text, build_exec_approval_message
+from .tool_progress_cards import (
+    build_tool_execution_channel_data,
+    detect_tool_progress,
+)
 from .contract import (
     CMD_EVENT_EDIT,
     CMD_EVENT_MSG,
@@ -489,6 +493,18 @@ class GrixAdapter(BasePlatformAdapter):
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
 
+        # Detect tool progress and inject structured channel_data for card display.
+        tp = detect_tool_progress(content)
+        if tp:
+            tool_name, preview = tp
+            if metadata is None:
+                metadata = {}
+            else:
+                metadata = dict(metadata)
+            cd: Dict[str, Any] = dict(metadata.get("channel_data") or {})
+            cd.update(build_tool_execution_channel_data(tool_name, preview))
+            metadata["channel_data"] = cd
+
         await self._enforce_send_rate()
 
         source_hint = self._latest_sources.get(str(chat_id))
@@ -635,6 +651,12 @@ class GrixAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
+        # Tool progress edits should become separate card messages.
+        # Return failure so the gateway falls back to adapter.send()
+        # for each tool call, allowing structured channel_data injection.
+        if detect_tool_progress(content):
+            return SendResult(success=False, error="tool_progress_card_fallback")
+
         _ = finalize
         client = await self._get_ready_client(operation="edit_message")
         if not client:
