@@ -7,9 +7,10 @@ plugin loadable by providing tiny fallbacks for optional helpers.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,25 @@ def build_card_action_user_text(tag: Any, value: Any) -> str:
     return f"[Card action: {normalized_tag}] {rendered}"
 
 
+_DEFAULT_APPROVAL_TIMEOUT_SEC = 300
+_ALLOWED_DECISIONS = ("allow-once", "allow-always", "deny")
+
+
+def _compact_text(value: str, limit: int) -> str:
+    normalized = " ".join(str(value or "").replace("\r\n", "\n").strip().split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(limit - 3, 0)] + "..."
+
+
+def _decision_commands(approval_id: str) -> Dict[str, str]:
+    return {
+        "allow-once": f"/approve {approval_id} allow-once",
+        "allow-always": f"/approve {approval_id} allow-always",
+        "deny": f"/approve {approval_id} deny",
+    }
+
+
 def build_exec_approval_message(
     *,
     approval_id: str,
@@ -81,11 +101,54 @@ def build_exec_approval_message(
             raw_approval_data=raw_approval_data,
         )
 
-    cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
-    text = (
-        "⚠️ Command Approval Required\n\n"
-        f"```\n{cmd_preview}\n```\n\n"
-        f"Reason: {description}\n\n"
-        "Reply `/approve`, `/approve session`, `/approve always`, or `/deny`."
+    normalized_approval_id = str(approval_id or "").strip()
+    normalized_command = str(command or "").replace("\r\n", "\n").strip()
+    normalized_description = str(description or "").replace("\r\n", "\n").strip()
+
+    decisions = list(_ALLOWED_DECISIONS)
+    decision_commands = _decision_commands(normalized_approval_id)
+
+    raw_payload: Dict[str, Any] = (
+        copy.deepcopy(dict(raw_approval_data)) if isinstance(raw_approval_data, Mapping) else {}
     )
-    return ApprovalPromptMessage(content=text)
+    raw_payload["approval_id"] = normalized_approval_id
+    raw_payload["command"] = normalized_command
+    raw_payload["description"] = normalized_description
+    raw_payload["host"] = "hermes"
+    raw_payload["expires_in_seconds"] = _DEFAULT_APPROVAL_TIMEOUT_SEC
+    raw_payload["allowed_decisions"] = list(decisions)
+    raw_payload["decision_commands"] = dict(decision_commands)
+
+    biz_payload: Dict[str, Any] = {
+        "approval_id": normalized_approval_id,
+        "approval_slug": normalized_approval_id,
+        "approval_command_id": normalized_approval_id,
+        "command": normalized_command,
+        "host": "hermes",
+        "allowed_decisions": list(decisions),
+        "decision_commands": dict(decision_commands),
+        "expires_in_seconds": _DEFAULT_APPROVAL_TIMEOUT_SEC,
+    }
+    if normalized_description:
+        biz_payload["warning_text"] = normalized_description
+
+    fallback_lines = [
+        f"[Exec Approval] {_compact_text(normalized_command, 160)} (hermes)",
+        decision_commands["allow-once"],
+    ]
+    if normalized_description:
+        fallback_lines.append(f"Reason: {normalized_description}")
+
+    return ApprovalPromptMessage(
+        content="\n".join(line for line in fallback_lines if line),
+        biz_card={
+            "version": 1,
+            "type": "exec_approval",
+            "payload": biz_payload,
+        },
+        channel_data={
+            "hermes": {
+                "execApprovalPending": raw_payload,
+            }
+        },
+    )
