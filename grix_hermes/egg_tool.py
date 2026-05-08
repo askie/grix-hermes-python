@@ -7,6 +7,7 @@ Provides the `grix_egg` tool that runs the 7-step agent incubation flow:
 from __future__ import annotations
 
 import logging
+import re
 import secrets
 from typing import Any, Dict
 
@@ -23,6 +24,8 @@ from .egg_state import (
 from .egg_state import STEP_NAMES
 from .egg_steps import (
     EggError,
+    _clean,
+    _is_valid_profile_name,
     step_accept,
     step_bind,
     step_create,
@@ -35,6 +38,17 @@ from .egg_steps import (
 from .card_links import build_egg_status_card
 
 logger = logging.getLogger(__name__)
+
+
+def _suggest_profile_slug(agent_name: str, profile_name: str) -> str:
+    raw = _clean(profile_name) or _clean(agent_name)
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    if slug and _is_valid_profile_name(slug):
+        return slug
+    if _clean(agent_name) == "客服":
+        return "kefu"
+    return "use-an-ascii-slug"
 
 GRIX_EGG_SCHEMA = {
     "name": "grix_egg",
@@ -75,7 +89,7 @@ GRIX_EGG_SCHEMA = {
             },
             "profile_name": {
                 "type": "string",
-                "description": "Hermes profile name. Defaults to agent_name.",
+                "description": "Hermes local profile slug. Must match [a-z0-9][a-z0-9_-]{0,63}. Do not pass Chinese directly. The calling LLM should provide a semantically appropriate ASCII slug based on the user's requested agent name, e.g. 客服 -> kefu. If omitted, the tool falls back to agent_name, which may fail validation if not already a legal slug.",
             },
             "hermes_home": {
                 "type": "string",
@@ -209,6 +223,20 @@ async def _run_bootstrap(params: Dict[str, Any]) -> Dict[str, Any]:
     is_main = to_bool(params.get("is_main"), default=True)
     hermes_home = params.get("hermes_home", "")
     delivery_target = params.get("delivery_target", "")
+    explicit_profile_name = _clean(params.get("profile_name", ""))
+
+    if explicit_profile_name and not _is_valid_profile_name(explicit_profile_name):
+        suggested_slug = _suggest_profile_slug(agent_name, explicit_profile_name)
+        return {
+            "ok": False,
+            "step": "detect",
+            "step_number": 1,
+            "reason": f"invalid profile_name: {explicit_profile_name}",
+            "suggestion": f"profile_name must match [a-z0-9][a-z0-9_-]{0,63}. agent_name={agent_name or '<empty>'}; suggested slug example: {suggested_slug}",
+            "install_id": install_id,
+            "state_file": "",
+            "resume_command": "",
+        }
 
     resolved_home = _resolve_hermes_home(hermes_home)
     sf_path = state_file_path(resolved_home, install_id)
@@ -509,6 +537,8 @@ async def _grix_egg_handler(args: dict, **kwargs) -> str:
             "install_id": state.install_id,
             "agent_name": state.agent_name,
             "profile_name": state.profile_name,
+            "profile_name_note": "profile_name must be a legal ASCII slug matching [a-z0-9][a-z0-9_-]{0,63}; the calling LLM should provide a semantically appropriate slug.",
+            "suggested_profile_slug_example": _suggest_profile_slug(state.agent_name, state.profile_name),
             "completed_at": state.completed_at,
             "interaction_status": state.interaction_status,
             "steps": {name: state.steps.get(name, None) and state.steps[name].status or "pending" for name in STEP_NAMES},
@@ -517,6 +547,7 @@ async def _grix_egg_handler(args: dict, **kwargs) -> str:
     if action == "dry_run":
         from .egg_steps import _resolve_hermes_home
         agent_name = params.get("agent_name", "")
+        profile_name = params.get("profile_name", "") or agent_name
         install_id = params.get("install_id", "") or f"egg-{secrets.token_hex(4)}"
         route = params.get("route", "create_new")
         hermes_home = _resolve_hermes_home(params.get("hermes_home", ""))
@@ -525,7 +556,9 @@ async def _grix_egg_handler(args: dict, **kwargs) -> str:
             "dry_run": True,
             "install_id": install_id,
             "agent_name": agent_name,
-            "profile_name": params.get("profile_name", "") or agent_name,
+            "profile_name": profile_name,
+            "profile_name_note": "profile_name must be a legal ASCII slug matching [a-z0-9][a-z0-9_-]{0,63}; the calling LLM should provide a semantically appropriate slug such as kefu for 客服.",
+            "suggested_profile_slug_example": _suggest_profile_slug(agent_name, profile_name),
             "route": route,
             "hermes_home": hermes_home,
             "steps": {name: "pending" for name in STEP_NAMES},

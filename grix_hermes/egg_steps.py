@@ -35,6 +35,17 @@ LLM_CONFIG_KEYS = ["model", "custom_providers", "providers", "fallback_providers
 RESTRICTED_MANAGEMENT_SKILLS = ["grix-admin", "grix-register", "grix-update", "grix-egg"]
 
 
+def _suggest_profile_slug(agent_name: str, profile_name: str) -> str:
+    raw = _clean(profile_name) or _clean(agent_name)
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw.lower()).strip("-")
+    slug = re.sub(r"-+", "-", slug)
+    if slug and _is_valid_profile_name(slug):
+        return slug
+    if _clean(agent_name) == "客服":
+        return "kefu"
+    return "use-an-ascii-slug"
+
+
 def _is_managed_grix_path(candidate: str) -> bool:
     base = os.path.basename(candidate)
     return base.startswith(PLUGIN_NAME) or os.path.isfile(os.path.join(candidate, "grix_hermes", "__init__.py"))
@@ -568,6 +579,13 @@ def step_bind(
     hermes_home = _resolve_hermes_home(hermes_home)
     profile_root = _resolve_profile_root(hermes_home)
     pname = _clean(profile_name) or state.profile_name or _clean(agent_name)
+    if not _is_valid_profile_name(pname):
+        suggested_slug = _suggest_profile_slug(agent_name, pname)
+        raise EggError(
+            "bind", 4,
+            f"invalid profile_name: {pname}",
+            f"profile_name must match [a-z0-9][a-z0-9_-]{0,63}. agent_name={_clean(agent_name) or '<empty>'}; suggested slug example: {suggested_slug}",
+        )
     profile_dir = _resolve_profile_dir(profile_root, pname)
     inst_dir = _clean(install_dir) or _default_install_dir(hermes_home)
     create_result = (state.steps.get("create") or None) and state.steps["create"].result or {}
