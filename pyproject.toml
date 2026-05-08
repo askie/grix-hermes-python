@@ -27,7 +27,7 @@ dependencies = [
 yaml = ["pyyaml>=6.0"]
 
 [project.entry-points."hermes_agent.plugins"]
-grix-hermes = "grix_hermes:register"
+grix-hermes = "grix_hermes"
 
 [tool.setuptools.packages.find]
 include = ["grix_hermes*"]
