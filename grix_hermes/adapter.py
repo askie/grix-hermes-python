@@ -1045,11 +1045,9 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return
 
-        from tools.approval import resolve_gateway_approval_by_id
-
-        session_key = resolve_gateway_approval_by_id(approval_id, approval_choice)
         approval_state = self._approval_state.pop(approval_id, None)
-        if session_key is None:
+        session_key = str((approval_state or {}).get("session_key") or "").strip()
+        if not session_key:
             await self._client.send_local_action_result(
                 action_id=action.action_id,
                 status=STATUS_FAILED,
@@ -1058,10 +1056,21 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return
 
-        if approval_state:
-            paused_chat_id = str(approval_state.get("chat_id") or "").strip()
-            if paused_chat_id:
-                self.resume_typing_for_chat(paused_chat_id)
+        from tools.approval import resolve_gateway_approval
+
+        resolved = resolve_gateway_approval(session_key, approval_choice)
+        if resolved <= 0:
+            await self._client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code=ERR_APPROVAL_NOT_FOUND,
+                error_message="unknown or expired approval id",
+            )
+            return
+
+        paused_chat_id = str((approval_state or {}).get("chat_id") or "").strip()
+        if paused_chat_id:
+            self.resume_typing_for_chat(paused_chat_id)
 
         await self._client.send_local_action_result(
             action_id=action.action_id,
