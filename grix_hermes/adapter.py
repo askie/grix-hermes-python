@@ -1145,7 +1145,7 @@ class GrixAdapter(BasePlatformAdapter):
             self._user_dm_session_ids[sender_key] = str(message.session_id)
             self._user_dm_session_keys[sender_key] = session_key
             if prev_session_id and prev_session_id != str(message.session_id):
-                logger.warning(
+                logger.debug(
                     "[%s] GRIX DM session_id changed for user=%s old_session_id=%s new_session_id=%s old_session_key=%s new_session_key=%s event_id=%s message_id=%s",
                     self.name,
                     sender_key,
