@@ -92,6 +92,8 @@ def register(ctx):
         emoji="🔌",
         pii_safe=False,
         allow_update_command=True,
+        allowed_users_env="GRIX_ALLOWED_USERS",
+        allow_all_env="GRIX_ALLOW_ALL_USERS",
         platform_hint=(
             "You are chatting via the Grix platform. "
             "Grix supports markdown text, interactive cards, message editing, "
