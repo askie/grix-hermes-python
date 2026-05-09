@@ -19,7 +19,7 @@ _TOOL_PROGRESS_RE = re.compile(
     r"([\w][\w\-]*)"        # tool name  (group 1)
     r"\s*"
     r"(?:"
-    r':\s*"([^"]*)"'       # : "preview"  (group 2)
+    r':\s*"(.*)"'          # : "preview"  (group 2, greedy — tolerates inner quotes)
     r"|(\.\.\.+)"           # ...          (group 3)
     r"|\(([^)]*)\)"         # (keys)       (group 4)
     r")"
