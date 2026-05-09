@@ -1434,7 +1434,11 @@ class GrixAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
-        was_active = session_key in self._active_sessions
+        was_active = await self._force_stop_session(
+            source,
+            session_key,
+            reply_to=stop.trigger_message_id or stop.event_id,
+        )
 
         is_duplicate = self._remember_event_id(stop.event_id)
         if is_duplicate:
@@ -1455,16 +1459,7 @@ class GrixAdapter(BasePlatformAdapter):
                 accepted=True,
             )
 
-        event = MessageEvent(
-            text="/stop",
-            message_type=MessageType.COMMAND,
-            source=source,
-            raw_message={**stop.raw, "_grix_kind": "stop"},
-            message_id=stop.trigger_message_id or stop.event_id,
-        )
-
         try:
-            await self.handle_message(event)
             if self._client:
                 await self._complete_stop(
                     event_id=stop.event_id,
@@ -1481,6 +1476,42 @@ class GrixAdapter(BasePlatformAdapter):
                     message=str(exc),
                 )
             raise
+
+    async def _force_stop_session(
+        self,
+        source: Any,
+        session_key: str,
+        *,
+        reply_to: Optional[str] = None,
+    ) -> bool:
+        was_active = session_key in self._active_sessions
+        if not was_active:
+            return False
+
+        await self.cancel_session_processing(
+            session_key,
+            release_guard=True,
+            discard_pending=True,
+        )
+        try:
+            await self.stop_typing(source.chat_id)
+        except Exception:
+            pass
+
+        thread_id = getattr(source, "thread_id", None)
+        thread_meta = {"thread_id": thread_id} if thread_id else None
+        try:
+            await self._send_with_retry(
+                chat_id=source.chat_id,
+                content="⚡ Stopped. You can continue this session.",
+                reply_to=reply_to,
+                metadata=thread_meta,
+            )
+        except Exception as exc:
+            logger.debug("[%s] Failed sending local stop confirmation for %s: %s", self.name, session_key, exc)
+
+        logger.info("[%s] Locally stopped active GRIX session %s", self.name, session_key)
+        return True
 
     def _resolve_stop_source(self, stop: GrixStopEvent):
         source = self._latest_sources.get(stop.session_id)
