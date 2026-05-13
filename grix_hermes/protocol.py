@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import platform
+import socket
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -289,6 +291,12 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     }
     if config.host_version:
         payload["host_version"] = config.host_version
+    payload["host_meta"] = {
+        "hostname": socket.gethostname(),
+        "platform": platform.system().lower(),
+        "arch": platform.machine(),
+        "os_release": platform.release(),
+    }
     return payload
 
 
