@@ -20,6 +20,7 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from gateway.session import build_session_key
 
 from .compat import build_card_action_user_text, build_exec_approval_message
+from .exec_command import parse_exec_command, handle_skills_command
 from .tool_progress_cards import (
     build_tool_execution_channel_data,
     detect_tool_progress,
@@ -1191,6 +1192,38 @@ class GrixAdapter(BasePlatformAdapter):
                 session_key=session_key,
                 session_id=message.session_id,
             )
+
+        # /grix exec interception — handle before normal message routing
+        if message.text:
+            parsed_exec = parse_exec_command(message.text)
+            if parsed_exec is not None:
+                subcommand, exec_args = parsed_exec
+                if subcommand == "stop":
+                    was_active = session_key in self._active_sessions
+                    if was_active:
+                        await self._force_stop_session(
+                            source,
+                            session_key,
+                            reply_to=message.message_id,
+                        )
+                    result_text = "Session stopped." if was_active else "No active session to stop."
+                elif subcommand == "skills":
+                    result_text = handle_skills_command()
+                else:
+                    result_text = f"Unknown exec command: {subcommand}\nSupported: skills, stop"
+
+                if self._client:
+                    await self._client.send_text(
+                        message.session_id,
+                        result_text,
+                        reply_to_message_id=message.message_id,
+                        event_id=message.event_id,
+                    )
+                    await self._complete_event_if_needed(
+                        message.event_id,
+                        status=STATUS_RESPONDED,
+                    )
+                return
 
         if _is_record_only_message(message):
             await self._record_message_without_processing(
