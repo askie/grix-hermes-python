@@ -42,6 +42,7 @@ from .contract import (
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
     LOCAL_ACTION_FILE_LIST,
+    LOCAL_ACTION_GET_SESSION_USAGE,
     STATUS_ALREADY_FINISHED,
     STATUS_FAILED,
     STATUS_OK,
@@ -1022,6 +1023,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_file_list(action)
             return
 
+        if action.action_type == LOCAL_ACTION_GET_SESSION_USAGE:
+            await self._handle_get_session_usage(action)
+            return
+
         if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
             await self._client.send_local_action_result(
                 action_id=action.action_id,
@@ -1101,6 +1106,28 @@ class GrixAdapter(BasePlatformAdapter):
             error_code=result.get("error_code"),
             error_message=result.get("error_msg"),
         )
+
+    async def _handle_get_session_usage(self, action: GrixLocalAction) -> None:
+        from .session_usage import handle_session_usage_action
+
+        if not self._client:
+            return
+        hermes_home = self._resolve_hermes_home()
+        result = handle_session_usage_action(action.params, hermes_home=hermes_home)
+        await self._client.send_local_action_result(
+            action_id=action.action_id,
+            status=result["status"],
+            result=result.get("result"),
+            error_code=result.get("error_code"),
+            error_message=result.get("error_msg"),
+        )
+
+    def _resolve_hermes_home(self) -> str:
+        try:
+            from hermes_constants import get_hermes_home
+            return str(get_hermes_home())
+        except ImportError:
+            return os.path.join(os.path.expanduser("~"), ".hermes")
 
     async def _handle_message_packet(self, payload: Dict[str, Any]) -> None:
         message = normalize_inbound_message(payload)
