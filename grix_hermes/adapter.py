@@ -26,18 +26,19 @@ from .tool_progress_cards import (
     detect_tool_progress,
 )
 from .contract import (
+    CMD_EVENT_CANCEL,
     CMD_EVENT_EDIT,
     CMD_EVENT_MSG,
     CMD_EVENT_REVOKE,
     CMD_EVENT_STOP,
     CMD_LOCAL_ACTION,
+    CMD_QUEUE_CLEAR,
     ERR_APPROVAL_NOT_FOUND,
     ERR_INVALID_LOCAL_ACTION,
     ERR_MISSING_APPROVAL_ID,
     ERR_STOP_HANDLER_FAILED,
     ERR_UNSUPPORTED_DECISION,
     ERR_UNSUPPORTED_LOCAL_ACTION,
-    LOCAL_ACTION_CREATE_FOLDER,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
     LOCAL_ACTION_FILE_LIST,
@@ -51,14 +52,18 @@ from .contract import (
 from .protocol import (
     GrixConnectionConfig,
     GrixEditEvent,
+    GrixEventCancelEvent,
     GrixInboundMessage,
     GrixLocalAction,
+    GrixQueueClearEvent,
     GrixRevokeEvent,
     GrixStopEvent,
     build_connection_config,
     normalize_edit_event,
+    normalize_event_cancel,
     normalize_inbound_message,
     normalize_local_action,
+    normalize_queue_clear,
     normalize_revoke_event,
     normalize_stop_event,
 )
@@ -990,6 +995,10 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._handle_edit_packet(payload)
             elif cmd == CMD_EVENT_REVOKE:
                 await self._handle_revoke_packet(payload)
+            elif cmd == CMD_EVENT_CANCEL:
+                await self._handle_event_cancel_packet(payload)
+            elif cmd == CMD_QUEUE_CLEAR:
+                await self._handle_queue_clear_packet(payload)
             else:
                 logger.debug("[%s] Ignoring unknown GRIX packet %s", self.name, cmd)
         except Exception as exc:
@@ -1011,10 +1020,6 @@ class GrixAdapter(BasePlatformAdapter):
 
         if action.action_type == LOCAL_ACTION_FILE_LIST:
             await self._handle_file_list(action)
-            return
-
-        if action.action_type == LOCAL_ACTION_CREATE_FOLDER:
-            await self._handle_create_folder(action)
             return
 
         if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
@@ -1085,24 +1090,6 @@ class GrixAdapter(BasePlatformAdapter):
         if not self._client:
             return
         result = handle_file_list_action(
-            action.params,
-            resolve_cwd=lambda _sid: None,
-            fallback_dir=real_home_dir(),
-        )
-        await self._client.send_local_action_result(
-            action_id=action.action_id,
-            status=result["status"],
-            result=result.get("result"),
-            error_code=result.get("error_code"),
-            error_message=result.get("error_msg"),
-        )
-
-    async def _handle_create_folder(self, action: GrixLocalAction) -> None:
-        from .create_folder import handle_create_folder_action, real_home_dir
-
-        if not self._client:
-            return
-        result = handle_create_folder_action(
             action.params,
             resolve_cwd=lambda _sid: None,
             fallback_dir=real_home_dir(),
@@ -1458,6 +1445,118 @@ class GrixAdapter(BasePlatformAdapter):
         self._reply_event_ids.pop((revoke.session_id, revoke.message_id), None)
         self._message_sources.pop((revoke.session_id, revoke.message_id), None)
         self._message_session_keys.pop((revoke.session_id, revoke.message_id), None)
+
+    async def _handle_event_cancel_packet(self, payload: Dict[str, Any]) -> None:
+        """处理后端下发的 event_cancel：取消某个进行中的事件并上报结果。"""
+        if not self._client:
+            return
+
+        try:
+            cancel = normalize_event_cancel(payload)
+        except ValueError as exc:
+            logger.warning("[%s] invalid event_cancel payload: %s", self.name, exc)
+            return
+
+        try:
+            source = self._latest_sources.get(cancel.session_id)
+            if source is None:
+                source = self.build_source(chat_id=cancel.session_id, chat_type="dm")
+            session_key = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
+            await self._force_stop_session(
+                source,
+                session_key,
+                reply_to=cancel.event_id,
+            )
+            await self._complete_event_if_needed(
+                cancel.event_id,
+                status=STATUS_FAILED,
+                message="event canceled by user",
+            )
+            await self._client.send_event_cancel_result(
+                event_id=cancel.event_id,
+                accepted=True,
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] event_cancel handler failed for %s: %s",
+                self.name,
+                cancel.event_id,
+                exc,
+                exc_info=True,
+            )
+            try:
+                await self._client.send_event_cancel_result(
+                    event_id=cancel.event_id,
+                    accepted=False,
+                    reason=str(exc),
+                )
+            except Exception:
+                pass
+
+    async def _handle_queue_clear_packet(self, payload: Dict[str, Any]) -> None:
+        """处理后端下发的 queue_clear：清空某会话的待处理队列并上报结果。"""
+        if not self._client:
+            return
+
+        try:
+            clear = normalize_queue_clear(payload)
+        except ValueError as exc:
+            logger.warning("[%s] invalid queue_clear payload: %s", self.name, exc)
+            return
+
+        try:
+            # grix-hermes 是消息适配器，没有显式队列；按本地状态清空所有
+            # 与该 session_id 关联的进行中处理与 pending 事件。
+            # session_key 由 hermes-agent 拼成 "agent:main:<platform>:<chat_type>:<chat_id>[:<extra>]"
+            # 形式，session_id 等于 chat_id，因此用冒号边界限定匹配，避免子串误伤。
+            session_id = clear.session_id
+            mid_marker = f":{session_id}:"
+            end_marker = f":{session_id}"
+
+            def _matches(key: str) -> bool:
+                return mid_marker in key or key.endswith(end_marker)
+
+            session_keys = [key for key in list(self._active_sessions) if _matches(key)]
+            for key in session_keys:
+                source = None
+                pending = self._pending_messages.get(key)
+                if pending is not None and getattr(pending, "source", None):
+                    source = pending.source
+                if source is None:
+                    source = self._latest_sources.get(session_id)
+                if source is None:
+                    source = self.build_source(chat_id=session_id, chat_type="dm")
+                await self._force_stop_session(source, key, reply_to=None)
+
+            # 清掉残留 pending 事件（同样按 session_id 边界匹配）
+            for key in list(self._pending_messages.keys()):
+                if _matches(key):
+                    self._pending_messages.pop(key, None)
+
+            await self._client.send_queue_clear_result(
+                session_id=session_id,
+                success=True,
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] queue_clear handler failed for %s: %s",
+                self.name,
+                clear.session_id,
+                exc,
+                exc_info=True,
+            )
+            try:
+                await self._client.send_queue_clear_result(
+                    session_id=clear.session_id,
+                    success=False,
+                    message=str(exc),
+                )
+            except Exception:
+                pass
 
     async def _handle_stop_packet(self, payload: Dict[str, Any]) -> None:
         stop = normalize_stop_event(payload)

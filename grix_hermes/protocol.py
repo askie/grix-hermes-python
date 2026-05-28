@@ -723,3 +723,43 @@ def normalize_edit_event(payload: Dict[str, Any]) -> GrixEditEvent:
         thread_id=normalize_id(payload.get("thread_id")) or None,
         raw=dict(payload),
     )
+
+
+@dataclass(frozen=True)
+class GrixEventCancelEvent:
+    event_id: str
+    session_id: str
+    raw: Dict[str, Any] = None
+
+
+@dataclass(frozen=True)
+class GrixQueueClearEvent:
+    session_id: str
+    raw: Dict[str, Any] = None
+
+
+def normalize_event_cancel(payload: Dict[str, Any]) -> GrixEventCancelEvent:
+    event_id = normalize_id(payload.get("event_id"))
+    if not event_id:
+        raise ValueError("event_cancel requires event_id")
+
+    session_id = normalize_id(payload.get("session_id"))
+    if not session_id:
+        raise ValueError("event_cancel requires session_id")
+
+    return GrixEventCancelEvent(
+        event_id=event_id,
+        session_id=session_id,
+        raw=dict(payload),
+    )
+
+
+def normalize_queue_clear(payload: Dict[str, Any]) -> GrixQueueClearEvent:
+    session_id = normalize_id(payload.get("session_id"))
+    if not session_id:
+        raise ValueError("queue_clear requires session_id")
+
+    return GrixQueueClearEvent(
+        session_id=session_id,
+        raw=dict(payload),
+    )

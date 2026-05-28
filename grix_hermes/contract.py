@@ -1,7 +1,10 @@
 """Canonical definitions for the standard AIBOT protocol.
 
-This module is the single source of truth for public AIBOT command names,
-status values, error codes, capabilities, and the frozen v1 baseline.
+本模块是 grix-hermes 插件对外公开的 AIBOT 协议命令、能力、状态、错误码、
+以及最小命令面的唯一来源。
+
+字段以后端 Hermes 适配器的实际白名单为准（参见 backend
+internal/ws/protocol/hermes_profile.go 与 internal/ws/agentapi/hermes_contract.go）。
 """
 
 from __future__ import annotations
@@ -11,7 +14,7 @@ from typing import Any, Dict
 AIBOT_PROTOCOL_VERSION = "aibot-agent-api-v1"
 AIBOT_DEFAULT_CONTRACT_VERSION = 1
 
-# Packet commands
+# 报文命令（与后端 hermes 通道完全对齐）
 CMD_AUTH = "auth"
 CMD_AUTH_ACK = "auth_ack"
 CMD_PING = "ping"
@@ -21,7 +24,6 @@ CMD_SEND_ACK = "send_ack"
 CMD_SEND_NACK = "send_nack"
 CMD_ERROR = "error"
 CMD_EDIT_MSG = "edit_msg"
-CMD_DELETE_MSG = "delete_msg"
 CMD_SESSION_ACTIVITY_SET = "session_activity_set"
 CMD_LOCAL_ACTION = "local_action"
 CMD_LOCAL_ACTION_RESULT = "local_action_result"
@@ -37,6 +39,13 @@ CMD_SESSION_ROUTE_BIND = "session_route_bind"
 CMD_SESSION_ROUTE_RESOLVE = "session_route_resolve"
 CMD_AGENT_INVOKE = "agent_invoke"
 CMD_AGENT_INVOKE_RESULT = "agent_invoke_result"
+# 事件生命周期命令（后端新增，APP 端用于事件取消与队列管理）
+CMD_EVENT_CANCEL = "event_cancel"
+CMD_EVENT_CANCEL_RESULT = "event_cancel_result"
+CMD_QUEUE_CLEAR = "queue_clear"
+CMD_QUEUE_CLEAR_RESULT = "queue_clear_result"
+CMD_EVENT_STATE = "event_state"
+CMD_QUEUE_SNAPSHOT = "queue_snapshot"
 
 STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_AUTH, "direction": "client_to_server", "purpose": "authenticate"},
@@ -49,13 +58,18 @@ STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_EVENT_STOP, "direction": "server_to_client", "purpose": "stop_event"},
     {"cmd": CMD_EVENT_STOP_ACK, "direction": "client_to_server", "purpose": "stop_event_received"},
     {"cmd": CMD_EVENT_STOP_RESULT, "direction": "client_to_server", "purpose": "stop_event_completed"},
+    {"cmd": CMD_EVENT_CANCEL, "direction": "server_to_client", "purpose": "cancel_event_request"},
+    {"cmd": CMD_EVENT_CANCEL_RESULT, "direction": "client_to_server", "purpose": "cancel_event_result"},
+    {"cmd": CMD_QUEUE_CLEAR, "direction": "server_to_client", "purpose": "clear_event_queue_request"},
+    {"cmd": CMD_QUEUE_CLEAR_RESULT, "direction": "client_to_server", "purpose": "clear_event_queue_result"},
+    {"cmd": CMD_EVENT_STATE, "direction": "client_to_server", "purpose": "report_event_state"},
+    {"cmd": CMD_QUEUE_SNAPSHOT, "direction": "client_to_server", "purpose": "report_event_queue_snapshot"},
     {"cmd": CMD_EVENT_EDIT, "direction": "server_to_client", "purpose": "message_edit_event"},
     {"cmd": CMD_EVENT_REVOKE, "direction": "server_to_client", "purpose": "message_revoke_event"},
     {"cmd": CMD_SEND_MSG, "direction": "client_to_server", "purpose": "send_message"},
     {"cmd": CMD_SEND_ACK, "direction": "server_to_client", "purpose": "send_succeeded"},
     {"cmd": CMD_SEND_NACK, "direction": "server_to_client", "purpose": "send_failed"},
     {"cmd": CMD_EDIT_MSG, "direction": "client_to_server", "purpose": "edit_message"},
-    {"cmd": CMD_DELETE_MSG, "direction": "client_to_server", "purpose": "delete_message"},
     {
         "cmd": CMD_SESSION_ACTIVITY_SET,
         "direction": "client_to_server",
@@ -82,15 +96,17 @@ STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_ERROR, "direction": "bidirectional", "purpose": "generic_error"},
 )
 
-# Capabilities
+# 能力声明
 CAP_SESSION_ROUTE = "session_route"
 CAP_THREAD_V1 = "thread_v1"
 CAP_INBOUND_MEDIA_V1 = "inbound_media_v1"
 CAP_LOCAL_ACTION_V1 = "local_action_v1"
 CAP_AGENT_INVOKE_V1 = "agent_invoke_v1"
+CAP_STREAM_CHUNK = "stream_chunk"
 
 REQUIRED_AUTH_CAPABILITIES = (CAP_LOCAL_ACTION_V1,)
 STABLE_AUTH_CAPABILITIES = (
+    CAP_STREAM_CHUNK,
     CAP_SESSION_ROUTE,
     CAP_THREAD_V1,
     CAP_INBOUND_MEDIA_V1,
@@ -98,19 +114,17 @@ STABLE_AUTH_CAPABILITIES = (
     CAP_AGENT_INVOKE_V1,
 )
 
-# Local actions
+# 本地动作（与后端 hermesSupportedLocalActions 完全对齐）
 LOCAL_ACTION_EXEC_APPROVE = "exec_approve"
 LOCAL_ACTION_EXEC_REJECT = "exec_reject"
 LOCAL_ACTION_FILE_LIST = "file_list"
-LOCAL_ACTION_CREATE_FOLDER = "create_folder"
 STABLE_LOCAL_ACTIONS = (
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
     LOCAL_ACTION_FILE_LIST,
-    LOCAL_ACTION_CREATE_FOLDER,
 )
 
-# Status values
+# 状态值
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
 STATUS_UNSUPPORTED = "unsupported"
@@ -133,7 +147,7 @@ STABLE_LOCAL_ACTION_RESULT_STATUSES = (
     STATUS_UNSUPPORTED,
 )
 
-# Error codes
+# 错误码
 ERR_INVALID_LOCAL_ACTION = "invalid_local_action"
 ERR_UNSUPPORTED_LOCAL_ACTION = "unsupported_local_action"
 ERR_MISSING_APPROVAL_ID = "missing_approval_id"
@@ -189,11 +203,16 @@ MINIMAL_PLUGIN_SURFACE = (
     CMD_EVENT_STOP,
     CMD_EVENT_STOP_ACK,
     CMD_EVENT_STOP_RESULT,
+    CMD_EVENT_CANCEL,
+    CMD_EVENT_CANCEL_RESULT,
+    CMD_QUEUE_CLEAR,
+    CMD_QUEUE_CLEAR_RESULT,
+    CMD_EVENT_STATE,
+    CMD_QUEUE_SNAPSHOT,
     CMD_SEND_MSG,
     CMD_SEND_ACK,
     CMD_SEND_NACK,
     CMD_EDIT_MSG,
-    CMD_DELETE_MSG,
     CMD_LOCAL_ACTION,
     CMD_LOCAL_ACTION_RESULT,
     CMD_SESSION_ROUTE_BIND,

@@ -9,23 +9,26 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional, Protocol
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol
 
 from .contract import (
     CMD_AGENT_INVOKE,
     CMD_AGENT_INVOKE_RESULT,
     CMD_AUTH,
     CMD_AUTH_ACK,
-    CMD_DELETE_MSG,
     CMD_EDIT_MSG,
     CMD_ERROR,
     CMD_EVENT_ACK,
+    CMD_EVENT_CANCEL_RESULT,
     CMD_EVENT_RESULT,
+    CMD_EVENT_STATE,
     CMD_EVENT_STOP_ACK,
     CMD_EVENT_STOP_RESULT,
     CMD_LOCAL_ACTION_RESULT,
     CMD_PING,
     CMD_PONG,
+    CMD_QUEUE_CLEAR_RESULT,
+    CMD_QUEUE_SNAPSHOT,
     CMD_SEND_ACK,
     CMD_SEND_MSG,
     CMD_SEND_NACK,
@@ -431,31 +434,6 @@ class GrixTransportClient:
             "packet": packet,
         }
 
-    async def delete_message(
-        self,
-        session_id: str,
-        message_id: str,
-        *,
-        timeout_ms: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        packet = await self.request(
-            CMD_DELETE_MSG,
-            {
-                "session_id": session_id.strip(),
-                "msg_id": message_id.strip(),
-            },
-            expected=(CMD_SEND_ACK, CMD_SEND_NACK, CMD_ERROR),
-            timeout_ms=timeout_ms,
-        )
-        if packet["cmd"] != CMD_SEND_ACK:
-            raise self._packet_error(packet)
-        return {
-            "ok": True,
-            "session_id": str(packet["payload"].get("session_id") or session_id).strip(),
-            "message_id": str(packet["payload"].get("msg_id") or message_id).strip(),
-            "packet": packet,
-        }
-
     async def set_session_activity(
         self,
         *,
@@ -577,6 +555,80 @@ class GrixTransportClient:
         if message:
             payload["msg"] = message.strip()
         await self.send_packet(CMD_EVENT_STOP_RESULT, payload)
+
+    async def send_event_cancel_result(
+        self,
+        *,
+        event_id: str,
+        accepted: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """对服务端 event_cancel 请求的回应。
+
+        accepted=True 表示已接受取消；reason 解释拒绝或失败原因。
+        """
+        payload: Dict[str, Any] = {
+            "event_id": event_id.strip(),
+            "accepted": accepted,
+        }
+        if reason:
+            payload["reason"] = reason.strip()
+        await self.send_packet(CMD_EVENT_CANCEL_RESULT, payload)
+
+    async def send_queue_clear_result(
+        self,
+        *,
+        session_id: str,
+        success: bool,
+        message: Optional[str] = None,
+    ) -> None:
+        """对服务端 queue_clear 请求的回应。"""
+        payload: Dict[str, Any] = {
+            "session_id": session_id.strip(),
+            "success": success,
+        }
+        if message:
+            payload["msg"] = message.strip()
+        await self.send_packet(CMD_QUEUE_CLEAR_RESULT, payload)
+
+    async def send_event_state(
+        self,
+        *,
+        event_id: str,
+        session_id: str,
+        state: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """主动上报某个事件的当前状态，由后端透传给 APP 端。"""
+        payload: Dict[str, Any] = {
+            "event_id": event_id.strip(),
+            "session_id": session_id.strip(),
+            "state": state.strip(),
+            "updated_at": _now_ms(),
+        }
+        if extra:
+            payload.update(extra)
+        await self.send_packet(CMD_EVENT_STATE, payload)
+
+    async def send_queue_snapshot(
+        self,
+        *,
+        session_id: str,
+        events: List[Any],
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """主动上报会话事件队列快照，由后端透传给 APP 端。
+
+        events 为本会话当前队列内的事件描述列表，结构由 Agent 自行定义。
+        """
+        payload: Dict[str, Any] = {
+            "session_id": session_id.strip(),
+            "events": list(events),
+            "updated_at": _now_ms(),
+        }
+        if extra:
+            payload.update(extra)
+        await self.send_packet(CMD_QUEUE_SNAPSHOT, payload)
 
     async def bind_session_route(
         self,
