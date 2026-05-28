@@ -707,6 +707,11 @@ class GrixAdapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
     ) -> SendResult:
+        """通过 agent_invoke 通道删除消息。
+
+        Hermes profile 不允许直接发 delete_msg 命令，必须走后端
+        agent_invoke 接口。message-unsend skill 也走这条路径。
+        """
         client = await self._get_ready_client(operation="delete_message")
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
@@ -718,14 +723,17 @@ class GrixAdapter(BasePlatformAdapter):
                 str(chat_id),
                 source_hint=source_hint,
             )
-            receipt = await client.delete_message(
-                str(session_id),
-                str(message_id),
+            result = await client.agent_invoke(
+                action="delete_msg",
+                params={
+                    "session_id": str(session_id),
+                    "msg_id": str(message_id),
+                },
             )
             return SendResult(
-                success=bool(receipt.get("ok")),
-                message_id=receipt.get("message_id"),
-                raw_response=receipt,
+                success=True,
+                message_id=str(message_id),
+                raw_response=result,
                 retryable=False,
             )
         except Exception as exc:

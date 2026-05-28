@@ -114,7 +114,8 @@ STABLE_AUTH_CAPABILITIES = (
     CAP_AGENT_INVOKE_V1,
 )
 
-# 本地动作（与后端 hermesSupportedLocalActions 完全对齐）
+# 本地动作（exec_approve/exec_reject/file_list 与后端 hermesSupportedLocalActions
+# 对齐；get_session_usage 是插件向前声明，等后端把它纳入白名单后即可生效）
 LOCAL_ACTION_EXEC_APPROVE = "exec_approve"
 LOCAL_ACTION_EXEC_REJECT = "exec_reject"
 LOCAL_ACTION_FILE_LIST = "file_list"
