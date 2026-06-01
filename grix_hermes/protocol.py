@@ -122,6 +122,7 @@ class GrixConnectionConfig:
     contract_version: int = DEFAULT_CONTRACT_VERSION
     capabilities: List[str] | tuple[str, ...] = tuple(STABLE_AUTH_CAPABILITIES)
     local_actions: List[str] | tuple[str, ...] = tuple(STABLE_LOCAL_ACTIONS)
+    skills: Optional[List[Dict[str, Any]]] = None
     connect_timeout_ms: int = DEFAULT_CONNECT_TIMEOUT_MS
     request_timeout_ms: int = DEFAULT_REQUEST_TIMEOUT_MS
 
@@ -291,6 +292,8 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     }
     if config.host_version:
         payload["host_version"] = config.host_version
+    if config.skills:
+        payload["skills"] = config.skills
     payload["host_meta"] = {
         "hostname": socket.gethostname(),
         "platform": platform.system().lower(),

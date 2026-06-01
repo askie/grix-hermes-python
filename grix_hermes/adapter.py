@@ -472,7 +472,23 @@ class GrixAdapter(BasePlatformAdapter):
 
         self._mark_connected()
         logger.info("[%s] Connected to %s", self.name, self.connection.endpoint)
+        await self._report_skills()
         return True
+
+    async def _report_skills(self) -> None:
+        """扫描本地 skills 并通过 agent_skills_update 上报给后端。"""
+        try:
+            from .exec_command import scan_hermes_skills
+            entries = scan_hermes_skills()
+            skills = [
+                {"name": s.name, "description": s.description, "source": s.source}
+                for s in entries
+            ]
+            if self._client and skills:
+                await self._client.send_skills_update(skills)
+                logger.info("[%s] Reported %d skill(s)", self.name, len(skills))
+        except Exception as exc:
+            logger.debug("[%s] Skills report failed: %s", self.name, exc)
 
     async def disconnect(self) -> None:
         self._disconnect_requested = True
@@ -1214,6 +1230,19 @@ class GrixAdapter(BasePlatformAdapter):
                 session_key=session_key,
                 session_id=message.session_id,
             )
+
+        # /stop 拦截：后端工具栏停止按钮通过 SendStopText 下发 "/stop" 文本命令
+        if message.text and message.text.strip().lower() == "/stop":
+            was_active = session_key in self._active_sessions
+            if was_active:
+                await self._force_stop_session(
+                    source, session_key, reply_to=message.message_id,
+                )
+            if self._client:
+                await self._complete_event_if_needed(
+                    message.event_id, status=STATUS_RESPONDED,
+                )
+            return
 
         # /grix exec interception — handle before normal message routing
         if message.text:
