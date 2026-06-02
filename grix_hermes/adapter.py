@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import time
+from contextlib import suppress
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -333,6 +334,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._busy_ack_msg_ids: Dict[str, tuple[str, str]] = {}
         self._last_send_at: float = 0.0
         self._send_lock = asyncio.Lock()
+        self._reconnect_lock = asyncio.Lock()
         self._tool_progress_msg_ids: set[str] = set()
 
     def format_message(self, content: str) -> str:
@@ -381,6 +383,13 @@ class GrixAdapter(BasePlatformAdapter):
         if connected and (authed or not require_authed):
             return client
 
+        # Client is unusable — try internal reconnect before giving up.
+        if not self._disconnect_requested:
+            if await self._try_reconnect_transport(
+                reason=f"{operation}: transport not ready",
+            ):
+                return self._client
+
         if self.is_connected and not self._disconnect_requested:
             reason = str(status.get("last_error") or f"{operation}: transport is not connected")
             logger.warning(
@@ -418,6 +427,68 @@ class GrixAdapter(BasePlatformAdapter):
             return
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
+
+    async def _try_reconnect_transport(
+        self, reason: str = "", max_attempts: int = 2
+    ) -> bool:
+        """Try to rebuild the WebSocket transport within the same adapter instance.
+
+        This keeps the adapter alive so in-flight agent sessions can continue
+        sending responses through the same adapter reference, avoiding the
+        "transport not connected" failure caused by gateway adapter replacement.
+        """
+        async with self._reconnect_lock:
+            # Double-check: another coroutine may have already reconnected.
+            client = self._client
+            if client:
+                s = getattr(client, "status", None)
+                if isinstance(s, dict) and s.get("connected") and s.get("authed"):
+                    return True
+
+            logger.info(
+                "[%s] Internal transport reconnect: %s", self.name, reason or "unknown"
+            )
+
+            # Tear down the old (disconnected) client.
+            old = self._client
+            self._client = None
+            if old:
+                with suppress(Exception):
+                    await old.disconnect(reason or "internal reconnect")
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    new_client = GrixTransportClient(
+                        self.connection,
+                        connector=self._connector,
+                        on_packet=self._handle_protocol_packet,
+                        on_status=self._handle_transport_status,
+                    )
+                    await new_client.connect()
+                    self._client = new_client
+                    self._mark_connected()
+                    await self._report_skills()
+                    logger.info(
+                        "[%s] Internal reconnect OK (attempt %d)",
+                        self.name,
+                        attempt,
+                    )
+                    return True
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Internal reconnect attempt %d failed: %s",
+                        self.name,
+                        attempt,
+                        exc,
+                    )
+                    await asyncio.sleep(2 * attempt)
+
+            logger.error(
+                "[%s] Internal reconnect failed after %d attempts",
+                self.name,
+                max_attempts,
+            )
+            return False
 
     async def connect(self) -> bool:
         if not self.connection.endpoint or not self.connection.agent_id or not self.connection.api_key:
@@ -1003,6 +1074,13 @@ class GrixAdapter(BasePlatformAdapter):
             return
 
         message = str(status.get("last_error") or "grix websocket disconnected")
+
+        # Try internal transport reconnection first — keeps the same adapter
+        # instance alive so in-flight agent sessions can still send responses.
+        if await self._try_reconnect_transport(reason=message):
+            return
+
+        # Internal reconnection failed; delegate to gateway adapter replacement.
         self._set_fatal_error("grix_connection_lost", message, retryable=True)
         await self._notify_fatal_error()
 
