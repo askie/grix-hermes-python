@@ -45,7 +45,8 @@ def handle_file_list_action(
     try:
         st = os.stat(real_target)
         if not stat_mod.S_ISDIR(st.st_mode):
-            return _fail("not_a_directory", f"Path is not a directory: {target}")
+            # 路径指向文件而非目录，自动解析为其父目录继续浏览。
+            real_target = os.path.dirname(real_target)
     except PermissionError:
         return _fail("path_not_accessible", f"Cannot access path: {target}")
     except OSError:
