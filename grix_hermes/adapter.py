@@ -1312,6 +1312,11 @@ class GrixAdapter(BasePlatformAdapter):
         # /stop 拦截：后端工具栏停止按钮通过 SendStopText 下发 "/stop" 文本命令
         if message.text and message.text.strip().lower() == "/stop":
             was_active = session_key in self._active_sessions
+            logger.info(
+                "[%s] GRIX /stop command received event_id=%s session_id=%s session_key=%s was_active=%s active_sessions=%s",
+                self.name, message.event_id, message.session_id, session_key, was_active,
+                list(self._active_sessions.keys()),
+            )
             if was_active:
                 await self._force_stop_session(
                     source, session_key, reply_to=message.message_id,
@@ -1320,6 +1325,10 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._complete_event_if_needed(
                     message.event_id, status=STATUS_RESPONDED,
                 )
+            logger.info(
+                "[%s] GRIX /stop command handled event_id=%s was_active=%s",
+                self.name, message.event_id, was_active,
+            )
             return
 
         # /grix exec interception — handle before normal message routing
@@ -1708,10 +1717,21 @@ class GrixAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        logger.info(
+            "[%s] GRIX event_stop received event_id=%s stop_id=%s session_id=%s session_key=%s "
+            "trigger_msg_id=%s stream_msg_id=%s reason=%s active_sessions=%s",
+            self.name, stop.event_id, stop.stop_id, stop.session_id, session_key,
+            stop.trigger_message_id, stop.stream_message_id, stop.reason,
+            list(self._active_sessions.keys()),
+        )
         was_active = await self._force_stop_session(
             source,
             session_key,
             reply_to=stop.trigger_message_id or stop.event_id,
+        )
+        logger.info(
+            "[%s] GRIX event_stop force_stop done event_id=%s was_active=%s",
+            self.name, stop.event_id, was_active,
         )
 
         is_duplicate = self._remember_event_id(stop.event_id)
@@ -1723,7 +1743,7 @@ class GrixAdapter(BasePlatformAdapter):
                     accepted=True,
                 )
                 await self._replay_completed_stop(stop.event_id, stop.stop_id)
-            logger.debug("[%s] Ignoring duplicate GRIX stop event %s", self.name, stop.event_id)
+            logger.info("[%s] GRIX event_stop duplicate, replayed event_id=%s", self.name, stop.event_id)
             return
 
         if self._client:
@@ -1732,15 +1752,28 @@ class GrixAdapter(BasePlatformAdapter):
                 stop_id=stop.stop_id,
                 accepted=True,
             )
+            logger.info(
+                "[%s] GRIX event_stop ack sent event_id=%s stop_id=%s",
+                self.name, stop.event_id, stop.stop_id,
+            )
 
         try:
             if self._client:
+                final_status = STATUS_STOPPED if was_active else STATUS_ALREADY_FINISHED
                 await self._complete_stop(
                     event_id=stop.event_id,
                     stop_id=stop.stop_id,
-                    status=STATUS_STOPPED if was_active else STATUS_ALREADY_FINISHED,
+                    status=final_status,
+                )
+                logger.info(
+                    "[%s] GRIX event_stop result sent event_id=%s stop_id=%s status=%s was_active=%s",
+                    self.name, stop.event_id, stop.stop_id, final_status, was_active,
                 )
         except Exception as exc:
+            logger.error(
+                "[%s] GRIX event_stop result failed event_id=%s stop_id=%s error=%s",
+                self.name, stop.event_id, stop.stop_id, exc, exc_info=True,
+            )
             if self._client:
                 await self._complete_stop(
                     event_id=stop.event_id,
@@ -1760,6 +1793,10 @@ class GrixAdapter(BasePlatformAdapter):
     ) -> bool:
         was_active = session_key in self._active_sessions
         if not was_active:
+            logger.debug(
+                "[%s] _force_stop_session skip (not active) session_key=%s active_sessions=%s",
+                self.name, session_key, list(self._active_sessions.keys()),
+            )
             return False
 
         await self.cancel_session_processing(
