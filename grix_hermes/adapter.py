@@ -611,13 +611,13 @@ class GrixAdapter(BasePlatformAdapter):
             thread_id=self._metadata_thread_id(metadata),
             source_hint=source_hint,
         )
-        event_id = None
-        if reply_to:
-            event_id = self._reply_event_ids.get((str(session_id), str(reply_to)))
-        if not event_id and metadata:
-            raw_event_id = metadata.get("event_id")
-            if isinstance(raw_event_id, str) and raw_event_id.strip():
-                event_id = raw_event_id.strip()
+        # NOTE: event_id is deliberately NOT included in send_text here.
+        # Previously, the first streaming chunk carried event_id and called
+        # _complete_event_if_needed, which closed the backend pending event
+        # prematurely.  Subsequent final-response sends then hit 4003
+        # "event_id not owned by current agent".
+        # Event lifecycle is now managed at the handler level
+        # (_handle_message_packet) instead.
         biz_card = _clone_metadata_object(metadata, "biz_card")
         channel_data = _clone_metadata_object(metadata, "channel_data")
 
@@ -635,14 +635,11 @@ class GrixAdapter(BasePlatformAdapter):
                     chunk,
                     reply_to_message_id=reply_to if is_first else None,
                     thread_id=thread_id,
-                    event_id=event_id if is_first else None,
                     biz_card=biz_card if is_first else None,
                     channel_data=channel_data if is_first else None,
                 )
                 if len(chunks) > 1 and index < len(chunks) - 1:
                     await asyncio.sleep(0.2)
-            if event_id:
-                await self._complete_event_if_needed(event_id, status=STATUS_RESPONDED)
             result = SendResult(
                 success=bool(receipt and receipt.get("ok")),
                 message_id=receipt.get("message_id") if receipt else None,
@@ -664,12 +661,6 @@ class GrixAdapter(BasePlatformAdapter):
                         break
             return result
         except Exception as exc:
-            if event_id:
-                await self._complete_event_if_needed(
-                    event_id,
-                    status=STATUS_FAILED,
-                    message=str(exc),
-                )
             return SendResult(
                 success=False,
                 error=str(exc),
@@ -1414,6 +1405,15 @@ class GrixAdapter(BasePlatformAdapter):
                     message=str(exc),
                 )
             raise
+
+        # Close the event after successful processing.
+        # This must happen AFTER handle_message returns (all streaming +
+        # final sends complete) so the backend pending event stays alive
+        # throughout the entire response lifecycle.
+        if self._client:
+            await self._complete_event_if_needed(
+                message.event_id, status=STATUS_RESPONDED,
+            )
 
     async def _handle_edit_packet(self, payload: Dict[str, Any]) -> None:
         edit: GrixEditEvent = normalize_edit_event(payload)
