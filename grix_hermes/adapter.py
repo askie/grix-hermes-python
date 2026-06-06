@@ -468,6 +468,7 @@ class GrixAdapter(BasePlatformAdapter):
                     self._client = new_client
                     self._mark_connected()
                     await self._report_skills()
+                    await self._replay_pending_completed_events()
                     logger.info(
                         "[%s] Internal reconnect OK (attempt %d)",
                         self.name,
@@ -1898,6 +1899,39 @@ class GrixAdapter(BasePlatformAdapter):
             status=str(result.get("status") or STATUS_RESPONDED),
             message=result.get("message"),
         )
+
+    async def _replay_pending_completed_events(self) -> None:
+        """Re-send event_result for events that completed while WS was disconnected.
+
+        When ``_complete_event_if_needed`` is called during a disconnect, the
+        ``complete_event`` call silently fails but the event_id is still added
+        to ``_completed_event_ids``.  On reconnect we re-emit those results so
+        the backend can resolve the pending events via its durable storage.
+        """
+        if not self._client or not self._completed_event_ids:
+            return
+        replayed = 0
+        for eid in list(self._completed_event_ids):
+            result = self._completed_event_results.get(eid)
+            if not result:
+                continue
+            try:
+                await self._client.complete_event(
+                    event_id=eid,
+                    status=str(result.get("status") or STATUS_RESPONDED),
+                    message=result.get("message"),
+                )
+                replayed += 1
+            except Exception as exc:
+                logger.debug(
+                    "[%s] Re-play event_result for %s failed: %s",
+                    self.name, eid, exc,
+                )
+        if replayed:
+            logger.info(
+                "[%s] Replayed %d completed event_result(s) after reconnect",
+                self.name, replayed,
+            )
 
     async def _replay_completed_stop(self, event_id: str, stop_id: Optional[str]) -> None:
         if not self._client:
