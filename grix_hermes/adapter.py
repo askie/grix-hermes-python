@@ -26,6 +26,10 @@ from .tool_progress_cards import (
     build_tool_execution_channel_data,
     detect_tool_progress,
 )
+from .agent_status_cards import (
+    build_agent_status_channel_data,
+    detect_agent_status,
+)
 from .contract import (
     CMD_EVENT_CANCEL,
     CMD_EVENT_EDIT,
@@ -590,17 +594,32 @@ class GrixAdapter(BasePlatformAdapter):
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
 
-        # Detect tool progress and inject structured channel_data for card display.
-        tp = detect_tool_progress(content)
-        if tp:
-            tool_name, preview = tp
+        # Detect structured content and inject channel_data for card display.
+        # Order matters: a gateway status line is checked first and short-circuits,
+        # so it is never routed to the tool_execution path.  (Today's tool-progress
+        # regex doesn't match these strings anyway, but ordering keeps the two
+        # classifiers independent of future regex changes.)
+        tp = None  # set only on the tool-progress path; consumed after send below
+        status_text = detect_agent_status(content)
+        if status_text:
             if metadata is None:
                 metadata = {}
             else:
                 metadata = dict(metadata)
             cd: Dict[str, Any] = dict(metadata.get("channel_data") or {})
-            cd.update(build_tool_execution_channel_data(tool_name, preview))
+            cd.update(build_agent_status_channel_data(status_text))
             metadata["channel_data"] = cd
+        else:
+            tp = detect_tool_progress(content)
+            if tp:
+                tool_name, preview = tp
+                if metadata is None:
+                    metadata = {}
+                else:
+                    metadata = dict(metadata)
+                cd = dict(metadata.get("channel_data") or {})
+                cd.update(build_tool_execution_channel_data(tool_name, preview))
+                metadata["channel_data"] = cd
 
         await self._enforce_send_rate()
 
