@@ -108,6 +108,30 @@ def build_egg_status_card(
     )
 
 
+def build_progress_card(
+    label: str,
+    percent: Optional[int] = None,
+    fallback_label: Optional[str] = None,
+) -> str:
+    """Build a ``grix://card/progress`` deep-link (one-line label + percent).
+
+    ``percent`` is optional: when ``None`` the card renders an *indeterminate*
+    progress bar.  Out-of-range values are clamped into 0..100.
+    """
+    label = _clean(label)
+    if not label:
+        raise ValueError("progress card requires label")
+
+    params: Dict[str, str] = {"label": label}
+    fb = _clean(fallback_label) or f"进度：{label}"
+    if percent is not None:
+        pct = max(0, min(100, int(percent)))
+        params["percent"] = str(pct)
+        fb = f"{fb} {pct}%"
+
+    return _build_link(fb, f"grix://card/progress?{urllib.parse.urlencode(params)}")
+
+
 def dispatch_card_builder(kind: str, params: Dict[str, object]) -> str:
     kind = _clean(kind)
     if kind == "conversation":
@@ -136,5 +160,17 @@ def dispatch_card_builder(kind: str, params: Dict[str, object]) -> str:
             error_code=str(params.get("error_code", "")) or None,
             error_message=str(params.get("error_message", "")) or None,
             label=str(params.get("label", "")) or None,
+        )
+    if kind == "progress":
+        raw_percent = params.get("percent")
+        percent = (
+            int(raw_percent)
+            if raw_percent is not None and str(raw_percent).strip() != ""
+            else None
+        )
+        return build_progress_card(
+            label=str(params.get("label", "")),
+            percent=percent,
+            fallback_label=str(params.get("fallback_label", "")) or None,
         )
     raise ValueError(f"Unsupported card kind: {kind}")

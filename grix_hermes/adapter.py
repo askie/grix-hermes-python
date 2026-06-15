@@ -26,6 +26,7 @@ from .tool_progress_cards import (
     build_tool_execution_channel_data,
     detect_tool_progress,
 )
+from .progress_cards import build_queue_progress_card
 from .agent_status_cards import (
     build_agent_status_channel_data,
     detect_agent_status,
@@ -602,13 +603,19 @@ class GrixAdapter(BasePlatformAdapter):
         tp = None  # set only on the tool-progress path; consumed after send below
         status_text = detect_agent_status(content)
         if status_text:
-            if metadata is None:
-                metadata = {}
+            progress_card = build_queue_progress_card(status_text)
+            if progress_card is not None:
+                # 排队消息渲染为进度卡片：content 即 grix://card/progress
+                # 链接，后端原样透传、前端渲染，无需 channel_data。
+                content = progress_card
             else:
-                metadata = dict(metadata)
-            cd: Dict[str, Any] = dict(metadata.get("channel_data") or {})
-            cd.update(build_agent_status_channel_data(status_text))
-            metadata["channel_data"] = cd
+                if metadata is None:
+                    metadata = {}
+                else:
+                    metadata = dict(metadata)
+                cd: Dict[str, Any] = dict(metadata.get("channel_data") or {})
+                cd.update(build_agent_status_channel_data(status_text))
+                metadata["channel_data"] = cd
         else:
             tp = detect_tool_progress(content)
             if tp:
