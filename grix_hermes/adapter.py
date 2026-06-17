@@ -26,6 +26,7 @@ from .tool_progress_cards import (
     build_tool_execution_channel_data,
     detect_tool_progress,
 )
+from .progress_cards import build_queue_progress_card
 from .agent_status_cards import (
     build_agent_status_channel_data,
     detect_agent_status,
@@ -602,13 +603,19 @@ class GrixAdapter(BasePlatformAdapter):
         tp = None  # set only on the tool-progress path; consumed after send below
         status_text = detect_agent_status(content)
         if status_text:
-            if metadata is None:
-                metadata = {}
+            progress_card = build_queue_progress_card(status_text)
+            if progress_card is not None:
+                # 排队消息渲染为进度卡片：content 即 grix://card/progress
+                # 链接，后端原样透传、前端渲染，无需 channel_data。
+                content = progress_card
             else:
-                metadata = dict(metadata)
-            cd: Dict[str, Any] = dict(metadata.get("channel_data") or {})
-            cd.update(build_agent_status_channel_data(status_text))
-            metadata["channel_data"] = cd
+                if metadata is None:
+                    metadata = {}
+                else:
+                    metadata = dict(metadata)
+                cd: Dict[str, Any] = dict(metadata.get("channel_data") or {})
+                cd.update(build_agent_status_channel_data(status_text))
+                metadata["channel_data"] = cd
         else:
             tp = detect_tool_progress(content)
             if tp:
@@ -865,6 +872,26 @@ class GrixAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.debug("[%s] GRIX typing update failed: %s", self.name, exc)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        client = await self._get_ready_client(operation="stop_typing")
+        if not client:
+            return
+        try:
+            source_hint = self._latest_sources.get(str(chat_id))
+            session_id, _thread_id = await resolve_grix_target(
+                client,
+                self.connection,
+                str(chat_id),
+                source_hint=source_hint,
+            )
+            await client.set_session_activity(
+                session_id=str(session_id),
+                kind="composing",
+                active=False,
+            )
+        except Exception as exc:
+            logger.debug("[%s] GRIX stop_typing failed: %s", self.name, exc)
 
     async def agent_invoke(
         self,
