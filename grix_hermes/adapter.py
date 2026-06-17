@@ -873,6 +873,26 @@ class GrixAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] GRIX typing update failed: %s", self.name, exc)
 
+    async def stop_typing(self, chat_id: str) -> None:
+        client = await self._get_ready_client(operation="stop_typing")
+        if not client:
+            return
+        try:
+            source_hint = self._latest_sources.get(str(chat_id))
+            session_id, _thread_id = await resolve_grix_target(
+                client,
+                self.connection,
+                str(chat_id),
+                source_hint=source_hint,
+            )
+            await client.set_session_activity(
+                session_id=str(session_id),
+                kind="composing",
+                active=False,
+            )
+        except Exception as exc:
+            logger.debug("[%s] GRIX stop_typing failed: %s", self.name, exc)
+
     async def agent_invoke(
         self,
         *,
