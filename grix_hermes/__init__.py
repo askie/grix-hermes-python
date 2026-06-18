@@ -7,8 +7,16 @@ __all__ = ["register"]
 
 
 PLUGIN_SKILLS = {
+    "grix-access-control": {
+        "description": "Approve/deny pairing codes, allow/remove senders, and set the access policy for who may message the agent.",
+        "tools": ["grix_access_control"],
+    },
     "grix-admin": {
         "description": "Manage Grix agents, API keys, and categories through Hermes.",
+        "tools": ["grix_invoke"],
+    },
+    "grix-agent-dispatch": {
+        "description": "Dispatch one of the owner's agents to work in a directory, and update an agent's introduction.",
         "tools": ["grix_invoke"],
     },
     "grix-egg": {
@@ -19,6 +27,10 @@ PLUGIN_SKILLS = {
         "description": "Use Grix group operation tools through Hermes.",
         "tools": ["grix_invoke"],
     },
+    "grix-owner-relay": {
+        "description": "Send a message as the owner into another session, or call the owner into a session for a voice talk/approval.",
+        "tools": ["grix_invoke"],
+    },
     "grix-query": {
         "description": "Query Grix contacts, sessions, messages, and related read-only data.",
         "tools": ["grix_invoke"],
@@ -26,6 +38,10 @@ PLUGIN_SKILLS = {
     "grix-register": {
         "description": "Register, authenticate, create API agents, and hand off Grix credentials.",
         "tools": ["grix_auth", "grix_egg"],
+    },
+    "grix-task-status": {
+        "description": "Query the task state across all the owner's sessions (running / waiting / completed / failed / idle).",
+        "tools": ["grix_invoke"],
     },
     "grix-update": {
         "description": "Update and maintain the grix-hermes installation.",
@@ -113,6 +129,7 @@ def register(ctx):
         ("egg_tool", "register_egg_tool"),
         ("update_tool", "register_update_tool"),
         ("file_link_tool", "register_file_link_tool"),
+        ("access_control_tool", "register_access_control_tool"),
     ]:
         try:
             _mod = importlib.import_module(f".{_module}", __name__)

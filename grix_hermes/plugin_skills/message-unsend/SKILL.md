@@ -1,6 +1,7 @@
 ---
 name: message-unsend
 description: Recall Grix messages through the Python grix_invoke Hermes tool.
+trigger: 当用户要撤回、收回、删除一条已经发出的消息时
 ---
 
 # Message Unsend
