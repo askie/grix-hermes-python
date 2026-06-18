@@ -39,6 +39,10 @@ PLUGIN_SKILLS = {
         "description": "Silently recall Grix messages through Hermes.",
         "tools": ["grix_invoke"],
     },
+    "tailnet-file-share": {
+        "description": "Share a local file with the user via a tailnet download link.",
+        "tools": ["grix_file_link"],
+    },
 }
 
 
@@ -108,6 +112,7 @@ def register(ctx):
         ("auth_tools", "register_auth_tools"),
         ("egg_tool", "register_egg_tool"),
         ("update_tool", "register_update_tool"),
+        ("file_link_tool", "register_file_link_tool"),
     ]:
         try:
             _mod = importlib.import_module(f".{_module}", __name__)
