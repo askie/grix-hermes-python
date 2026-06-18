@@ -30,6 +30,11 @@ SUPPORTED_ACTIONS = {
     "agent_category_assign": "Assign an agent to a category",
     "agent_api_status": "Get agent API status",
     "agent_api_key_rotate": "Rotate an agent's API key",
+    "agent_introduction_update": "Update an agent's text introduction",
+    "dispatch_agent": "Dispatch one of the owner's agents to work in a directory",
+    "call_owner": "Call the owner into a session for a voice talk/approval",
+    "session_send": "Send a message into a session AS THE OWNER (owner relay)",
+    "agent_task_query": "Query task state across all the owner's sessions",
 }
 
 GRIX_INVOKE_SCHEMA = {
@@ -43,7 +48,10 @@ GRIX_INVOKE_SCHEMA = {
         "group_member_remove, group_member_role_update, group_all_members_muted_update, "
         "group_member_speaking_update, group_dissolve\n"
         "  Admin: agent_api_create, agent_category_list, agent_category_create, "
-        "agent_category_update, agent_category_assign, agent_api_status, agent_api_key_rotate"
+        "agent_category_update, agent_category_assign, agent_api_status, agent_api_key_rotate\n"
+        "  Agent dispatch: dispatch_agent, agent_introduction_update\n"
+        "  Owner relay: call_owner, session_send\n"
+        "  Task status: agent_task_query"
     ),
     "parameters": {
         "type": "object",
