@@ -37,7 +37,7 @@ def build_conversation_card(
         query += f"&peer_id={urllib.parse.quote(peer_id, safe='')}"
 
     return _build_link(
-        _clean(label) or "打开会话",
+        _clean(label) or "Open conversation",
         f"grix://card/conversation?{query}",
     )
 
@@ -64,7 +64,7 @@ def build_user_profile_card(
         params["avatar_url"] = avatar_url
 
     return _build_link(
-        _clean(label) or "查看 Agent 资料",
+        _clean(label) or "View agent profile",
         f"grix://card/user_profile?{urllib.parse.urlencode(params)}",
     )
 
@@ -103,7 +103,7 @@ def build_egg_status_card(
         params["error_msg"] = error_message
 
     return _build_link(
-        _clean(label) or "安装状态",
+        _clean(label) or "Install status",
         f"grix://card/egg_install_status?{urllib.parse.urlencode(params)}",
     )
 
@@ -123,7 +123,7 @@ def build_progress_card(
         raise ValueError("progress card requires label")
 
     params: Dict[str, str] = {"label": label}
-    fb = _clean(fallback_label) or f"进度：{label}"
+    fb = _clean(fallback_label) or f"Progress: {label}"
     if percent is not None:
         pct = max(0, min(100, int(percent)))
         params["percent"] = str(pct)

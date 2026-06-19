@@ -19,7 +19,7 @@ def test_queue_message_with_iteration_renders_percent():
     link = build_queue_progress_card("⏳ Queued for the next turn (iteration 4/8). ")
     assert link is not None
     params = _params(link)
-    assert params["label"] == "处理中 · 第4/8轮"
+    assert params["label"] == "Working · iteration 4/8"
     assert params["percent"] == "50"
 
 
@@ -34,7 +34,7 @@ def test_working_message_renders_progress_card():
     link = build_queue_progress_card("⏳ Working — 3 min — iteration 9/90, process")
     assert link is not None
     params = _params(link)
-    assert params["label"] == "处理中 · 第9/90轮 · 已跑3分钟"
+    assert params["label"] == "Working · iteration 9/90 · 3 min elapsed"
     assert params["percent"] == "10"
 
 
@@ -42,7 +42,7 @@ def test_working_without_iteration():
     link = build_queue_progress_card("⏳ Working — 1 min")
     assert link is not None
     params = _params(link)
-    assert params["label"] == "处理中 · 已跑1分钟"
+    assert params["label"] == "Working · 1 min elapsed"
     assert "percent" not in params
 
 

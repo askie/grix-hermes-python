@@ -45,17 +45,17 @@ def build_queue_progress_card(status_text: str) -> Optional[str]:
     if it:
         current = int(it.group(1))
         total = int(it.group(2))
-        parts.append(f"第{current}/{total}轮")
+        parts.append(f"iteration {current}/{total}")
         if total > 0:
             percent = max(0, min(100, round(current / total * 100)))
 
     el = _ELAPSED_RE.search(stripped)
     if el:
-        parts.append(f"已跑{int(el.group(1))}分钟")
+        parts.append(f"{int(el.group(1))} min elapsed")
 
     if parts:
-        label = "处理中 · " + " · ".join(parts)
+        label = "Working · " + " · ".join(parts)
     else:
-        label = "排队等待处理"
+        label = "Queued"
 
     return build_progress_card(label, percent)
