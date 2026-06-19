@@ -341,6 +341,9 @@ class GrixAdapter(BasePlatformAdapter):
         self._send_lock = asyncio.Lock()
         self._reconnect_lock = asyncio.Lock()
         self._tool_progress_msg_ids: set[str] = set()
+        # extra.connector hints injected by the backend per-session (e.g. group chat).
+        # Keyed by both session_id and session_key for fast lookup in send().
+        self._session_connector_hints: Dict[str, Dict[str, Any]] = {}
 
     def format_message(self, content: str) -> str:
         return content.strip()
@@ -581,6 +584,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._completed_stop_results.clear()
         self._completed_event_ids.clear()
         self._tool_progress_msg_ids.clear()
+        self._session_connector_hints.clear()
         await self._safe_release_lock()
         self._mark_disconnected()
 
@@ -595,6 +599,11 @@ class GrixAdapter(BasePlatformAdapter):
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
 
+        # Read per-session connector hints injected by the backend (e.g. group chat).
+        _hints = self._session_connector_hints.get(str(chat_id)) or {}
+        _drop_thinking = _hints.get("thinking_events") == "drop"
+        _drop_tools = _hints.get("tool_events") == "drop"
+
         # Detect structured content and inject channel_data for card display.
         # Order matters: a gateway status line is checked first and short-circuits,
         # so it is never routed to the tool_execution path.  (Today's tool-progress
@@ -603,6 +612,9 @@ class GrixAdapter(BasePlatformAdapter):
         tp = None  # set only on the tool-progress path; consumed after send below
         status_text = detect_agent_status(content)
         if status_text:
+            if _drop_thinking:
+                # Backend instructed us to suppress thinking/status events.
+                return SendResult(success=True, retryable=False)
             progress_card = build_queue_progress_card(status_text)
             if progress_card is not None:
                 # 排队消息渲染为进度卡片：content 即 grix://card/progress
@@ -619,6 +631,9 @@ class GrixAdapter(BasePlatformAdapter):
         else:
             tp = detect_tool_progress(content)
             if tp:
+                if _drop_tools:
+                    # Backend instructed us to suppress tool execution events.
+                    return SendResult(success=True, retryable=False)
                 tool_name, preview = tp
                 if metadata is None:
                     metadata = {}
@@ -1294,6 +1309,14 @@ class GrixAdapter(BasePlatformAdapter):
         self._reply_event_ids[(message.session_id, message.message_id)] = message.event_id
         self._message_sources[(message.session_id, message.message_id)] = source
         self._message_session_keys[(message.session_id, message.message_id)] = session_key
+
+        # Extract extra.connector hints and index by both session_id and session_key
+        # so send() can look them up by whichever key the caller uses as chat_id.
+        raw_extra = payload.get("extra") or {}
+        connector_hints = raw_extra.get("connector") or {} if isinstance(raw_extra, dict) else {}
+        if connector_hints and isinstance(connector_hints, dict):
+            self._session_connector_hints[message.session_id] = connector_hints
+            self._session_connector_hints[session_key] = connector_hints
 
         if message.chat_type == "dm" and message.sender_id:
             sender_key = str(message.sender_id)
