@@ -75,7 +75,7 @@ def check(name, cond):
 # ── 1. grix_invoke: 5 new direct actions present in actions + schema enum ───
 print("1. grix_invoke new actions")
 NEW = ["dispatch_agent", "agent_introduction_update", "call_owner",
-       "session_send", "chat_state_query"]
+       "session_send", "chat_state_query", "chat_state_update"]
 enum = invoke_tool.GRIX_INVOKE_SCHEMA["parameters"]["properties"]["action"]["enum"]
 for a in NEW:
     check(f"{a} in SUPPORTED_ACTIONS", a in invoke_tool.SUPPORTED_ACTIONS)
