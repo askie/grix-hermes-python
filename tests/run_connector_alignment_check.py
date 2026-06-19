@@ -75,7 +75,7 @@ def check(name, cond):
 # ── 1. grix_invoke: 5 new direct actions present in actions + schema enum ───
 print("1. grix_invoke new actions")
 NEW = ["dispatch_agent", "agent_introduction_update", "call_owner",
-       "session_send", "agent_task_query"]
+       "session_send", "chat_state_query"]
 enum = invoke_tool.GRIX_INVOKE_SCHEMA["parameters"]["properties"]["action"]["enum"]
 for a in NEW:
     check(f"{a} in SUPPORTED_ACTIONS", a in invoke_tool.SUPPORTED_ACTIONS)
@@ -90,8 +90,8 @@ check("dispatch_agent forwarded verbatim",
 check("dispatch_agent result ok", res.startswith("OK:"))
 
 calls.clear()
-asyncio.run(invoke_tool._grix_invoke_handler({"action": "agent_task_query", "params": {}}))
-check("agent_task_query forwarded", calls == [("agent_task_query", {})])
+asyncio.run(invoke_tool._grix_invoke_handler({"action": "chat_state_query", "params": {}}))
+check("chat_state_query forwarded", calls == [("chat_state_query", {})])
 
 # unknown action still rejected
 bad = asyncio.run(invoke_tool._grix_invoke_handler({"action": "claude_access_control"}))
