@@ -33,7 +33,7 @@ SUPPORTED_ACTIONS = {
     "dispatch_agent": "Dispatch one of the owner's agents to work in a directory",
     "call_owner": "Call the owner into a session for a voice talk/approval",
     "session_send": "Send a message into a session AS THE OWNER (owner relay)",
-    "chat_state_query": "Query chat-level task states across all the owner's sessions (supports page/page_size/state filtering)",
+    "chat_state_query": "Query chat-level task states across the owner's sessions (supports session_id/page/page_size/state filtering)",
     "chat_state_update": "Manually update the task state of a specific chat session (params: session_id, state, reason[optional])",
 }
 

@@ -15,12 +15,14 @@ All parameters are **optional**:
 
 | param | type | default | description |
 |-------|------|---------|-------------|
+| `session_id` | string | *(all)* | Query a single session by its ID; omit to return all sessions |
 | `page` | int | 1 | Page number, starting from 1 |
 | `page_size` | int | 10 | Items per page, max 100 |
 | `state` | string | *(all)* | Filter: running / waiting_approval / waiting_question / completed / failed / idle |
 
 ```text
 grix_invoke(action="chat_state_query", params={})
+grix_invoke(action="chat_state_query", params={"session_id": "xxx"})
 grix_invoke(action="chat_state_query", params={"page": 1, "page_size": 20, "state": "running"})
 ```
 
