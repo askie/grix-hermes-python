@@ -14,7 +14,7 @@ import os
 import time
 from contextlib import suppress
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
@@ -177,6 +177,48 @@ def _resolve_message_type(message: GrixInboundMessage) -> MessageType:
     if kind == "audio" or mime_type.startswith("audio/"):
         return MessageType.AUDIO
     return MessageType.DOCUMENT
+
+
+def _render_grix_context_block(message: GrixInboundMessage) -> str:
+    """Assemble the backend-provided context_messages into readable text that is
+    prepended to the agent prompt. A quoted (replied-to) entry has its content
+    prefixed with "[引用消息]"; in group chats the sender id is included so the
+    agent can tell who said what. 1:1 chats omit the sender id."""
+    raw = message.raw or {}
+    items = raw.get("context_messages")
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except (ValueError, TypeError):
+            return ""
+    if not isinstance(items, list) or not items:
+        return ""
+
+    is_group = str(message.session_type or "") == "2"
+    current_id = str(message.message_id or "")
+    quoted_prefix = "[引用消息]"
+    lines: List[str] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        msg_id = str(item.get("msg_id") or "")
+        if msg_id and msg_id == current_id:
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        sender_id = str(item.get("sender_id") or "")
+        if content.startswith(quoted_prefix):
+            quoted = content[len(quoted_prefix):].lstrip("\n").strip()
+            if is_group and sender_id:
+                lines.append(f"[引用消息] (来自 {sender_id})：{quoted}")
+            else:
+                lines.append(f"[引用消息]：{quoted}")
+        elif is_group and sender_id:
+            lines.append(f"[{sender_id}]：{content}")
+        else:
+            lines.append(content)
+    return "\n".join(lines)
 
 
 def _is_record_only_message(message: GrixInboundMessage) -> bool:
@@ -1439,6 +1481,9 @@ class GrixAdapter(BasePlatformAdapter):
             )
 
         event_text = message.text
+        context_block = _render_grix_context_block(message)
+        if context_block:
+            event_text = f"{context_block}\n\n{event_text}" if event_text else context_block
         event_message_type = _resolve_message_type(message)
         raw_kind = "message"
         raw_message = {**message.raw}
