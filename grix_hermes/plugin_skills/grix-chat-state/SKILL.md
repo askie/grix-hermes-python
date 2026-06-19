@@ -11,7 +11,13 @@ Use the Python Hermes tool `grix_invoke`.
 ## Chat task states — `chat_state_query`
 
 Query the task state across all the owner's chats (direct and group sessions).
-Supports pagination and optional state filtering.
+All parameters are **optional**:
+
+| param | type | default | description |
+|-------|------|---------|-------------|
+| `page` | int | 1 | Page number, starting from 1 |
+| `page_size` | int | 10 | Items per page, max 100 |
+| `state` | string | *(all)* | Filter: running / waiting_approval / waiting_question / completed / failed / idle |
 
 ```text
 grix_invoke(action="chat_state_query", params={})
