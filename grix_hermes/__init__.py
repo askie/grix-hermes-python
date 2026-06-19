@@ -39,8 +39,8 @@ PLUGIN_SKILLS = {
         "description": "Register, authenticate, create API agents, and hand off Grix credentials.",
         "tools": ["grix_auth", "grix_egg"],
     },
-    "grix-task-status": {
-        "description": "Query the task state across all the owner's sessions (running / waiting / completed / failed / idle).",
+    "grix-chat-state": {
+        "description": "Query the chat-level task state across all the owner's chats (running / waiting / completed / failed / idle). Supports pagination and state filtering.",
         "tools": ["grix_invoke"],
     },
     "grix-update": {

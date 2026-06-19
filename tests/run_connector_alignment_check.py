@@ -130,7 +130,7 @@ for args, why in [
 # ── 3. skills ↔ SKILL.md alignment ──────────────────────────────────────────
 print("3. skills + SKILL.md")
 EXPECTED_NEW_SKILLS = ["grix-access-control", "grix-agent-dispatch",
-                       "grix-owner-relay", "grix-task-status"]
+                       "grix-owner-relay", "grix-chat-state"]
 skills_root = ROOT / "grix_hermes" / "plugin_skills"
 for s in EXPECTED_NEW_SKILLS:
     check(f"{s} in PLUGIN_SKILLS", s in PLUGIN_SKILLS)
@@ -152,7 +152,7 @@ for name, sdef in PLUGIN_SKILLS.items():
 print("4. trigger fields + no camelCase param leakage")
 CONNECTOR_COUNTERPARTS = [
     "grix-access-control", "grix-admin", "grix-agent-dispatch", "grix-group",
-    "grix-owner-relay", "grix-query", "grix-task-status",
+    "grix-owner-relay", "grix-query", "grix-chat-state",
     "message-send", "message-unsend", "tailnet-file-share",
 ]
 for name in CONNECTOR_COUNTERPARTS:
