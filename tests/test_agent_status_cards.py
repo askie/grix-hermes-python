@@ -31,6 +31,11 @@ def test_queued_for_next_turn():
     assert detect_agent_status("⏳ Queued for the next turn (iteration 4/8). ") is not None
 
 
+def test_working_status():
+    text = "⏳ Working — 3 min — iteration 9/90, process"
+    assert detect_agent_status(text) == text
+
+
 def test_gateway_busy():
     assert detect_agent_status("⏳ Gateway is running and is not accepting another turn right now.") is not None
 
@@ -75,6 +80,7 @@ def test_status_lines_do_not_match_tool_progress_today():
     # any future change to the tool-progress regex.
     for text in (
         "⏳ Still working... (2 min elapsed)",
+        "⏳ Working — 3 min — iteration 9/90, process",
         "⏳ Queued for the next turn (iteration 4/8). ",
         "⚠️ No activity for 15 min. Use /reset.",
     ):

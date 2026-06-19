@@ -9,6 +9,7 @@ render them as a lightweight thinking card instead of a formal bubble.
 
 Source of the status strings (gateway/run.py):
   - "⏳ Still working... (N min elapsed — iteration X/Y, running: tool)"
+  - "⏳ Working — N min — iteration X/Y, tool"
   - "⚠️ No activity for N min. ..."
   - "⏳ Queued for the next turn ..."
   - "⏳ Gateway is running ..." / "⏳ Gateway running — queued ..."
@@ -26,6 +27,7 @@ from typing import Any, Dict, Optional
 # to avoid misclassifying genuine agent replies that happen to open with ⏳/⚠️.
 _STATUS_PATTERNS = (
     re.compile(r"^⏳\s+Still working\b"),
+    re.compile(r"^⏳\s+Working\b"),
     re.compile(r"^⚠️\s+No activity for\b"),
     re.compile(r"^⏳\s+Queued for the next turn\b"),
     re.compile(r"^⏳\s+Gateway\b"),

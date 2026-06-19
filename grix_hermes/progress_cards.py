@@ -1,15 +1,13 @@
-"""Render Hermes gateway *queue* status lines as progress-bar cards.
+"""Render Hermes gateway status lines as progress-bar cards.
 
-When a user message arrives while the agent is still busy with the previous
-turn, the gateway replies with a queue notice, e.g.::
+The gateway emits periodic status notifications in two formats::
 
-    ⏳ Queued for the next turn (2 min elapsed, iteration 3/10, running: bash). I'll respond once the current task finishes.
+    ⏳ Queued for the next turn (2 min elapsed, iteration 3/10, running: bash).
+    ⏳ Working — 3 min — iteration 9/90, process
 
-The parenthesised detail is built by the gateway from the running agent's
-structured activity summary (``api_call_count`` / ``max_iterations`` /
-elapsed minutes). Instead of showing the raw line, surface it as a progress
-card: a one-line label plus a percent derived from ``iteration N/M``, reusing
-the same backend pass-through that other ``grix://`` card links rely on.
+Both carry an ``iteration N/M`` progress and elapsed time. This module
+detects either format and surfaces them as a ``grix://card/progress``
+card with a percent bar.
 """
 
 from __future__ import annotations
@@ -19,25 +17,25 @@ from typing import Optional
 
 from .card_links import build_progress_card
 
-# 仅「排队等待下一轮」这类消息渲染为进度卡。
-_QUEUE_RE = re.compile(r"^⏳\s+Queued for the next turn\b", re.IGNORECASE)
-# 形如 "iteration 3/10" 的轮次进度（来自网关 activity_summary）。
+_PROGRESS_RE = re.compile(
+    r"^⏳\s+(?:Queued for the next turn|Working)\b", re.IGNORECASE,
+)
 _ITERATION_RE = re.compile(r"iteration\s+(\d+)\s*/\s*(\d+)", re.IGNORECASE)
-# 形如 "2 min elapsed" 的已跑时间。
-_ELAPSED_RE = re.compile(r"(\d+)\s*min(?:ute)?s?\s+elapsed", re.IGNORECASE)
+# "2 min elapsed" 或 "— 3 min —"
+_ELAPSED_RE = re.compile(r"(\d+)\s*min(?:ute)?s?(?:\s+elapsed)?", re.IGNORECASE)
 
 
 def build_queue_progress_card(status_text: str) -> Optional[str]:
-    """Return a ``grix://card/progress`` link if *status_text* is a queue notice.
+    """Return a ``grix://card/progress`` link for a queue/working status line.
 
-    The percent comes from the gateway's ``iteration N/M`` activity参数; the
-    label also surfaces the elapsed minutes when present. Returns ``None`` for
-    any non-queue status line so the caller falls back to the agent-status path.
+    Matches both "Queued for the next turn" and "Working" gateway formats.
+    Returns ``None`` for other status lines so the caller falls back to the
+    agent-status thinking card path.
     """
     if not status_text:
         return None
     stripped = status_text.strip()
-    if not _QUEUE_RE.search(stripped):
+    if not _PROGRESS_RE.search(stripped):
         return None
 
     percent: Optional[int] = None
