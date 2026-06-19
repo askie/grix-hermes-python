@@ -35,8 +35,22 @@ Returns one entry per session with a single mutually-exclusive state:
 Also returns `task_title` for easy identification of each chat, along with
 pagination info (`total`, `page`, `page_size`).
 
+## Manually update a chat state — `chat_state_update`
+
+Override the task state of a specific chat session.
+
+| param | required | description |
+|-------|----------|-------------|
+| `session_id` | yes | the session to update |
+| `state` | yes | running / waiting_approval / waiting_question / completed / failed / idle |
+| `reason` | no | reason for the change, written to `stop_reason` |
+
+```text
+grix_invoke(action="chat_state_update", params={"session_id": "xxx", "state": "completed", "reason": "manually closed"})
+```
+
 ## Rules
 
-1. This action is read-only — safe to call any time to orient yourself.
-2. It reports per-session state, not per-message; pair it with `grix-query`
-   (`message_history`) when you need the actual content.
+1. `chat_state_query` is read-only — safe to call any time to orient yourself.
+2. `chat_state_update` only updates existing records; returns an error if the session has no prior state entry.
+3. Both report per-session state, not per-message; pair with `grix-query` (`message_history`) when you need the actual content.

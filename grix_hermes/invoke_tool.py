@@ -34,6 +34,7 @@ SUPPORTED_ACTIONS = {
     "call_owner": "Call the owner into a session for a voice talk/approval",
     "session_send": "Send a message into a session AS THE OWNER (owner relay)",
     "chat_state_query": "Query chat-level task states across all the owner's sessions (supports page/page_size/state filtering)",
+    "chat_state_update": "Manually update the task state of a specific chat session (params: session_id, state, reason[optional])",
 }
 
 GRIX_INVOKE_SCHEMA = {
@@ -50,7 +51,7 @@ GRIX_INVOKE_SCHEMA = {
         "agent_category_update, agent_category_assign, agent_api_key_rotate\n"
         "  Agent dispatch: dispatch_agent, agent_introduction_update\n"
         "  Owner relay: call_owner, session_send\n"
-        "  Chat state: chat_state_query"
+        "  Chat state: chat_state_query, chat_state_update"
     ),
     "parameters": {
         "type": "object",
