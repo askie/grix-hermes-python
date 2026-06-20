@@ -24,6 +24,7 @@ from .compat import build_card_action_user_text, build_exec_approval_message
 from .exec_command import parse_exec_command, handle_skills_command
 from .tool_progress_cards import (
     build_tool_execution_channel_data,
+    detect_hook_status,
     detect_tool_progress,
 )
 from .progress_cards import build_queue_progress_card
@@ -684,6 +685,19 @@ class GrixAdapter(BasePlatformAdapter):
                 cd = dict(metadata.get("channel_data") or {})
                 cd.update(build_tool_execution_channel_data(tool_name, preview))
                 metadata["channel_data"] = cd
+            else:
+                hs = detect_hook_status(content)
+                if hs:
+                    if _drop_tools:
+                        return SendResult(success=True, retryable=False)
+                    action_name, description = hs
+                    if metadata is None:
+                        metadata = {}
+                    else:
+                        metadata = dict(metadata)
+                    cd = dict(metadata.get("channel_data") or {})
+                    cd.update(build_tool_execution_channel_data(action_name, description))
+                    metadata["channel_data"] = cd
 
         await self._enforce_send_rate()
 
