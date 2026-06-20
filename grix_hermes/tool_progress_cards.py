@@ -26,6 +26,16 @@ _TOOL_PROGRESS_RE = re.compile(
     r"\s*(?:\(×\d+\))?$",  # optional dedup counter (×N)
 )
 
+# Matches Claude Code hook notification lines whose action name may contain
+# spaces, e.g.:  💾 Self-improvement review: Memory updated
+_HOOK_STATUS_RE = re.compile(
+    r"^[^\w\s]+"               # leading emoji(s)
+    r"\s+"
+    r"([A-Za-z][\w\- ]*\w)"   # action name — starts/ends with word char, spaces allowed
+    r"\s*:\s*"
+    r"(.+)$",
+)
+
 
 def detect_tool_progress(content: str) -> Optional[Tuple[str, str]]:
     """Return (tool_name, preview) if *content* is a tool-progress message.
@@ -52,6 +62,25 @@ def detect_tool_progress(content: str) -> Optional[Tuple[str, str]]:
             return tool_name, preview
 
     return None
+
+
+def detect_hook_status(content: str) -> Optional[Tuple[str, str]]:
+    """Return (action_name, description) if *content* is a single-line hook notification.
+
+    Handles Claude Code hook messages like:
+        💾 Self-improvement review: Memory updated
+    where the action name may contain spaces (unlike ``detect_tool_progress``).
+    Only matches single-line content.
+    """
+    if not content:
+        return None
+    stripped = content.strip()
+    if "\n" in stripped:
+        return None
+    m = _HOOK_STATUS_RE.match(stripped)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
 
 
 def build_tool_execution_channel_data(tool_name: str, preview: str) -> Dict[str, Any]:
