@@ -833,6 +833,15 @@ class GrixAdapter(BasePlatformAdapter):
             self._tool_progress_msg_ids.discard(message_id)
             return SendResult(success=False, error="tool_progress_card_fallback")
 
+        # Apply the same status-to-card conversion as send() so that heartbeat
+        # edits (⏳ Working — N min…) render as progress cards rather than plain
+        # text after the first send already established a card bubble.
+        status_text = detect_agent_status(content)
+        if status_text:
+            progress_card = build_queue_progress_card(status_text)
+            if progress_card is not None:
+                content = progress_card
+
         _ = finalize
         client = await self._get_ready_client(operation="edit_message")
         if not client:
