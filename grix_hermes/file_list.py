@@ -9,6 +9,8 @@ import stat as stat_mod
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from .protocol import get_hostname
+
 
 def handle_file_list_action(
     params: Dict[str, Any],
@@ -64,6 +66,7 @@ def handle_file_list_action(
         "result": {
             "files": files,
             "current_path": real_target,
+            "machine_name": get_hostname(),
         },
     }
 
