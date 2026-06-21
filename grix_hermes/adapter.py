@@ -1311,18 +1311,22 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def _handle_file_list(self, action: GrixLocalAction) -> None:
         from .file_list import handle_file_list_action, real_home_dir
+        from .protocol import get_hostname
 
         if not self._client:
             return
         result = handle_file_list_action(
             action.params,
-            resolve_cwd=lambda _sid: None,
             fallback_dir=real_home_dir(),
         )
+        # machine_name 在边界统一注入：仅当有 result（成功）时附加，与 grix-connector 对齐。
+        payload = result.get("result")
+        if payload is not None:
+            payload = {**payload, "machine_name": get_hostname()}
         await self._client.send_local_action_result(
             action_id=action.action_id,
             status=result["status"],
-            result=result.get("result"),
+            result=payload,
             error_code=result.get("error_code"),
             error_message=result.get("error_msg"),
         )
