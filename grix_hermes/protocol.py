@@ -266,6 +266,11 @@ class GrixLocalAction:
     raw: Dict[str, Any] = None
 
 
+def get_hostname() -> str:
+    """返回当前 agent 所在机器的主机名，全项目统一从这里获取。"""
+    return socket.gethostname()
+
+
 def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     capabilities = normalize_capabilities(config.capabilities)
     local_actions = normalize_names(config.local_actions)
@@ -295,7 +300,7 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     if config.skills:
         payload["skills"] = config.skills
     payload["host_meta"] = {
-        "hostname": socket.gethostname(),
+        "hostname": get_hostname(),
         "platform": platform.system().lower(),
         "arch": platform.machine(),
         "os_release": platform.release(),
