@@ -1,7 +1,0 @@
-{
-  "statusLine": {
-    "type": "command",
-    "command": "node /Volumes/disk1/go/src/grix-connector/dist/scripts/status-line-forwarder.js",
-    "refreshInterval": 10
-  }
-}

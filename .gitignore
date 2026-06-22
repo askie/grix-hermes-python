@@ -7,3 +7,6 @@ build/
 .env
 .venv/
 venv/
+
+# Claude Code 本地设置，不纳入版本管理
+.claude/settings.json
