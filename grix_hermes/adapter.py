@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import dataclasses
 import json
 import logging
 import os
 import time
 from contextlib import suppress
+from contextvars import ContextVar
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +35,7 @@ from .agent_status_cards import (
     detect_agent_status,
 )
 from .contract import (
+    CMD_CONTROL_SHARE_SET,
     CMD_EVENT_CANCEL,
     CMD_EVENT_EDIT,
     CMD_EVENT_MSG,
@@ -88,6 +91,13 @@ from .transport import (
 _PLATFORM_VALUE = "grix"
 
 logger = logging.getLogger(__name__)
+
+# agent 共享：handler 在入口把「正在处理本 packet 的 client」绑定到这个 ContextVar，
+# 下游所有 send 通过 self._active_client() 取（contextvars 跨 await 自动透传）；
+# 未设置时回退主连接 self._client（兼容非 packet 上下文的调用，如启动时主动发包）。
+_CURRENT_CLIENT_CTX: ContextVar[Optional[GrixTransportClient]] = ContextVar(
+    "grix_hermes_current_client", default=None
+)
 
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
 _EVENT_DEDUP_WINDOW_SECONDS = 300
@@ -388,6 +398,26 @@ class GrixAdapter(BasePlatformAdapter):
         # Keyed by both session_id and session_key for fast lookup in send().
         self._session_connector_hints: Dict[str, Dict[str, Any]] = {}
 
+        # agent 共享：为每个被共享者维护一条独立 WS 连接（key=shared_owner_id, value=client）。
+        # 主连接收到 CMD_CONTROL_SHARE_SET 后 diff 名单增删；共享子连接复用 self._handle_protocol_packet
+        # 处理回调，所有 send 通过 _active_client() 路由到「事件来源 client」（contextvars 透传）。
+        self._shared_clients: Dict[str, GrixTransportClient] = {}
+        # 串行化共享子连接的增删，避免并发 control_share_set 造成重复建/漏删。
+        self._share_sync_lock = asyncio.Lock()
+        # 关停标志：disconnect 期间禁止再为共享名单建新子连接，避免泄漏。
+        self._shutting_down = False
+
+    def _active_client(self) -> Optional[GrixTransportClient]:
+        """返回「当前应使用的 client」：处理 packet 时回事件来源 client（共享子连接或主连接），
+        否则回退主连接。所有 send_* / complete_* / acknowledge_* 调用都应走这里，
+        以保证共享子连接收到的事件，回执也从同一条连接发出（不串到主连接 / 不串给主人）。"""
+        return _CURRENT_CLIENT_CTX.get() or self._client
+
+    def _bind_packet_handler(self, client: GrixTransportClient) -> None:
+        """把 packet handler 绑定到 client，回调时携带 client 引用（让 _handle_protocol_packet
+        知道事件从哪条连接来）。"""
+        client.on_packet = lambda packet: self._handle_protocol_packet(packet, source_client=client)
+
     def format_message(self, content: str) -> str:
         return content.strip()
 
@@ -421,6 +451,29 @@ class GrixAdapter(BasePlatformAdapter):
         operation: str,
         require_authed: bool = True,
     ) -> Optional[GrixTransportClient]:
+        # agent 共享:在 packet handler 上下文中（contextvar 已 set 为事件来源 client）
+        # 优先取该 client（共享子连接 / 主连接）;只要它就绪就直接用,以保证 LLM 回复
+        # /edit/delete/typing/invoke 等公开方法都从「事件来源连接」回发,不串到主连接。
+        # contextvar 未设置（背景任务,如启动时 _report_skills）或事件来源 client 已不就绪时,
+        # 才回退主连接 self._client + reconnect 路径,与旧行为一致。
+        ctx_client = _CURRENT_CLIENT_CTX.get()
+        if ctx_client is not None:
+            status = getattr(ctx_client, "status", None)
+            if not isinstance(status, dict):
+                return ctx_client
+            if bool(status.get("connected")) and (bool(status.get("authed")) or not require_authed):
+                return ctx_client
+            # 共享子连接不就绪:不触发主连接 reconnect 路径(那只属于主连接),直接报失败给上层。
+            logger.warning(
+                "[%s] GRIX shared transport unavailable during %s shared_owner=%s connected=%s authed=%s",
+                self.name,
+                operation,
+                getattr(getattr(ctx_client, "_config", None), "shared_owner_id", None),
+                bool(status.get("connected")),
+                bool(status.get("authed")),
+            )
+            return None
+
         client = self._client
         if not client:
             return None
@@ -512,9 +565,9 @@ class GrixAdapter(BasePlatformAdapter):
                     new_client = GrixTransportClient(
                         self.connection,
                         connector=self._connector,
-                        on_packet=self._handle_protocol_packet,
                         on_status=self._handle_transport_status,
                     )
+                    self._bind_packet_handler(new_client)
                     await new_client.connect()
                     self._client = new_client
                     self._mark_connected()
@@ -579,9 +632,9 @@ class GrixAdapter(BasePlatformAdapter):
         self._client = GrixTransportClient(
             self.connection,
             connector=self._connector,
-            on_packet=self._handle_protocol_packet,
             on_status=self._handle_transport_status,
         )
+        self._bind_packet_handler(self._client)
         try:
             await self._client.connect()
         except GrixAuthRejectedError as exc:
@@ -608,13 +661,23 @@ class GrixAdapter(BasePlatformAdapter):
                 for s in entries
             ]
             if self._client and skills:
-                await self._client.send_skills_update(skills)
+                await self._active_client().send_skills_update(skills)
                 logger.info("[%s] Reported %d skill(s)", self.name, len(skills))
         except Exception as exc:
             logger.debug("[%s] Skills report failed: %s", self.name, exc)
 
     async def disconnect(self) -> None:
         self._disconnect_requested = True
+        # agent 共享：置位 shutting_down,串行等在途 share-set 同步结束,避免关停后泄漏。
+        self._shutting_down = True
+        async with self._share_sync_lock:
+            shared_clients = list(self._shared_clients.values())
+            self._shared_clients.clear()
+        for shared in shared_clients:
+            try:
+                await shared.disconnect("adapter disconnect")
+            except Exception as exc:
+                logger.debug("[%s] GRIX shared client disconnect failed: %s", self.name, exc)
         client = self._client
         self._client = None
         if client:
@@ -1202,9 +1265,17 @@ class GrixAdapter(BasePlatformAdapter):
         self._set_fatal_error("grix_connection_lost", message, retryable=True)
         await self._notify_fatal_error()
 
-    async def _handle_protocol_packet(self, packet: Dict[str, Any]) -> None:
+    async def _handle_protocol_packet(
+        self,
+        packet: Dict[str, Any],
+        source_client: Optional[GrixTransportClient] = None,
+    ) -> None:
+        """处理一个 packet。source_client 指明事件来源连接（主或共享子连接），
+        通过 ContextVar 透传给下游所有 send_*，确保回执从同一连接发出，
+        不会把共享子连接收到的事件回到主连接（造成共享越权/串扰）。"""
         cmd = packet.get("cmd")
         payload = packet.get("payload") or {}
+        token = _CURRENT_CLIENT_CTX.set(source_client) if source_client is not None else None
         try:
             if cmd == CMD_EVENT_MSG:
                 await self._handle_message_packet(payload)
@@ -1220,18 +1291,101 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._handle_event_cancel_packet(payload)
             elif cmd == CMD_QUEUE_CLEAR:
                 await self._handle_queue_clear_packet(payload)
+            elif cmd == CMD_CONTROL_SHARE_SET:
+                # 共享名单仅主连接处理：共享子连接虽然也可能收到，但 diff 须由主实例统一做。
+                if source_client is None or source_client is self._client:
+                    await self._handle_share_set_packet(payload)
+                else:
+                    logger.debug(
+                        "[%s] Ignoring %s on shared client (only primary handles diff)",
+                        self.name,
+                        cmd,
+                    )
             else:
                 logger.debug("[%s] Ignoring unknown GRIX packet %s", self.name, cmd)
         except Exception as exc:
             logger.error("[%s] Failed handling GRIX packet %s: %s", self.name, cmd, exc, exc_info=True)
+        finally:
+            if token is not None:
+                _CURRENT_CLIENT_CTX.reset(token)
+
+    async def _handle_share_set_packet(self, payload: Dict[str, Any]) -> None:
+        """agent 共享：后端下发当前被共享者全量名单，diff 后增删共享子连接。
+        每个被共享者一条独立 WS（主人 api_key + shared_owner_id），handler 回调
+        通过 contextvar 路由到各自 client，确保回执不串。"""
+        raw_list = payload.get("shared_to") or []
+        if not isinstance(raw_list, list):
+            logger.warning("[%s] control_share_set ignored: shared_to not list", self.name)
+            return
+        desired: set[str] = set()
+        for item in raw_list:
+            s = str(item).strip()
+            if s:
+                desired.add(s)
+
+        async with self._share_sync_lock:
+            current = set(self._shared_clients.keys())
+            to_add = desired - current
+            to_remove = current - desired
+
+            # 新增：为名单中尚未运行的被共享者建独立 client。
+            for shared_owner_id in to_add:
+                if self._shutting_down:
+                    break
+                try:
+                    shared_config = dataclasses.replace(
+                        self.connection, shared_owner_id=shared_owner_id
+                    )
+                    shared_client = GrixTransportClient(
+                        shared_config,
+                        connector=self._connector,
+                        on_status=self._handle_transport_status,
+                    )
+                    self._bind_packet_handler(shared_client)
+                    await shared_client.connect()
+                    self._shared_clients[shared_owner_id] = shared_client
+                    logger.info(
+                        "[%s] shared client connected agent=%s shared_owner=%s",
+                        self.name,
+                        self.connection.agent_id,
+                        shared_owner_id,
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "[%s] connect shared client failed shared_owner=%s: %s",
+                        self.name,
+                        shared_owner_id,
+                        exc,
+                    )
+
+            # 移除：已不在名单中的子连接，断开并清理。
+            for shared_owner_id in to_remove:
+                shared_client = self._shared_clients.pop(shared_owner_id, None)
+                if shared_client is None:
+                    continue
+                try:
+                    await shared_client.disconnect("share revoked")
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] disconnect shared client failed shared_owner=%s: %s",
+                        self.name,
+                        shared_owner_id,
+                        exc,
+                    )
+                logger.info(
+                    "[%s] shared client disconnected agent=%s shared_owner=%s",
+                    self.name,
+                    self.connection.agent_id,
+                    shared_owner_id,
+                )
 
     async def _handle_local_action_packet(self, payload: Dict[str, Any]) -> None:
-        if not self._client:
+        if not self._active_client():
             return
 
         action: GrixLocalAction = normalize_local_action(payload)
         if not action.action_id or not action.action_type:
-            await self._client.send_local_action_result(
+            await self._active_client().send_local_action_result(
                 action_id=action.action_id or "unknown",
                 status=STATUS_FAILED,
                 error_code=ERR_INVALID_LOCAL_ACTION,
@@ -1248,7 +1402,7 @@ class GrixAdapter(BasePlatformAdapter):
             return
 
         if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
-            await self._client.send_local_action_result(
+            await self._active_client().send_local_action_result(
                 action_id=action.action_id,
                 status=STATUS_UNSUPPORTED,
                 error_code=ERR_UNSUPPORTED_LOCAL_ACTION,
@@ -1258,7 +1412,7 @@ class GrixAdapter(BasePlatformAdapter):
 
         approval_id = _approval_lookup_id(action.params)
         if not approval_id:
-            await self._client.send_local_action_result(
+            await self._active_client().send_local_action_result(
                 action_id=action.action_id,
                 status=STATUS_FAILED,
                 error_code=ERR_MISSING_APPROVAL_ID,
@@ -1268,7 +1422,7 @@ class GrixAdapter(BasePlatformAdapter):
 
         approval_choice, decision_value = _approval_choice_from_action(action.action_type, action.params)
         if approval_choice is None:
-            await self._client.send_local_action_result(
+            await self._active_client().send_local_action_result(
                 action_id=action.action_id,
                 status=STATUS_FAILED,
                 error_code=ERR_UNSUPPORTED_DECISION,
@@ -1279,7 +1433,7 @@ class GrixAdapter(BasePlatformAdapter):
         approval_state = self._approval_state.pop(approval_id, None)
         session_key = str((approval_state or {}).get("session_key") or "").strip()
         if not session_key:
-            await self._client.send_local_action_result(
+            await self._active_client().send_local_action_result(
                 action_id=action.action_id,
                 status=STATUS_FAILED,
                 error_code=ERR_APPROVAL_NOT_FOUND,
@@ -1291,7 +1445,7 @@ class GrixAdapter(BasePlatformAdapter):
 
         resolved = resolve_gateway_approval(session_key, approval_choice)
         if resolved <= 0:
-            await self._client.send_local_action_result(
+            await self._active_client().send_local_action_result(
                 action_id=action.action_id,
                 status=STATUS_FAILED,
                 error_code=ERR_APPROVAL_NOT_FOUND,
@@ -1303,7 +1457,7 @@ class GrixAdapter(BasePlatformAdapter):
         if paused_chat_id:
             self.resume_typing_for_chat(paused_chat_id)
 
-        await self._client.send_local_action_result(
+        await self._active_client().send_local_action_result(
             action_id=action.action_id,
             status=STATUS_OK,
             result=decision_value or approval_choice,
@@ -1313,7 +1467,7 @@ class GrixAdapter(BasePlatformAdapter):
         from .file_list import handle_file_list_action, real_home_dir
         from .protocol import get_hostname
 
-        if not self._client:
+        if not self._active_client():
             return
         result = handle_file_list_action(
             action.params,
@@ -1323,7 +1477,7 @@ class GrixAdapter(BasePlatformAdapter):
         payload = result.get("result")
         if payload is not None:
             payload = {**payload, "machine_name": get_hostname()}
-        await self._client.send_local_action_result(
+        await self._active_client().send_local_action_result(
             action_id=action.action_id,
             status=result["status"],
             result=payload,
@@ -1334,11 +1488,11 @@ class GrixAdapter(BasePlatformAdapter):
     async def _handle_get_session_usage(self, action: GrixLocalAction) -> None:
         from .session_usage import handle_session_usage_action
 
-        if not self._client:
+        if not self._active_client():
             return
         hermes_home = self._resolve_hermes_home()
         result = handle_session_usage_action(action.params, hermes_home=hermes_home)
-        await self._client.send_local_action_result(
+        await self._active_client().send_local_action_result(
             action_id=action.action_id,
             status=result["status"],
             result=result.get("result"),
@@ -1419,7 +1573,7 @@ class GrixAdapter(BasePlatformAdapter):
         is_duplicate = self._remember_event_id(message.event_id)
         if is_duplicate:
             if self._client:
-                await self._client.acknowledge_event(
+                await self._active_client().acknowledge_event(
                     event_id=message.event_id,
                     session_id=message.session_id,
                     message_id=message.message_id,
@@ -1429,7 +1583,7 @@ class GrixAdapter(BasePlatformAdapter):
             return
 
         if self._client:
-            await self._client.acknowledge_event(
+            await self._active_client().acknowledge_event(
                 event_id=message.event_id,
                 session_id=message.session_id,
                 message_id=message.message_id,
@@ -1481,7 +1635,7 @@ class GrixAdapter(BasePlatformAdapter):
                     result_text = f"Unknown exec command: {subcommand}\nSupported: skills, stop"
 
                 if self._client:
-                    await self._client.send_text(
+                    await self._active_client().send_text(
                         message.session_id,
                         result_text,
                         reply_to_message_id=message.message_id,
@@ -1688,7 +1842,7 @@ class GrixAdapter(BasePlatformAdapter):
             )
 
         if self._client:
-            await self._client.acknowledge_event(
+            await self._active_client().acknowledge_event(
                 event_id=revoke.event_id,
                 session_id=revoke.session_id,
                 message_id=revoke.message_id,
@@ -1741,7 +1895,7 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def _handle_event_cancel_packet(self, payload: Dict[str, Any]) -> None:
         """处理后端下发的 event_cancel：取消某个进行中的事件并上报结果。"""
-        if not self._client:
+        if not self._active_client():
             return
 
         try:
@@ -1769,7 +1923,7 @@ class GrixAdapter(BasePlatformAdapter):
                 status=STATUS_FAILED,
                 message="event canceled by user",
             )
-            await self._client.send_event_cancel_result(
+            await self._active_client().send_event_cancel_result(
                 event_id=cancel.event_id,
                 accepted=True,
             )
@@ -1782,7 +1936,7 @@ class GrixAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             try:
-                await self._client.send_event_cancel_result(
+                await self._active_client().send_event_cancel_result(
                     event_id=cancel.event_id,
                     accepted=False,
                     reason=str(exc),
@@ -1792,7 +1946,7 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def _handle_queue_clear_packet(self, payload: Dict[str, Any]) -> None:
         """处理后端下发的 queue_clear：清空某会话的待处理队列并上报结果。"""
-        if not self._client:
+        if not self._active_client():
             return
 
         try:
@@ -1830,7 +1984,7 @@ class GrixAdapter(BasePlatformAdapter):
                 if _matches(key):
                     self._pending_messages.pop(key, None)
 
-            await self._client.send_queue_clear_result(
+            await self._active_client().send_queue_clear_result(
                 session_id=session_id,
                 success=True,
             )
@@ -1843,7 +1997,7 @@ class GrixAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             try:
-                await self._client.send_queue_clear_result(
+                await self._active_client().send_queue_clear_result(
                     session_id=clear.session_id,
                     success=False,
                     message=str(exc),
@@ -1879,7 +2033,7 @@ class GrixAdapter(BasePlatformAdapter):
         is_duplicate = self._remember_event_id(stop.event_id)
         if is_duplicate:
             if self._client:
-                await self._client.acknowledge_stop(
+                await self._active_client().acknowledge_stop(
                     event_id=stop.event_id,
                     stop_id=stop.stop_id,
                     accepted=True,
@@ -1889,7 +2043,7 @@ class GrixAdapter(BasePlatformAdapter):
             return
 
         if self._client:
-            await self._client.acknowledge_stop(
+            await self._active_client().acknowledge_stop(
                 event_id=stop.event_id,
                 stop_id=stop.stop_id,
                 accepted=True,
@@ -1985,7 +2139,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not self._client or not event_id or event_id in self._completed_event_ids:
             return
         try:
-            await self._client.complete_event(
+            await self._active_client().complete_event(
                 event_id=event_id,
                 status=status,
                 message=message,
@@ -2015,7 +2169,7 @@ class GrixAdapter(BasePlatformAdapter):
     ) -> None:
         if not self._client or not event_id:
             return
-        await self._client.complete_stop(
+        await self._active_client().complete_stop(
             event_id=event_id,
             stop_id=stop_id,
             status=status,
@@ -2030,12 +2184,12 @@ class GrixAdapter(BasePlatformAdapter):
         }
 
     async def _replay_completed_event(self, event_id: str) -> None:
-        if not self._client:
+        if not self._active_client():
             return
         result = self._completed_event_results.get(event_id)
         if not result:
             return
-        await self._client.complete_event(
+        await self._active_client().complete_event(
             event_id=event_id,
             status=str(result.get("status") or STATUS_RESPONDED),
             message=result.get("message"),
@@ -2057,7 +2211,7 @@ class GrixAdapter(BasePlatformAdapter):
             if not result:
                 continue
             try:
-                await self._client.complete_event(
+                await self._active_client().complete_event(
                     event_id=eid,
                     status=str(result.get("status") or STATUS_RESPONDED),
                     message=result.get("message"),
@@ -2075,12 +2229,12 @@ class GrixAdapter(BasePlatformAdapter):
             )
 
     async def _replay_completed_stop(self, event_id: str, stop_id: Optional[str]) -> None:
-        if not self._client:
+        if not self._active_client():
             return
         result = self._completed_stop_results.get(event_id)
         if not result:
             return
-        await self._client.complete_stop(
+        await self._active_client().complete_stop(
             event_id=event_id,
             stop_id=stop_id or result.get("stop_id"),
             status=str(result.get("status") or STATUS_ALREADY_FINISHED),
