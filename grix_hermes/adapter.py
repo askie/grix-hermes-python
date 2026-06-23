@@ -768,12 +768,11 @@ class GrixAdapter(BasePlatformAdapter):
                 await client.disconnect("adapter disconnect")
             except Exception as exc:
                 logger.debug("[%s] GRIX disconnect failed: %s", self.name, exc)
-        self._active_state().seen_event_ids.clear()
-        self._active_state().completed_event_results.clear()
-        self._active_state().completed_stop_results.clear()
-        self._active_state().completed_event_ids.clear()
-        self._active_state().tool_progress_msg_ids.clear()
-        self._active_state().session_connector_hints.clear()
+        # adapter 关停：所有 owner（主连接 + 全部被共享者）的 state 一次性清光。
+        # 之前按 self._active_state().xxx.clear() 仅清了「active owner」(disconnect
+        # 时 ContextVar 为 None → 落到主 owner)，而且只清了 6/16 个字段；其余 owner
+        # 的 state + 主 owner 漏清的 10 个字段会全部残留，构成内存泄漏 + 重连后状态污染。
+        self._owner_states.clear()
         await self._safe_release_lock()
         self._mark_disconnected()
 

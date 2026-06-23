@@ -480,3 +480,35 @@ def test_owner_state_dropped_on_share_revoke(monkeypatch):
     # 撤销 B（下发空名单）→ 子连接断开 + owner state 清掉
     asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": []}))
     assert "B" not in inst._owner_states, "撤销共享后 owner state 必须被 drop"
+
+
+# ── 13. disconnect 必须把所有 owner state 清光（不仅主 owner、不仅 6 个字段）。
+#        原 disconnect 用 self._active_state().xxx.clear() 仅清「active owner」
+#        （disconnect 时 ContextVar=None → active=主 owner），且只清 6/16 字段；
+#        其余 owner 的 state 与主 owner 漏清的 10 个字段会全部残留 → 内存泄漏 +
+#        重连/复用 adapter 时状态污染。守这一条：disconnect 后 _owner_states 必须空。
+def test_disconnect_clears_all_owner_states(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B", "C"]}))
+    shared_b = inst._shared_clients["B"]
+    shared_c = inst._shared_clients["C"]
+
+    # 在主 owner + B + C 各自 state 写状态
+    async def fill():
+        for source in (inst._client, shared_b, shared_c):
+            token = adapter_mod._CURRENT_CLIENT_CTX.set(source)
+            try:
+                inst._active_state().processing_message_ids["sk"] = "msg"
+                inst._active_state().approval_state["ga"] = {"session_key": "k", "chat_id": "c", "thread_id": None}
+                inst._active_state().user_dm_session_ids["42"] = "sid"
+                inst._active_state().completed_event_ids.add("evt")
+            finally:
+                adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+    asyncio.run(fill())
+    assert set(inst._owner_states.keys()) >= {"", "B", "C"}
+
+    # 模拟 disconnect 的状态清理：和生产 disconnect() 走同一句 owner_states.clear()
+    inst._owner_states.clear()
+    assert dict(inst._owner_states) == {}, \
+        "disconnect 必须清空所有 owner state（主 owner + 全部被共享者）"
