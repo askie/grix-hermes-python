@@ -125,6 +125,9 @@ class GrixConnectionConfig:
     skills: Optional[List[Dict[str, Any]]] = None
     connect_timeout_ms: int = DEFAULT_CONNECT_TIMEOUT_MS
     request_timeout_ms: int = DEFAULT_REQUEST_TIMEOUT_MS
+    # agent 共享：为某被共享者建立独立 WS 连接时携带（连同主人 api_key）。
+    # 后端据此把本连接身份认定为该被共享者；为空/None 表示主连接（主人本人）。
+    shared_owner_id: Optional[str] = None
 
 
 def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> GrixConnectionConfig:
@@ -299,6 +302,9 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
         payload["host_version"] = config.host_version
     if config.skills:
         payload["skills"] = config.skills
+    # agent 共享：被共享者连接握手时带 shared_owner_id，后端据此认定本连接身份。
+    if config.shared_owner_id:
+        payload["shared_owner_id"] = config.shared_owner_id
     payload["host_meta"] = {
         "hostname": get_hostname(),
         "platform": platform.system().lower(),

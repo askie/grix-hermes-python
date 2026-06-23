@@ -47,6 +47,11 @@ CMD_QUEUE_CLEAR_RESULT = "queue_clear_result"
 CMD_EVENT_STATE = "event_state"
 CMD_QUEUE_SNAPSHOT = "queue_snapshot"
 
+# agent 共享：后端 → 主连接下行命令，载荷 {agent_id: str, shared_to: [str, ...]}。
+# Hermes 收到后 diff 名单，为每个被共享者维护一条独立 WS 连接
+# （主人 api_key + shared_owner_id）。仅主连接会收到。
+CMD_CONTROL_SHARE_SET = "control_share_set"
+
 STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_AUTH, "direction": "client_to_server", "purpose": "authenticate"},
     {"cmd": CMD_AUTH_ACK, "direction": "server_to_client", "purpose": "authentication_result"},
