@@ -13,10 +13,12 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from contextlib import suppress
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
@@ -105,6 +107,42 @@ _CURRENT_CLIENT_CTX: ContextVar[Optional[GrixTransportClient]] = ContextVar(
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
 _EVENT_DEDUP_WINDOW_SECONDS = 300
 _EVENT_DEDUP_MAX_SIZE = 1000
+
+# agent 共享：adapter 是单进程多 WS，主连接和每个被共享者各一条连接，但 adapter 实例
+# 只有一个。下面这些 per-chat / per-event 状态字典如果不按 owner 隔离，跨 owner 会串
+# 数据(同一外部用户 X 同时是 owner A 和 owner B 的联系人时，DM session/审批/processing
+# 状态会互相覆盖)。把所有 per-owner 状态收口到 _OwnerState，按 _CURRENT_CLIENT_CTX
+# 解析出的 owner_key 分桶。主连接 owner_key=""（_PRIMARY_OWNER_KEY），共享子连接
+# owner_key=shared_owner_id 字符串。
+_PRIMARY_OWNER_KEY = ""
+
+
+@dataclass
+class _OwnerState:
+    """单一 owner（主人 or 某个被共享者）维度的所有运行时状态。
+
+    所有以 (chat_id / sender_id / session_id / message_id / event_id / approval_id /
+    session_key) 为 key 的字典都按 owner 分桶，避免跨 owner 串数据。event_id /
+    session_id 在 aibot 后端是 snowflake 全局唯一，但 dedup / 缓存依然按 owner 隔离
+    以保证撤销共享后状态可干净清除（不影响其他 owner）。
+    """
+
+    completed_event_ids: Set[str] = field(default_factory=set)
+    seen_event_ids: Dict[str, float] = field(default_factory=dict)
+    completed_event_results: Dict[str, Dict[str, Optional[str]]] = field(default_factory=dict)
+    completed_stop_results: Dict[str, Dict[str, Optional[str]]] = field(default_factory=dict)
+    reply_event_ids: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    latest_sources: Dict[str, Any] = field(default_factory=dict)
+    message_sources: Dict[Tuple[str, str], Any] = field(default_factory=dict)
+    message_session_keys: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    user_dm_session_ids: Dict[str, str] = field(default_factory=dict)
+    user_dm_session_keys: Dict[str, str] = field(default_factory=dict)
+    approval_state: Dict[str, Dict[str, Optional[str]]] = field(default_factory=dict)
+    processing_message_ids: Dict[str, str] = field(default_factory=dict)
+    revoked_message_keys: Set[Tuple[str, str]] = field(default_factory=set)
+    busy_ack_msg_ids: Dict[str, Tuple[str, str, Any]] = field(default_factory=dict)
+    tool_progress_msg_ids: Set[str] = field(default_factory=set)
+    session_connector_hints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 def check_grix_requirements() -> bool:
@@ -379,30 +417,13 @@ class GrixAdapter(BasePlatformAdapter):
         self._connector = None
         self._disconnect_requested = False
         self._token_lock_identity: Optional[str] = None
-        self._completed_event_ids: set[str] = set()
-        self._seen_event_ids: Dict[str, float] = {}
-        self._completed_event_results: Dict[str, Dict[str, Optional[str]]] = {}
-        self._completed_stop_results: Dict[str, Dict[str, Optional[str]]] = {}
-        self._reply_event_ids: Dict[tuple[str, str], str] = {}
-        self._latest_sources: Dict[str, Any] = {}
-        self._message_sources: Dict[tuple[str, str], Any] = {}
-        self._message_session_keys: Dict[tuple[str, str], str] = {}
-        self._user_dm_session_ids: Dict[str, str] = {}
-        self._user_dm_session_keys: Dict[str, str] = {}
-        self._approval_state: Dict[str, Dict[str, Optional[str]]] = {}
-        self._processing_message_ids: Dict[str, str] = {}
-        self._revoked_message_keys: set[tuple[str, str]] = set()
-        # 记录 busy-ack 提示消息：(chat_id, msg_id, sender_client)。
-        # 第三项是发送该 busy-ack 的 client（主连接 / 共享子连接），删除时显式 ContextVar
-        # 还原回去,避免删除路径脱离 packet handler 上下文后走错连接。
-        self._busy_ack_msg_ids: Dict[str, tuple[str, str, GrixTransportClient]] = {}
+        # agent 共享：所有 per-chat / per-event 状态收口到 _OwnerState，按当前 packet
+        # 的 _CURRENT_CLIENT_CTX 解析出的 owner_key 分桶，跨 owner 物理隔离。详见
+        # _OwnerState dataclass 与 _active_state() / _state_for() helper。
+        self._owner_states: Dict[str, _OwnerState] = defaultdict(_OwnerState)
         self._last_send_at: float = 0.0
         self._send_lock = asyncio.Lock()
         self._reconnect_lock = asyncio.Lock()
-        self._tool_progress_msg_ids: set[str] = set()
-        # extra.connector hints injected by the backend per-session (e.g. group chat).
-        # Keyed by both session_id and session_key for fast lookup in send().
-        self._session_connector_hints: Dict[str, Dict[str, Any]] = {}
 
         # agent 共享：为每个被共享者维护一条独立 WS 连接（key=shared_owner_id, value=client）。
         # 主连接收到 CMD_CONTROL_SHARE_SET 后 diff 名单增删；共享子连接复用 self._handle_protocol_packet
@@ -412,6 +433,36 @@ class GrixAdapter(BasePlatformAdapter):
         self._share_sync_lock = asyncio.Lock()
         # 关停标志：disconnect 期间禁止再为共享名单建新子连接，避免泄漏。
         self._shutting_down = False
+
+    @staticmethod
+    def _owner_key_of(client: Optional[GrixTransportClient]) -> str:
+        """从 client 解析出 owner_key：共享子连接=shared_owner_id，主连接=""。"""
+        if client is None:
+            return _PRIMARY_OWNER_KEY
+        # 真 client 用 _config（私有），测试用 FakeClient 暴露 config（公开），都兼容。
+        cfg = getattr(client, "_config", None) or getattr(client, "config", None)
+        shared = getattr(cfg, "shared_owner_id", None)
+        if shared:
+            s = str(shared).strip()
+            if s:
+                return s
+        return _PRIMARY_OWNER_KEY
+
+    def _active_owner_key(self) -> str:
+        """当前 packet 上下文的 owner_key（依据 _CURRENT_CLIENT_CTX）。
+        不在 packet handler 上下文时回落到主连接 — 这条路径只剩管理性主动调用，
+        与「跨 owner 串数据」无关。"""
+        return self._owner_key_of(_CURRENT_CLIENT_CTX.get())
+
+    def _state_for(self, owner_key: str) -> _OwnerState:
+        return self._owner_states[owner_key]
+
+    def _active_state(self) -> _OwnerState:
+        return self._state_for(self._active_owner_key())
+
+    def _drop_owner_state(self, owner_key: str) -> None:
+        """从 owner_states 移除某 owner 的全部状态（撤销共享 / 共享子连接关闭时调用）。"""
+        self._owner_states.pop(owner_key, None)
 
     def _active_client(self) -> Optional[GrixTransportClient]:
         """返回「当前应使用的 client」：处理 packet 时回事件来源 client（共享子连接或主连接）。
@@ -717,12 +768,12 @@ class GrixAdapter(BasePlatformAdapter):
                 await client.disconnect("adapter disconnect")
             except Exception as exc:
                 logger.debug("[%s] GRIX disconnect failed: %s", self.name, exc)
-        self._seen_event_ids.clear()
-        self._completed_event_results.clear()
-        self._completed_stop_results.clear()
-        self._completed_event_ids.clear()
-        self._tool_progress_msg_ids.clear()
-        self._session_connector_hints.clear()
+        self._active_state().seen_event_ids.clear()
+        self._active_state().completed_event_results.clear()
+        self._active_state().completed_stop_results.clear()
+        self._active_state().completed_event_ids.clear()
+        self._active_state().tool_progress_msg_ids.clear()
+        self._active_state().session_connector_hints.clear()
         await self._safe_release_lock()
         self._mark_disconnected()
 
@@ -738,7 +789,7 @@ class GrixAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
 
         # Read per-session connector hints injected by the backend (e.g. group chat).
-        _hints = self._session_connector_hints.get(str(chat_id)) or {}
+        _hints = self._active_state().session_connector_hints.get(str(chat_id)) or {}
         _drop_thinking = _hints.get("thinking_events") == "drop"
         _drop_tools = _hints.get("tool_events") == "drop"
 
@@ -796,7 +847,7 @@ class GrixAdapter(BasePlatformAdapter):
 
         await self._enforce_send_rate()
 
-        source_hint = self._latest_sources.get(str(chat_id))
+        source_hint = self._active_state().latest_sources.get(str(chat_id))
         session_id, thread_id = await resolve_grix_target(
             client,
             self.connection,
@@ -841,14 +892,14 @@ class GrixAdapter(BasePlatformAdapter):
             )
             # Track tool progress messages so edit_message can intercept them.
             if tp and result.success and result.message_id:
-                self._tool_progress_msg_ids.add(result.message_id)
+                self._active_state().tool_progress_msg_ids.add(result.message_id)
             if result.message_id and reply_to:
                 _normalized_reply_to = str(reply_to).strip()
                 for _sk, _pe in self._pending_messages.items():
                     if _pe and str(getattr(_pe, "message_id", "")).strip() == _normalized_reply_to:
                         # 记下发送 busy-ack 的 client,后续删除时要从同一条连接发删除指令,
                         # 避免脱离 packet 上下文后走错连接(可能错走主连接 / 共享子连接)。
-                        self._busy_ack_msg_ids[_sk] = (str(chat_id), result.message_id, client)
+                        self._active_state().busy_ack_msg_ids[_sk] = (str(chat_id), result.message_id, client)
                         logger.debug(
                             "[%s] Tracked busy-ack notification msg_id=%s for session_key=%s",
                             self.name, result.message_id, _sk,
@@ -880,7 +931,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not resolved_approval_id:
             resolved_approval_id = f"ga_{abs(hash((session_key, command))) & 0xFFFFFFFF:08x}"
 
-        source_hint = self._latest_sources.get(str(chat_id))
+        source_hint = self._active_state().latest_sources.get(str(chat_id))
         session_id, thread_id = await resolve_grix_target(
             client,
             self.connection,
@@ -909,7 +960,7 @@ class GrixAdapter(BasePlatformAdapter):
                 biz_card=message.biz_card,
                 channel_data=message.channel_data,
             )
-            self._approval_state[resolved_approval_id] = {
+            self._active_state().approval_state[resolved_approval_id] = {
                 "session_key": str(session_key).strip(),
                 "chat_id": str(chat_id).strip(),
                 "thread_id": thread_id,
@@ -940,8 +991,8 @@ class GrixAdapter(BasePlatformAdapter):
         # Only intercept edits to messages we previously identified as
         # tool progress (tracked via _tool_progress_msg_ids) to avoid
         # false positives on regular streaming AI text.
-        if message_id in self._tool_progress_msg_ids:
-            self._tool_progress_msg_ids.discard(message_id)
+        if message_id in self._active_state().tool_progress_msg_ids:
+            self._active_state().tool_progress_msg_ids.discard(message_id)
             return SendResult(success=False, error="tool_progress_card_fallback")
 
         # Apply the same status-to-card conversion as send() so that heartbeat
@@ -958,7 +1009,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
         try:
-            source_hint = self._latest_sources.get(str(chat_id))
+            source_hint = self._active_state().latest_sources.get(str(chat_id))
             session_id, _thread_id = await resolve_grix_target(
                 client,
                 self.connection,
@@ -998,7 +1049,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
         try:
-            source_hint = self._latest_sources.get(str(chat_id))
+            source_hint = self._active_state().latest_sources.get(str(chat_id))
             session_id, _thread_id = await resolve_grix_target(
                 client,
                 self.connection,
@@ -1031,7 +1082,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not client:
             return
         try:
-            source_hint = self._latest_sources.get(str(chat_id))
+            source_hint = self._active_state().latest_sources.get(str(chat_id))
             session_id, _thread_id = await resolve_grix_target(
                 client,
                 self.connection,
@@ -1055,7 +1106,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not client:
             return
         try:
-            source_hint = self._latest_sources.get(str(chat_id))
+            source_hint = self._active_state().latest_sources.get(str(chat_id))
             session_id, _thread_id = await resolve_grix_target(
                 client,
                 self.connection,
@@ -1083,7 +1134,7 @@ class GrixAdapter(BasePlatformAdapter):
         return await client.agent_invoke(action=action, params=params, timeout_ms=timeout_ms)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        source = self._latest_sources.get(str(chat_id))
+        source = self._active_state().latest_sources.get(str(chat_id))
         if source:
             return {
                 "id": source.chat_id,
@@ -1092,7 +1143,7 @@ class GrixAdapter(BasePlatformAdapter):
             }
 
         base_chat_id, _, thread_id = str(chat_id).partition(":")
-        source = self._latest_sources.get(chat_id) or self._latest_sources.get(base_chat_id)
+        source = self._active_state().latest_sources.get(chat_id) or self._active_state().latest_sources.get(base_chat_id)
         if source:
             return {
                 "id": source.chat_id,
@@ -1106,7 +1157,7 @@ class GrixAdapter(BasePlatformAdapter):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         event = self._pending_messages.pop(session_key, None)
         if event:
-            ack_entry = self._busy_ack_msg_ids.pop(session_key, None)
+            ack_entry = self._active_state().busy_ack_msg_ids.pop(session_key, None)
             if ack_entry:
                 chat_id, msg_id, sender_client = ack_entry
                 logger.debug(
@@ -1160,10 +1211,10 @@ class GrixAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
         message_id = str(event.message_id or "").strip()
-        if message_id and self._processing_message_ids.get(session_key) == message_id:
-            self._processing_message_ids.pop(session_key, None)
+        if message_id and self._active_state().processing_message_ids.get(session_key) == message_id:
+            self._active_state().processing_message_ids.pop(session_key, None)
         if message_id and self.is_message_revoked(session_key, message_id):
-            self._revoked_message_keys.discard((session_key, message_id))
+            self._active_state().revoked_message_keys.discard((session_key, message_id))
             logger.debug(
                 "[%s] Skipping completion for revoked GRIX message %s/%s",
                 self.name,
@@ -1189,13 +1240,13 @@ class GrixAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
-        self._processing_message_ids[session_key] = str(event.message_id)
+        self._active_state().processing_message_ids[session_key] = str(event.message_id)
 
     def is_message_revoked(self, session_key: str, message_id: str) -> bool:
         normalized_message_id = str(message_id or "").strip()
         if not session_key or not normalized_message_id:
             return False
-        return (session_key, normalized_message_id) in self._revoked_message_keys
+        return (session_key, normalized_message_id) in self._active_state().revoked_message_keys
 
     def _build_record_only_attachment_summary(self, message: GrixInboundMessage) -> str:
         attachments = list(message.attachments or [])
@@ -1420,6 +1471,9 @@ class GrixAdapter(BasePlatformAdapter):
                         shared_owner_id,
                         exc,
                     )
+                # 共享被撤销后，对应 owner 的所有 per-chat/per-event 状态一并丢弃，
+                # 防止后续若 owner 重新被授权时拿到旧残留（也避免长期累积内存）。
+                self._drop_owner_state(shared_owner_id)
                 logger.info(
                     "[%s] shared client disconnected agent=%s shared_owner=%s",
                     self.name,
@@ -1478,7 +1532,7 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return
 
-        approval_state = self._approval_state.pop(approval_id, None)
+        approval_state = self._active_state().approval_state.pop(approval_id, None)
         session_key = str((approval_state or {}).get("session_key") or "").strip()
         if not session_key:
             await self._active_client().send_local_action_result(
@@ -1571,28 +1625,28 @@ class GrixAdapter(BasePlatformAdapter):
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
-        prev_session_key = self._user_dm_session_keys.get(str(message.sender_id or "")) if message.chat_type == "dm" and message.sender_id else None
-        prev_session_id = self._user_dm_session_ids.get(str(message.sender_id or "")) if message.chat_type == "dm" and message.sender_id else None
-        self._latest_sources[message.session_id] = source
-        self._latest_sources[session_key] = source
+        prev_session_key = self._active_state().user_dm_session_keys.get(str(message.sender_id or "")) if message.chat_type == "dm" and message.sender_id else None
+        prev_session_id = self._active_state().user_dm_session_ids.get(str(message.sender_id or "")) if message.chat_type == "dm" and message.sender_id else None
+        self._active_state().latest_sources[message.session_id] = source
+        self._active_state().latest_sources[session_key] = source
         if message.thread_id:
-            self._latest_sources[f"{message.session_id}:{message.thread_id}"] = source
-        self._reply_event_ids[(message.session_id, message.message_id)] = message.event_id
-        self._message_sources[(message.session_id, message.message_id)] = source
-        self._message_session_keys[(message.session_id, message.message_id)] = session_key
+            self._active_state().latest_sources[f"{message.session_id}:{message.thread_id}"] = source
+        self._active_state().reply_event_ids[(message.session_id, message.message_id)] = message.event_id
+        self._active_state().message_sources[(message.session_id, message.message_id)] = source
+        self._active_state().message_session_keys[(message.session_id, message.message_id)] = session_key
 
         # Extract extra.connector hints and index by both session_id and session_key
         # so send() can look them up by whichever key the caller uses as chat_id.
         raw_extra = payload.get("extra") or {}
         connector_hints = raw_extra.get("connector") or {} if isinstance(raw_extra, dict) else {}
         if connector_hints and isinstance(connector_hints, dict):
-            self._session_connector_hints[message.session_id] = connector_hints
-            self._session_connector_hints[session_key] = connector_hints
+            self._active_state().session_connector_hints[message.session_id] = connector_hints
+            self._active_state().session_connector_hints[session_key] = connector_hints
 
         if message.chat_type == "dm" and message.sender_id:
             sender_key = str(message.sender_id)
-            self._user_dm_session_ids[sender_key] = str(message.session_id)
-            self._user_dm_session_keys[sender_key] = session_key
+            self._active_state().user_dm_session_ids[sender_key] = str(message.session_id)
+            self._active_state().user_dm_session_keys[sender_key] = session_key
             if prev_session_id and prev_session_id != str(message.session_id):
                 logger.debug(
                     "[%s] GRIX DM session_id changed for user=%s old_session_id=%s new_session_id=%s old_session_key=%s new_session_key=%s event_id=%s message_id=%s",
@@ -1739,7 +1793,7 @@ class GrixAdapter(BasePlatformAdapter):
 
         try:
             if session_key not in self._active_sessions and message.message_id:
-                self._processing_message_ids[session_key] = message.message_id
+                self._active_state().processing_message_ids[session_key] = message.message_id
             await self.handle_message(event)
         except Exception as exc:
             if self._client:
@@ -1761,9 +1815,9 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def _handle_edit_packet(self, payload: Dict[str, Any]) -> None:
         edit: GrixEditEvent = normalize_edit_event(payload)
-        session_key = self._message_session_keys.get((edit.session_id, edit.message_id))
+        session_key = self._active_state().message_session_keys.get((edit.session_id, edit.message_id))
         if not session_key:
-            source = self._latest_sources.get(edit.session_id)
+            source = self._active_state().latest_sources.get(edit.session_id)
             if source:
                 session_key = build_session_key(
                     source,
@@ -1880,8 +1934,8 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def _handle_revoke_packet(self, payload: Dict[str, Any]) -> None:
         revoke: GrixRevokeEvent = normalize_revoke_event(payload)
-        source = self._message_sources.get((revoke.session_id, revoke.message_id))
-        session_key = self._message_session_keys.get((revoke.session_id, revoke.message_id))
+        source = self._active_state().message_sources.get((revoke.session_id, revoke.message_id))
+        session_key = self._active_state().message_session_keys.get((revoke.session_id, revoke.message_id))
         if not session_key and source is not None:
             session_key = build_session_key(
                 source,
@@ -1899,7 +1953,7 @@ class GrixAdapter(BasePlatformAdapter):
         pending_event = self._pending_messages.get(session_key or "")
         if pending_event and pending_event.message_id == revoke.message_id:
             self._pending_messages.pop(session_key, None)
-            ack_entry = self._busy_ack_msg_ids.pop(session_key, None) if session_key else None
+            ack_entry = self._active_state().busy_ack_msg_ids.pop(session_key, None) if session_key else None
             if ack_entry:
                 ack_chat_id, ack_msg_id, ack_sender_client = ack_entry
                 await self._delete_busy_ack(
@@ -1914,8 +1968,8 @@ class GrixAdapter(BasePlatformAdapter):
                 revoke.session_id,
                 revoke.message_id,
             )
-        elif session_key and self._processing_message_ids.get(session_key) == revoke.message_id:
-            self._revoked_message_keys.add((session_key, revoke.message_id))
+        elif session_key and self._active_state().processing_message_ids.get(session_key) == revoke.message_id:
+            self._active_state().revoked_message_keys.add((session_key, revoke.message_id))
             interrupt_event = self._active_sessions.get(session_key)
             if interrupt_event is not None:
                 interrupt_event.set()
@@ -1942,9 +1996,9 @@ class GrixAdapter(BasePlatformAdapter):
                 message_id=revoke.message_id,
             )
 
-        self._reply_event_ids.pop((revoke.session_id, revoke.message_id), None)
-        self._message_sources.pop((revoke.session_id, revoke.message_id), None)
-        self._message_session_keys.pop((revoke.session_id, revoke.message_id), None)
+        self._active_state().reply_event_ids.pop((revoke.session_id, revoke.message_id), None)
+        self._active_state().message_sources.pop((revoke.session_id, revoke.message_id), None)
+        self._active_state().message_session_keys.pop((revoke.session_id, revoke.message_id), None)
 
     async def _handle_event_cancel_packet(self, payload: Dict[str, Any]) -> None:
         """处理后端下发的 event_cancel：取消某个进行中的事件并上报结果。"""
@@ -1958,7 +2012,7 @@ class GrixAdapter(BasePlatformAdapter):
             return
 
         try:
-            source = self._latest_sources.get(cancel.session_id)
+            source = self._active_state().latest_sources.get(cancel.session_id)
             if source is None:
                 source = self.build_source(chat_id=cancel.session_id, chat_type="dm")
             session_key = build_session_key(
@@ -2027,7 +2081,7 @@ class GrixAdapter(BasePlatformAdapter):
                 if pending is not None and getattr(pending, "source", None):
                     source = pending.source
                 if source is None:
-                    source = self._latest_sources.get(session_id)
+                    source = self._active_state().latest_sources.get(session_id)
                 if source is None:
                     source = self.build_source(chat_id=session_id, chat_type="dm")
                 await self._force_stop_session(source, key, reply_to=None)
@@ -2174,7 +2228,7 @@ class GrixAdapter(BasePlatformAdapter):
         return True
 
     def _resolve_stop_source(self, stop: GrixStopEvent):
-        source = self._latest_sources.get(stop.session_id)
+        source = self._active_state().latest_sources.get(stop.session_id)
         if source:
             return source
         return self.build_source(
@@ -2189,7 +2243,7 @@ class GrixAdapter(BasePlatformAdapter):
         status: str,
         message: Optional[str] = None,
     ) -> None:
-        if not self._client or not event_id or event_id in self._completed_event_ids:
+        if not self._client or not event_id or event_id in self._active_state().completed_event_ids:
             return
         try:
             await self._active_client().complete_event(
@@ -2205,11 +2259,11 @@ class GrixAdapter(BasePlatformAdapter):
                 exc,
             )
             return
-        self._completed_event_results[event_id] = {
+        self._active_state().completed_event_results[event_id] = {
             "status": status,
             "message": message,
         }
-        self._completed_event_ids.add(event_id)
+        self._active_state().completed_event_ids.add(event_id)
 
     async def _complete_stop(
         self,
@@ -2229,7 +2283,7 @@ class GrixAdapter(BasePlatformAdapter):
             code=code,
             message=message,
         )
-        self._completed_stop_results[event_id] = {
+        self._active_state().completed_stop_results[event_id] = {
             "status": status,
             "stop_id": stop_id,
             "code": code,
@@ -2239,7 +2293,7 @@ class GrixAdapter(BasePlatformAdapter):
     async def _replay_completed_event(self, event_id: str) -> None:
         if not self._active_client():
             return
-        result = self._completed_event_results.get(event_id)
+        result = self._active_state().completed_event_results.get(event_id)
         if not result:
             return
         await self._active_client().complete_event(
@@ -2256,11 +2310,11 @@ class GrixAdapter(BasePlatformAdapter):
         to ``_completed_event_ids``.  On reconnect we re-emit those results so
         the backend can resolve the pending events via its durable storage.
         """
-        if not self._client or not self._completed_event_ids:
+        if not self._client or not self._active_state().completed_event_ids:
             return
         replayed = 0
-        for eid in list(self._completed_event_ids):
-            result = self._completed_event_results.get(eid)
+        for eid in list(self._active_state().completed_event_ids):
+            result = self._active_state().completed_event_results.get(eid)
             if not result:
                 continue
             try:
@@ -2284,7 +2338,7 @@ class GrixAdapter(BasePlatformAdapter):
     async def _replay_completed_stop(self, event_id: str, stop_id: Optional[str]) -> None:
         if not self._active_client():
             return
-        result = self._completed_stop_results.get(event_id)
+        result = self._active_state().completed_stop_results.get(event_id)
         if not result:
             return
         await self._active_client().complete_stop(
@@ -2301,29 +2355,29 @@ class GrixAdapter(BasePlatformAdapter):
             return False
 
         now = time.time()
-        if len(self._seen_event_ids) > _EVENT_DEDUP_MAX_SIZE:
+        if len(self._active_state().seen_event_ids) > _EVENT_DEDUP_MAX_SIZE:
             cutoff = now - _EVENT_DEDUP_WINDOW_SECONDS
-            self._seen_event_ids = {
-                key: ts for key, ts in self._seen_event_ids.items() if ts > cutoff
+            self._active_state().seen_event_ids = {
+                key: ts for key, ts in self._active_state().seen_event_ids.items() if ts > cutoff
             }
-            self._completed_event_results = {
+            self._active_state().completed_event_results = {
                 key: value
-                for key, value in self._completed_event_results.items()
-                if key in self._seen_event_ids
+                for key, value in self._active_state().completed_event_results.items()
+                if key in self._active_state().seen_event_ids
             }
-            self._completed_stop_results = {
+            self._active_state().completed_stop_results = {
                 key: value
-                for key, value in self._completed_stop_results.items()
-                if key in self._seen_event_ids
+                for key, value in self._active_state().completed_stop_results.items()
+                if key in self._active_state().seen_event_ids
             }
-            self._completed_event_ids = {
-                key for key in self._completed_event_ids if key in self._seen_event_ids
+            self._active_state().completed_event_ids = {
+                key for key in self._active_state().completed_event_ids if key in self._active_state().seen_event_ids
             }
 
-        if normalized_event_id in self._seen_event_ids:
+        if normalized_event_id in self._active_state().seen_event_ids:
             return True
 
-        self._seen_event_ids[normalized_event_id] = now
+        self._active_state().seen_event_ids[normalized_event_id] = now
         return False
 
     async def _safe_release_lock(self) -> None:
