@@ -115,25 +115,12 @@ def _make_adapter():
     inst._connector = None
     inst._disconnect_requested = False
     inst._token_lock_identity = None
-    inst._completed_event_ids = set()
-    inst._seen_event_ids = {}
-    inst._completed_event_results = {}
-    inst._completed_stop_results = {}
-    inst._reply_event_ids = {}
-    inst._latest_sources = {}
-    inst._message_sources = {}
-    inst._message_session_keys = {}
-    inst._user_dm_session_ids = {}
-    inst._user_dm_session_keys = {}
-    inst._approval_state = {}
-    inst._processing_message_ids = {}
-    inst._revoked_message_keys = set()
-    inst._busy_ack_msg_ids = {}
+    # owner 隔离：所有 per-chat/per-event 状态收口到 _owner_states
+    from collections import defaultdict
+    inst._owner_states = defaultdict(adapter_mod._OwnerState)
     inst._last_send_at = 0.0
     inst._send_lock = asyncio.Lock()
     inst._reconnect_lock = asyncio.Lock()
-    inst._tool_progress_msg_ids = set()
-    inst._session_connector_hints = {}
     inst._shared_clients = {}
     inst._share_sync_lock = asyncio.Lock()
     inst._shutting_down = False
@@ -390,8 +377,9 @@ def test_delete_busy_ack_uses_stored_sender_client(monkeypatch):
     asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
     shared_b = inst._shared_clients["B"]
 
-    # 模拟 send() 已记录了 busy-ack(sender=shared_b)
-    inst._busy_ack_msg_ids["sk-x"] = ("chat-1", "msg-1", shared_b)
+    # 模拟 send() 已记录了 busy-ack(sender=shared_b)：busy-ack 是从 shared_b 这条
+    # 连接发出去的，状态登记在 shared_b 对应的 OwnerState 桶里。
+    inst._state_for("B").busy_ack_msg_ids["sk-x"] = ("chat-1", "msg-1", shared_b)
 
     # 让 delete_message 捕获调用时 ContextVar 的值
     seen_ctx_clients = []
@@ -408,3 +396,87 @@ def test_delete_busy_ack_uses_stored_sender_client(monkeypatch):
     asyncio.run(inst._delete_busy_ack("chat-1", "msg-1", "sk-x", shared_b))
     assert seen_ctx_clients == [shared_b], \
         "_delete_busy_ack 必须在调用 delete_message 前把 ContextVar set 为发送方 client"
+
+
+# ── 10. per-owner state 隔离：同一外部 sender_id 在主连接和共享子连接下访问 DM
+#        session 字典，必须落到各自 OwnerState，互不串。
+def test_owner_state_isolated_dm_sessions(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    shared_b = inst._shared_clients["B"]
+
+    async def write_in(source_client, sid, sk):
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(source_client)
+        try:
+            # 模拟入站消息把 sender_id="42" 这条 DM 状态写进 active state
+            inst._active_state().user_dm_session_ids["42"] = sid
+            inst._active_state().user_dm_session_keys["42"] = sk
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+
+    asyncio.run(write_in(inst._client, "sid-main", "sk-main"))
+    asyncio.run(write_in(shared_b, "sid-shared-b", "sk-shared-b"))
+
+    # 主 owner state 仍是主连接写的
+    assert inst._state_for("").user_dm_session_ids["42"] == "sid-main"
+    assert inst._state_for("").user_dm_session_keys["42"] == "sk-main"
+    # B 的 owner state 是共享子连接写的，不被主连接覆盖
+    assert inst._state_for("B").user_dm_session_ids["42"] == "sid-shared-b"
+    assert inst._state_for("B").user_dm_session_keys["42"] == "sk-shared-b"
+
+
+# ── 11. per-owner state 隔离：审批/processing/事件 dedup 几个关键字典都不能串。
+def test_owner_state_isolated_approval_and_processing(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    shared_b = inst._shared_clients["B"]
+
+    async def write_in(source_client, approval_id, msg_id, event_id):
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(source_client)
+        try:
+            inst._active_state().approval_state[approval_id] = {"session_key": "k", "chat_id": "c", "thread_id": None}
+            inst._active_state().processing_message_ids["sk-shared"] = msg_id
+            inst._active_state().completed_event_ids.add(event_id)
+            inst._active_state().seen_event_ids[event_id] = 0.0
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+
+    asyncio.run(write_in(inst._client, "ga_main", "msg-main", "evt-main"))
+    asyncio.run(write_in(shared_b, "ga_shared", "msg-shared", "evt-shared"))
+
+    main = inst._state_for("")
+    b = inst._state_for("B")
+    # 审批：各自只看到自己
+    assert "ga_main" in main.approval_state and "ga_main" not in b.approval_state
+    assert "ga_shared" in b.approval_state and "ga_shared" not in main.approval_state
+    # processing_message_ids 同 key 不同值
+    assert main.processing_message_ids["sk-shared"] == "msg-main"
+    assert b.processing_message_ids["sk-shared"] == "msg-shared"
+    # event dedup：主与 B 各持自己的 event_id 集合
+    assert "evt-main" in main.completed_event_ids and "evt-main" not in b.completed_event_ids
+    assert "evt-shared" in b.completed_event_ids and "evt-shared" not in main.completed_event_ids
+
+
+# ── 12. 撤销共享后必须 drop 对应 owner state，防止重新被授权时拿到残留 + 防内存泄漏。
+def test_owner_state_dropped_on_share_revoke(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    shared_b = inst._shared_clients["B"]
+
+    # 在 B 的 owner state 写入一些状态
+    async def fill():
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(shared_b)
+        try:
+            inst._active_state().processing_message_ids["sk"] = "msg-x"
+            inst._active_state().completed_event_ids.add("evt-x")
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+    asyncio.run(fill())
+    assert "B" in inst._owner_states
+
+    # 撤销 B（下发空名单）→ 子连接断开 + owner state 清掉
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": []}))
+    assert "B" not in inst._owner_states, "撤销共享后 owner state 必须被 drop"
