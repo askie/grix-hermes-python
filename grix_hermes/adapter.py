@@ -473,9 +473,11 @@ class GrixAdapter(BasePlatformAdapter):
         # agent 共享: 在 packet handler 上下文中（contextvar 已 set 为事件来源 client）
         # 取该 client（共享子连接 / 主连接），就绪就直接用。
         # contextvar 未设置时**不再回退主连接** — 那会把消息按主人身份错发出去。
-        # 直接 log error + 返回 None,让调用方失败。reconnect 路径只在「事件来源 client
-        # 本身就是主连接」时才触发（旧主连接 reconnect 行为保留），共享子连接不就绪时
-        # 一律直接报失败,不触发主连接 reconnect（避免越权重连别人的连接）。
+        # 直接 log error + 返回 None,让调用方失败。
+        # 是否共享子连接以 config.shared_owner_id 是否非空为准（按身份语义判定），
+        # 不能用 `ctx_client is self._client` 做对象身份比较：主连接 reconnect 后
+        # self._client 会换成新对象，旧的 ctx_client 引用会变成「既不是主、shared_owner_id 也为空」
+        # 的孤儿，被错判为共享子连接而拒绝 reconnect，整段 conversation 的 send 全部失败。
         ctx_client = _CURRENT_CLIENT_CTX.get()
         if ctx_client is None:
             logger.error(
@@ -495,20 +497,21 @@ class GrixAdapter(BasePlatformAdapter):
         if connected and (authed or not require_authed):
             return ctx_client
 
-        is_primary = ctx_client is self._client
-        if not is_primary:
-            # 共享子连接不就绪:不触发主连接 reconnect 路径(那只属于主连接),直接报失败给上层。
+        ctx_shared_id = getattr(getattr(ctx_client, "_config", None), "shared_owner_id", None)
+        is_shared_child = bool(ctx_shared_id)
+        if is_shared_child:
+            # 真共享子连接不就绪:不触发主连接 reconnect 路径(那只属于主连接),直接报失败给上层。
             logger.warning(
                 "[%s] GRIX shared transport unavailable during %s shared_owner=%s connected=%s authed=%s",
                 self.name,
                 operation,
-                getattr(getattr(ctx_client, "_config", None), "shared_owner_id", None),
+                ctx_shared_id,
                 connected,
                 authed,
             )
             return None
 
-        # 主连接不就绪 — 走旧的内部 reconnect 路径,保持单连接场景的健壮性。
+        # 主连接(含 reconnect 前的旧主连接引用)不就绪 — 走旧的内部 reconnect 路径,保持单连接场景的健壮性。
         if not self._disconnect_requested:
             if await self._try_reconnect_transport(
                 reason=f"{operation}: transport not ready",

@@ -297,6 +297,50 @@ def test_get_ready_client_uses_shared_in_handler_context(monkeypatch):
     asyncio.run(background_must_not_fallback())
 
 
+# ── 7b. 回归:主连接 reconnect 之后,contextvar 里的旧主连接引用(已 disconnect)
+#       不能被错判为共享子连接而直接返回 None。判定必须用 shared_owner_id,而不是
+#       `ctx_client is self._client` 的对象身份比较,否则长 conversation 中途主连接
+#       reconnect 一次,后续所有 send 都会失败(无法触发 fallback reconnect 路径)。
+def test_get_ready_client_treats_stale_primary_as_primary_not_shared(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+
+    # 模拟 reconnect:把 self._client 换成全新 FakeClient(就绪),
+    # 旧主连接引用还在 contextvar 里,且 status = disconnected。
+    old_primary = inst._client
+    old_primary.status = {"connected": False, "authed": False, "last_error": "ws closed"}
+    new_primary = FakeTransportClient(inst.connection)
+    new_primary.status = {"connected": True, "authed": True}
+    inst._client = new_primary
+
+    # 拦截 _try_reconnect_transport:不重连(已经"reconnect 完成"),直接返回 True,
+    # _get_ready_client 应在 fallback 后返回 self._client(= new_primary)。
+    reconnect_calls: list[str] = []
+
+    async def fake_reconnect(*, reason: str = "", max_attempts: int = 2):
+        reconnect_calls.append(reason)
+        return True
+
+    monkeypatch.setattr(inst, "_try_reconnect_transport", fake_reconnect)
+
+    async def in_stale_primary_ctx():
+        # 旧主连接引用(shared_owner_id 为 None)塞进 contextvar
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(old_primary)
+        try:
+            got = await inst._get_ready_client(operation="send")
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+        # 关键断言:不能被错判为 shared child 早返回 None,必须走 reconnect 路径
+        # 拿到当前主连接。
+        assert got is new_primary, (
+            "旧主连接引用必须按主连接处理走 reconnect 路径,"
+            "不能因为 `ctx_client is self._client` 不等就当成共享子连接 return None"
+        )
+        assert reconnect_calls, "应该触发了主连接 reconnect 路径"
+
+    asyncio.run(in_stale_primary_ctx())
+
+
 # ── 8. _schedule_session_route_bind 跟随 ContextVar:被共享者会话的 route_bind
 #       必须从对应共享子连接发,不能跑到主连接(会绑错路由)。
 def test_session_route_bind_follows_contextvar(monkeypatch):
