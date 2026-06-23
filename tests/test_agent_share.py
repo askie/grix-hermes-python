@@ -137,6 +137,7 @@ def _make_adapter():
     inst._shared_clients = {}
     inst._share_sync_lock = asyncio.Lock()
     inst._shutting_down = False
+    inst._background_tasks = set()
     # 主连接（用 FakeClient 占位）
     inst._client = FakeTransportClient(inst.connection)
     inst._bind_packet_handler(inst._client)
@@ -208,12 +209,13 @@ def test_unknown_cmd_does_not_raise(monkeypatch):
 
 
 # ── 5. contextvar 路由:回执发到事件来源 client ──
+#    脱离 packet handler 上下文时**不再回退主连接**(防 sender 错乱),
+#    改返回 None + log,让调用方直接失败比错发更安全。
 def test_active_client_routes_to_source(monkeypatch):
     _patch_transport(monkeypatch)
     inst = _make_adapter()
     asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
     shared_b = inst._shared_clients["B"]
-    main = inst._client
 
     async def use_active(source):
         token = adapter_mod._CURRENT_CLIENT_CTX.set(source)
@@ -221,11 +223,11 @@ def test_active_client_routes_to_source(monkeypatch):
             assert inst._active_client() is source
         finally:
             adapter_mod._CURRENT_CLIENT_CTX.reset(token)
-        # 退出后回主连接
-        assert inst._active_client() is main
+        # 退出 packet 上下文后必须返回 None(不再 fallback 主连接,避免按主人身份错发)
+        assert inst._active_client() is None
 
     asyncio.run(use_active(shared_b))
-    asyncio.run(use_active(main))
+    asyncio.run(use_active(inst._client))
 
 
 # ── 6. disconnect 一并清理子连接 ──
@@ -255,6 +257,7 @@ async def _run_share_cleanup(inst):
 
 # ── 7. CRIT 守卫:_get_ready_client 在 packet handler 上下文中必须返回共享 client,
 #       而不是主连接。否则 LLM 回复会被回到主人(共享物理隔离失效)。
+#       脱离 packet 上下文时**不再回退主连接**(防 sender 错乱),改返回 None + log。
 def test_get_ready_client_uses_shared_in_handler_context(monkeypatch):
     _patch_transport(monkeypatch)
     inst = _make_adapter()
@@ -274,10 +277,90 @@ def test_get_ready_client_uses_shared_in_handler_context(monkeypatch):
         finally:
             adapter_mod._CURRENT_CLIENT_CTX.reset(token)
 
-    async def background():
-        # 无 contextvar(背景任务)→ 回退主连接,保持旧行为
+    async def in_primary_handler_ctx():
+        # 主连接的 packet handler 上下文 → 返回主连接,主连接的就绪检查仍走 reconnect 路径。
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(main)
+        try:
+            got = await inst._get_ready_client(operation="send")
+            assert got is main
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+
+    async def background_must_not_fallback():
+        # 无 contextvar(背景任务)→ **不再回退主连接**,直接返回 None。
+        # 避免脱离 packet 上下文的 send 把消息按主人身份错发出去。
         got = await inst._get_ready_client(operation="background_task")
-        assert got is main
+        assert got is None
 
     asyncio.run(in_handler_ctx())
-    asyncio.run(background())
+    asyncio.run(in_primary_handler_ctx())
+    asyncio.run(background_must_not_fallback())
+
+
+# ── 8. _schedule_session_route_bind 跟随 ContextVar:被共享者会话的 route_bind
+#       必须从对应共享子连接发,不能跑到主连接(会绑错路由)。
+def test_session_route_bind_follows_contextvar(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    shared_b = inst._shared_clients["B"]
+
+    # 给 FakeClient 加 bind_session_route 捕获
+    bind_calls = []
+
+    async def fake_bind(self, **kw):
+        bind_calls.append((self, kw))
+
+    monkeypatch.setattr(FakeTransportClient, "bind_session_route", fake_bind, raising=False)
+
+    async def run_bind_in_ctx(source_client):
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(source_client)
+        try:
+            inst._schedule_session_route_bind(session_key="sk-1", session_id="sid-1")
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+        # 等 spawn 的 task 跑完
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+    asyncio.run(run_bind_in_ctx(shared_b))
+    assert bind_calls and bind_calls[-1][0] is shared_b, \
+        "_schedule_session_route_bind 必须用 ContextVar 里的 client(共享子连接),不应走主连接"
+
+    # 脱离 ContextVar → 跳过(不发包,不抛错)
+    bind_calls.clear()
+    inst._schedule_session_route_bind(session_key="sk-2", session_id="sid-2")
+    # spawn 不会发生
+    async def drain():
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    asyncio.run(drain())
+    assert bind_calls == [], "脱离 ContextVar 时 _schedule_session_route_bind 必须跳过,不能错走主连接"
+
+
+# ── 9. _busy_ack 删除路径:删除 busy-ack 提示时必须从「发送该提示的 client」发出。
+#       否则脱离 packet 上下文后调 delete_message,会因 ContextVar 丢失而失败 + log。
+def test_delete_busy_ack_uses_stored_sender_client(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    shared_b = inst._shared_clients["B"]
+
+    # 模拟 send() 已记录了 busy-ack(sender=shared_b)
+    inst._busy_ack_msg_ids["sk-x"] = ("chat-1", "msg-1", shared_b)
+
+    # 让 delete_message 捕获调用时 ContextVar 的值
+    seen_ctx_clients = []
+
+    async def fake_delete(chat_id, msg_id):
+        seen_ctx_clients.append(adapter_mod._CURRENT_CLIENT_CTX.get())
+
+        class _R:
+            success = True
+        return _R()
+
+    monkeypatch.setattr(inst, "delete_message", fake_delete)
+
+    asyncio.run(inst._delete_busy_ack("chat-1", "msg-1", "sk-x", shared_b))
+    assert seen_ctx_clients == [shared_b], \
+        "_delete_busy_ack 必须在调用 delete_message 前把 ContextVar set 为发送方 client"

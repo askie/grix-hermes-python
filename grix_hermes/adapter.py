@@ -93,8 +93,11 @@ _PLATFORM_VALUE = "grix"
 logger = logging.getLogger(__name__)
 
 # agent 共享：handler 在入口把「正在处理本 packet 的 client」绑定到这个 ContextVar，
-# 下游所有 send 通过 self._active_client() 取（contextvars 跨 await 自动透传）；
-# 未设置时回退主连接 self._client（兼容非 packet 上下文的调用，如启动时主动发包）。
+# 下游所有 send 通过 self._active_client() 取（contextvars 跨 await 自动透传，
+# Python asyncio.create_task 默认拷贝当前 context，所以子任务里仍然能取到）。
+# 未设置时**不再回退主连接**：脱离 packet 上下文的 send 会把消息错路由给主人身份，
+# 造成 sender 错乱。此时一律 log + 返回 None，让调用失败比错发更安全。
+# 真正需要主连接发起的管理性主动调用（如启动时的 skills 上报）显式走 self._client。
 _CURRENT_CLIENT_CTX: ContextVar[Optional[GrixTransportClient]] = ContextVar(
     "grix_hermes_current_client", default=None
 )
@@ -389,7 +392,10 @@ class GrixAdapter(BasePlatformAdapter):
         self._approval_state: Dict[str, Dict[str, Optional[str]]] = {}
         self._processing_message_ids: Dict[str, str] = {}
         self._revoked_message_keys: set[tuple[str, str]] = set()
-        self._busy_ack_msg_ids: Dict[str, tuple[str, str]] = {}
+        # 记录 busy-ack 提示消息：(chat_id, msg_id, sender_client)。
+        # 第三项是发送该 busy-ack 的 client（主连接 / 共享子连接），删除时显式 ContextVar
+        # 还原回去,避免删除路径脱离 packet handler 上下文后走错连接。
+        self._busy_ack_msg_ids: Dict[str, tuple[str, str, GrixTransportClient]] = {}
         self._last_send_at: float = 0.0
         self._send_lock = asyncio.Lock()
         self._reconnect_lock = asyncio.Lock()
@@ -408,10 +414,23 @@ class GrixAdapter(BasePlatformAdapter):
         self._shutting_down = False
 
     def _active_client(self) -> Optional[GrixTransportClient]:
-        """返回「当前应使用的 client」：处理 packet 时回事件来源 client（共享子连接或主连接），
-        否则回退主连接。所有 send_* / complete_* / acknowledge_* 调用都应走这里，
-        以保证共享子连接收到的事件，回执也从同一条连接发出（不串到主连接 / 不串给主人）。"""
-        return _CURRENT_CLIENT_CTX.get() or self._client
+        """返回「当前应使用的 client」：处理 packet 时回事件来源 client（共享子连接或主连接）。
+        所有 send_* / complete_* / acknowledge_* 调用都应走这里，以保证共享子连接收到的事件，
+        回执也从同一条连接发出（不串到主连接 / 不串给主人）。
+
+        contextvar 未设置时**不再回退主连接** — 那会把消息按主人身份错发出去。
+        改为 log error + 返回 None，让调用方失败（外层 try/except 会兜住 NoneType 异常）。
+        需要主连接主动发起的场景（如启动 skills 上报）请显式用 self._client。"""
+        ctx = _CURRENT_CLIENT_CTX.get()
+        if ctx is None:
+            logger.error(
+                "[%s] _active_client called without packet ContextVar — refusing to fallback "
+                "to primary client to avoid sender mix-up; call site must run inside a "
+                "packet handler scope or use self._client explicitly",
+                self.name,
+            )
+            return None
+        return ctx
 
     def _bind_packet_handler(self, client: GrixTransportClient) -> None:
         """把 packet handler 绑定到 client，回调时携带 client 引用（让 _handle_protocol_packet
@@ -451,43 +470,45 @@ class GrixAdapter(BasePlatformAdapter):
         operation: str,
         require_authed: bool = True,
     ) -> Optional[GrixTransportClient]:
-        # agent 共享:在 packet handler 上下文中（contextvar 已 set 为事件来源 client）
-        # 优先取该 client（共享子连接 / 主连接）;只要它就绪就直接用,以保证 LLM 回复
-        # /edit/delete/typing/invoke 等公开方法都从「事件来源连接」回发,不串到主连接。
-        # contextvar 未设置（背景任务,如启动时 _report_skills）或事件来源 client 已不就绪时,
-        # 才回退主连接 self._client + reconnect 路径,与旧行为一致。
+        # agent 共享: 在 packet handler 上下文中（contextvar 已 set 为事件来源 client）
+        # 取该 client（共享子连接 / 主连接），就绪就直接用。
+        # contextvar 未设置时**不再回退主连接** — 那会把消息按主人身份错发出去。
+        # 直接 log error + 返回 None,让调用方失败。reconnect 路径只在「事件来源 client
+        # 本身就是主连接」时才触发（旧主连接 reconnect 行为保留），共享子连接不就绪时
+        # 一律直接报失败,不触发主连接 reconnect（避免越权重连别人的连接）。
         ctx_client = _CURRENT_CLIENT_CTX.get()
-        if ctx_client is not None:
-            status = getattr(ctx_client, "status", None)
-            if not isinstance(status, dict):
-                return ctx_client
-            if bool(status.get("connected")) and (bool(status.get("authed")) or not require_authed):
-                return ctx_client
+        if ctx_client is None:
+            logger.error(
+                "[%s] %s called without packet ContextVar — refusing to fallback to primary "
+                "client (would risk routing to wrong sender)",
+                self.name,
+                operation,
+            )
+            return None
+
+        status = getattr(ctx_client, "status", None)
+        if not isinstance(status, dict):
+            return ctx_client
+
+        connected = bool(status.get("connected"))
+        authed = bool(status.get("authed"))
+        if connected and (authed or not require_authed):
+            return ctx_client
+
+        is_primary = ctx_client is self._client
+        if not is_primary:
             # 共享子连接不就绪:不触发主连接 reconnect 路径(那只属于主连接),直接报失败给上层。
             logger.warning(
                 "[%s] GRIX shared transport unavailable during %s shared_owner=%s connected=%s authed=%s",
                 self.name,
                 operation,
                 getattr(getattr(ctx_client, "_config", None), "shared_owner_id", None),
-                bool(status.get("connected")),
-                bool(status.get("authed")),
+                connected,
+                authed,
             )
             return None
 
-        client = self._client
-        if not client:
-            return None
-
-        status = getattr(client, "status", None)
-        if not isinstance(status, dict):
-            return client
-
-        connected = bool(status.get("connected"))
-        authed = bool(status.get("authed"))
-        if connected and (authed or not require_authed):
-            return client
-
-        # Client is unusable — try internal reconnect before giving up.
+        # 主连接不就绪 — 走旧的内部 reconnect 路径,保持单连接场景的健壮性。
         if not self._disconnect_requested:
             if await self._try_reconnect_transport(
                 reason=f"{operation}: transport not ready",
@@ -509,8 +530,15 @@ class GrixAdapter(BasePlatformAdapter):
         return None
 
     def _schedule_session_route_bind(self, *, session_key: str, session_id: str) -> None:
-        client = self._client
-        if not client:
+        # 在 packet handler 内调用,跟随事件来源 client(共享子连接 / 主连接);
+        # 直接走 self._client 会让被共享者会话的 route_bind 跑到主连接上,造成绑错。
+        client = _CURRENT_CLIENT_CTX.get()
+        if client is None:
+            logger.error(
+                "[%s] _schedule_session_route_bind called without packet ContextVar — "
+                "skipping bind to avoid routing to wrong client",
+                self.name,
+            )
             return
 
         async def _bind_route() -> None:
@@ -661,7 +689,8 @@ class GrixAdapter(BasePlatformAdapter):
                 for s in entries
             ]
             if self._client and skills:
-                await self._active_client().send_skills_update(skills)
+                # 启动时主连接的管理性主动调用,不在 packet handler 上下文,显式走主连接。
+                await self._client.send_skills_update(skills)
                 logger.info("[%s] Reported %d skill(s)", self.name, len(skills))
         except Exception as exc:
             logger.debug("[%s] Skills report failed: %s", self.name, exc)
@@ -814,7 +843,9 @@ class GrixAdapter(BasePlatformAdapter):
                 _normalized_reply_to = str(reply_to).strip()
                 for _sk, _pe in self._pending_messages.items():
                     if _pe and str(getattr(_pe, "message_id", "")).strip() == _normalized_reply_to:
-                        self._busy_ack_msg_ids[_sk] = (str(chat_id), result.message_id)
+                        # 记下发送 busy-ack 的 client,后续删除时要从同一条连接发删除指令,
+                        # 避免脱离 packet 上下文后走错连接(可能错走主连接 / 共享子连接)。
+                        self._busy_ack_msg_ids[_sk] = (str(chat_id), result.message_id, client)
                         logger.debug(
                             "[%s] Tracked busy-ack notification msg_id=%s for session_key=%s",
                             self.name, result.message_id, _sk,
@@ -1074,14 +1105,16 @@ class GrixAdapter(BasePlatformAdapter):
         if event:
             ack_entry = self._busy_ack_msg_ids.pop(session_key, None)
             if ack_entry:
-                chat_id, msg_id = ack_entry
+                chat_id, msg_id, sender_client = ack_entry
                 logger.debug(
                     "[%s] Scheduling busy-ack deletion msg_id=%s for session_key=%s",
                     self.name, msg_id, session_key,
                 )
                 try:
                     loop = asyncio.get_running_loop()
-                    loop.create_task(self._delete_busy_ack(chat_id, msg_id, session_key))
+                    loop.create_task(
+                        self._delete_busy_ack(chat_id, msg_id, session_key, sender_client)
+                    )
                 except RuntimeError:
                     logger.warning(
                         "[%s] No running loop for busy-ack deletion msg_id=%s",
@@ -1089,18 +1122,30 @@ class GrixAdapter(BasePlatformAdapter):
                     )
         return event
 
-    async def _delete_busy_ack(self, chat_id: str, msg_id: str, session_key: str) -> None:
+    async def _delete_busy_ack(
+        self,
+        chat_id: str,
+        msg_id: str,
+        session_key: str,
+        sender_client: GrixTransportClient,
+    ) -> None:
+        # 显式把 ContextVar 还原为当初发送 busy-ack 的 client,确保 delete_message 内部
+        # _get_ready_client() 走的是同一条连接(不靠脱离 packet 后的隐式 fallback)。
+        token = _CURRENT_CLIENT_CTX.set(sender_client)
         try:
-            result = await self.delete_message(chat_id, msg_id)
-            logger.debug(
-                "[%s] Deleted busy-ack notification %s for session %s (success=%s)",
-                self.name, msg_id, session_key, result.success,
-            )
-        except Exception as exc:
-            logger.warning(
-                "[%s] Failed to delete busy-ack notification %s: %s",
-                self.name, msg_id, exc,
-            )
+            try:
+                result = await self.delete_message(chat_id, msg_id)
+                logger.debug(
+                    "[%s] Deleted busy-ack notification %s for session %s (success=%s)",
+                    self.name, msg_id, session_key, result.success,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to delete busy-ack notification %s: %s",
+                    self.name, msg_id, exc,
+                )
+        finally:
+            _CURRENT_CLIENT_CTX.reset(token)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
@@ -1853,8 +1898,13 @@ class GrixAdapter(BasePlatformAdapter):
             self._pending_messages.pop(session_key, None)
             ack_entry = self._busy_ack_msg_ids.pop(session_key, None) if session_key else None
             if ack_entry:
-                ack_chat_id, ack_msg_id = ack_entry
-                await self._delete_busy_ack(ack_chat_id or revoke.session_id, ack_msg_id, session_key or "")
+                ack_chat_id, ack_msg_id, ack_sender_client = ack_entry
+                await self._delete_busy_ack(
+                    ack_chat_id or revoke.session_id,
+                    ack_msg_id,
+                    session_key or "",
+                    ack_sender_client,
+                )
             logger.debug(
                 "[%s] Dropped pending Hermes event from GRIX revoke for %s/%s",
                 self.name,
