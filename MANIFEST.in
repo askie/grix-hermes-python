@@ -1,6 +1,0 @@
-include README.md
-include plugin.yaml
-include __init__.py
-recursive-include grix_hermes *.py
-recursive-include grix_hermes *.yaml
-recursive-include grix_hermes/plugin_skills *.md

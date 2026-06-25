@@ -7,18 +7,6 @@ name = "grix-hermes"
 version = "1.4.7"
 description = "Grix/aibot protocol platform adapter plugin for Hermes Agent"
 requires-python = ">=3.11"
-license = {text = "MIT"}
-readme = "README.md"
-keywords = ["hermes", "grix", "aibot", "chatbot", "agent"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Topic :: Communications :: Chat",
-]
 dependencies = [
     "aiohttp>=3.9",
 ]
