@@ -130,6 +130,15 @@ class GrixConnectionConfig:
     shared_owner_id: Optional[str] = None
 
 
+def _resolve_client_version() -> str:
+    """Return the actual installed grix-hermes version, with fallback."""
+    try:
+        from .upgrade_checker import resolve_plugin_version
+        return resolve_plugin_version()
+    except Exception:
+        return DEFAULT_CLIENT_VERSION
+
+
 def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> GrixConnectionConfig:
     raw_capabilities = extra.get("capabilities")
     if isinstance(raw_capabilities, str):
@@ -158,7 +167,7 @@ def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> Gr
         account_id=normalize_text(extra.get("account_id")) or "main",
         client=normalize_text(extra.get("client")) or DEFAULT_CLIENT,
         client_type=normalize_text(extra.get("client_type")) or DEFAULT_CLIENT_TYPE,
-        client_version=normalize_text(extra.get("client_version")) or DEFAULT_CLIENT_VERSION,
+        client_version=normalize_text(extra.get("client_version")) or _resolve_client_version(),
         host_type=normalize_text(extra.get("host_type")) or DEFAULT_HOST_TYPE,
         host_version=normalize_text(extra.get("host_version")) or None,
         contract_version=clamp_int(

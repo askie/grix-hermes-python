@@ -51,6 +51,7 @@ from .contract import (
     ERR_STOP_HANDLER_FAILED,
     ERR_UNSUPPORTED_DECISION,
     ERR_UNSUPPORTED_LOCAL_ACTION,
+    LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
     LOCAL_ACTION_FILE_LIST,
@@ -433,6 +434,8 @@ class GrixAdapter(BasePlatformAdapter):
         self._share_sync_lock = asyncio.Lock()
         # 关停标志：disconnect 期间禁止再为共享名单建新子连接，避免泄漏。
         self._shutting_down = False
+        # 自升级检查器
+        self._upgrade_checker: Optional["UpgradeChecker"] = None
 
     @staticmethod
     def _owner_key_of(client: Optional[GrixTransportClient]) -> str:
@@ -731,6 +734,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._mark_connected()
         logger.info("[%s] Connected to %s", self.name, self.connection.endpoint)
         await self._report_skills()
+        await self._start_upgrade_checker()
         return True
 
     async def _report_skills(self) -> None:
@@ -751,6 +755,9 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._disconnect_requested = True
+        if self._upgrade_checker:
+            self._upgrade_checker.stop()
+            self._upgrade_checker = None
         # agent 共享：置位 shutting_down,串行等在途 share-set 同步结束,避免关停后泄漏。
         self._shutting_down = True
         async with self._share_sync_lock:
@@ -1593,6 +1600,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_file_list(action)
             return
 
+        if action.action_type == LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH:
+            await self._handle_upgrade_push(action)
+            return
+
         if action.action_type == LOCAL_ACTION_GET_SESSION_USAGE:
             await self._handle_get_session_usage(action)
             return
@@ -1702,6 +1713,30 @@ class GrixAdapter(BasePlatformAdapter):
             return str(get_hermes_home())
         except ImportError:
             return os.path.join(os.path.expanduser("~"), ".hermes")
+
+    async def _start_upgrade_checker(self) -> None:
+        try:
+            from .upgrade_checker import UpgradeChecker
+
+            self._upgrade_checker = UpgradeChecker(
+                endpoint=self.connection.endpoint,
+                api_key=self.connection.api_key,
+            )
+            await self._upgrade_checker.start()
+            logger.info("[%s] Upgrade checker started", self.name)
+        except Exception as exc:
+            logger.warning("[%s] Failed to start upgrade checker: %s", self.name, exc)
+
+    async def _handle_upgrade_push(self, action: "GrixLocalAction") -> None:
+        if not self._active_client():
+            return
+        if self._upgrade_checker:
+            self._upgrade_checker.trigger_check()
+        await self._active_client().send_local_action_result(
+            action_id=action.action_id,
+            status=STATUS_OK,
+            result="upgrade check triggered",
+        )
 
     async def _handle_message_packet(self, payload: Dict[str, Any]) -> None:
         message = normalize_inbound_message(payload)
