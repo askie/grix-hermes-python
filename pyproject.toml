@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grix-hermes"
-version = "1.4.5"
+version = "1.4.6"
 description = "Grix/aibot protocol platform adapter plugin for Hermes Agent"
 requires-python = ">=3.11"
 license = {text = "MIT"}

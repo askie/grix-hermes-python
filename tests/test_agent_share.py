@@ -71,6 +71,7 @@ _install_stubs()
 
 from grix_hermes import adapter as adapter_mod  # noqa: E402
 from grix_hermes.protocol import GrixConnectionConfig  # noqa: E402
+from grix_hermes.transport import GrixAuthRejectedError  # noqa: E402
 
 
 # ── Fake transport client：捕获 connect/disconnect 调用，不真连 ws ──
@@ -512,3 +513,76 @@ def test_disconnect_clears_all_owner_states(monkeypatch):
     inst._owner_states.clear()
     assert dict(inst._owner_states) == {}, \
         "disconnect 必须清空所有 owner state（主 owner + 全部被共享者）"
+
+
+# ── 14. 共享子连接断开后自动重连 ──
+def test_shared_client_auto_reconnects_on_disconnect(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    old_b = inst._shared_clients["B"]
+    old_b.connected = False  # 模拟断连
+
+    asyncio.run(inst._try_reconnect_shared_client("B", reason="ws closed"))
+
+    new_b = inst._shared_clients["B"]
+    assert new_b is not old_b, "重连后必须替换为新 client"
+    assert new_b.connected is True
+    assert new_b.config.shared_owner_id == "B"
+
+
+# ── 15. 重连被拒（共享已撤销）→ 清理 owner state，不再重试 ──
+def test_shared_client_reconnect_auth_rejected_cleans_up(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    old_b = inst._shared_clients["B"]
+    old_b.connected = False
+
+    # 在 B 的 owner state 写入状态
+    inst._state_for("B").processing_message_ids["sk"] = "msg-x"
+
+    # 让 FakeClient.connect 抛 GrixAuthRejectedError
+    call_count = 0
+    original_init = FakeTransportClient.__init__
+
+    def rejecting_init(self, config, *, connector=None, on_status=None):
+        original_init(self, config, connector=connector, on_status=on_status)
+
+    monkeypatch.setattr(FakeTransportClient, "__init__", rejecting_init)
+
+    async def rejecting_connect(self):
+        raise GrixAuthRejectedError(403, "share revoked")
+
+    monkeypatch.setattr(FakeTransportClient, "connect", rejecting_connect)
+
+    asyncio.run(inst._try_reconnect_shared_client("B", reason="ws closed"))
+
+    assert "B" not in inst._shared_clients, "认证被拒后不应保留 client"
+    assert "B" not in inst._owner_states, "认证被拒后必须清掉 owner state"
+
+
+# ── 16. 关停期间不重连共享子连接 ──
+def test_shared_client_reconnect_skipped_during_shutdown(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    old_b = inst._shared_clients["B"]
+    old_b.connected = False
+
+    inst._shutting_down = True
+    result = asyncio.run(inst._try_reconnect_shared_client("B", reason="ws closed"))
+
+    assert result is False, "关停期间 reconnect 必须跳过"
+
+
+# ── 17. _handle_share_set_packet 给共享子连接用独立 on_status（非主连接回调） ──
+def test_shared_client_uses_per_client_status_handler(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    shared_b = inst._shared_clients["B"]
+
+    assert shared_b.on_status is not None
+    assert shared_b.on_status is not inst._handle_transport_status, \
+        "共享子连接必须用独立 on_status，不能复用主连接回调"
