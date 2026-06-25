@@ -362,6 +362,7 @@ class UpgradeChecker:
         import aiohttp
 
         body: Dict[str, Any] = {
+            "client_type": PLUGIN_NAME,
             **report,
             "platform": platform.system().lower(),
             "arch": platform.machine(),
