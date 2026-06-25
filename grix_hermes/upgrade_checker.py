@@ -372,6 +372,11 @@ class UpgradeChecker:
             body["host_name"] = socket.gethostname()
         except Exception:
             pass
+        try:
+            import uuid
+            body["install_id"] = str(uuid.getnode())
+        except Exception:
+            pass
 
         base = ws_to_http(self._endpoint)
         url = f"{base}/v1/agent-api/upgrade/report"
