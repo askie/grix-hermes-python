@@ -586,3 +586,21 @@ def test_shared_client_uses_per_client_status_handler(monkeypatch):
     assert shared_b.on_status is not None
     assert shared_b.on_status is not inst._handle_transport_status, \
         "共享子连接必须用独立 on_status，不能复用主连接回调"
+
+
+# ── 18. 竞态防护：共享已被 control_share_set 撤销后，旧 client 断连触发的 on_status
+#        不应把已撤销的共享重新建起来。
+def test_shared_client_no_reconnect_after_revoke(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+
+    # 撤销共享（下发空名单）→ B 从 _shared_clients 移除
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": []}))
+    assert "B" not in inst._shared_clients
+
+    # 模拟旧 client 的 on_status 延迟触发 reconnect
+    result = asyncio.run(inst._try_reconnect_shared_client("B", reason="ws closed"))
+
+    assert result is False, "共享已撤销，不应重连"
+    assert "B" not in inst._shared_clients, "不应把已撤销的共享重新加回 _shared_clients"

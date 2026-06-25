@@ -1373,10 +1373,12 @@ class GrixAdapter(BasePlatformAdapter):
                 return False
 
             old_client = self._shared_clients.get(shared_owner_id)
-            if old_client is not None:
-                s = getattr(old_client, "status", None)
-                if isinstance(s, dict) and s.get("connected") and s.get("authed"):
-                    return True
+            if old_client is None:
+                # Already removed by control_share_set (revoked) or prior reconnect.
+                return False
+            s = getattr(old_client, "status", None)
+            if isinstance(s, dict) and s.get("connected") and s.get("authed"):
+                return True
 
             logger.info(
                 "[%s] Shared client reconnect shared_owner=%s: %s",
@@ -1385,10 +1387,9 @@ class GrixAdapter(BasePlatformAdapter):
                 reason or "unknown",
             )
 
-            if old_client:
-                self._shared_clients.pop(shared_owner_id, None)
-                with suppress(Exception):
-                    await old_client.disconnect(reason or "shared client reconnect")
+            self._shared_clients.pop(shared_owner_id, None)
+            with suppress(Exception):
+                await old_client.disconnect(reason or "shared client reconnect")
 
             for attempt in range(1, max_attempts + 1):
                 if self._shutting_down or self._disconnect_requested:
