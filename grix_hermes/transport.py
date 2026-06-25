@@ -196,6 +196,7 @@ class GrixTransportClient:
         self._auth_session: Optional[GrixAuthSession] = None
         self._disconnect_requested = False
         self._disconnect_lock = asyncio.Lock()
+        self._status_tasks: set[asyncio.Task] = set()
         self._status = {
             "running": False,
             "connected": False,
@@ -836,4 +837,6 @@ class GrixTransportClient:
         if self.on_status:
             result = self.on_status(dict(self._status))
             if asyncio.iscoroutine(result):
-                asyncio.create_task(result)
+                task = asyncio.create_task(result)
+                self._status_tasks.add(task)
+                task.add_done_callback(self._status_tasks.discard)

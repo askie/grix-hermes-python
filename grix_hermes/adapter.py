@@ -18,7 +18,7 @@ from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
@@ -1344,6 +1344,101 @@ class GrixAdapter(BasePlatformAdapter):
 
         session_store.append_to_transcript(session_entry.session_id, transcript_entry)
 
+    def _make_shared_status_handler(self, shared_owner_id: str) -> Callable:
+        """Return an on_status callback bound to a specific shared_owner_id.
+
+        When the shared client disconnects unexpectedly, this triggers
+        automatic reconnection — mirroring _handle_transport_status for
+        the primary client."""
+
+        async def handler(status: Dict[str, Any]) -> None:
+            if self._disconnect_requested or self._shutting_down:
+                return
+            if status.get("connected", True):
+                return
+            reason = str(status.get("last_error") or "shared client disconnected")
+            await self._try_reconnect_shared_client(shared_owner_id, reason=reason)
+
+        return handler
+
+    async def _try_reconnect_shared_client(
+        self, shared_owner_id: str, *, reason: str = "", max_attempts: int = 2
+    ) -> bool:
+        """Try to reconnect a disconnected shared client.
+
+        On auth rejection (share revoked) we clean up and stop.
+        On transient failure we retry with exponential backoff."""
+        async with self._share_sync_lock:
+            if self._shutting_down or self._disconnect_requested:
+                return False
+
+            old_client = self._shared_clients.get(shared_owner_id)
+            if old_client is None:
+                # Already removed by control_share_set (revoked) or prior reconnect.
+                return False
+            s = getattr(old_client, "status", None)
+            if isinstance(s, dict) and s.get("connected") and s.get("authed"):
+                return True
+
+            logger.info(
+                "[%s] Shared client reconnect shared_owner=%s: %s",
+                self.name,
+                shared_owner_id,
+                reason or "unknown",
+            )
+
+            self._shared_clients.pop(shared_owner_id, None)
+            with suppress(Exception):
+                await old_client.disconnect(reason or "shared client reconnect")
+
+            for attempt in range(1, max_attempts + 1):
+                if self._shutting_down or self._disconnect_requested:
+                    return False
+                try:
+                    shared_config = dataclasses.replace(
+                        self.connection, shared_owner_id=shared_owner_id
+                    )
+                    new_client = GrixTransportClient(
+                        shared_config,
+                        connector=self._connector,
+                        on_status=self._make_shared_status_handler(shared_owner_id),
+                    )
+                    self._bind_packet_handler(new_client)
+                    await new_client.connect()
+                    self._shared_clients[shared_owner_id] = new_client
+                    logger.info(
+                        "[%s] Shared client reconnect OK shared_owner=%s (attempt %d)",
+                        self.name,
+                        shared_owner_id,
+                        attempt,
+                    )
+                    return True
+                except GrixAuthRejectedError:
+                    logger.info(
+                        "[%s] Shared client auth rejected (share revoked) shared_owner=%s",
+                        self.name,
+                        shared_owner_id,
+                    )
+                    self._drop_owner_state(shared_owner_id)
+                    return False
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Shared client reconnect attempt %d failed shared_owner=%s: %s",
+                        self.name,
+                        shared_owner_id,
+                        attempt,
+                        exc,
+                    )
+                    await asyncio.sleep(2 * attempt)
+
+            logger.error(
+                "[%s] Shared client reconnect failed after %d attempts shared_owner=%s",
+                self.name,
+                max_attempts,
+                shared_owner_id,
+            )
+            return False
+
     async def _handle_transport_status(self, status: Dict[str, Any]) -> None:
         if self._disconnect_requested:
             return
@@ -1437,7 +1532,7 @@ class GrixAdapter(BasePlatformAdapter):
                     shared_client = GrixTransportClient(
                         shared_config,
                         connector=self._connector,
-                        on_status=self._handle_transport_status,
+                        on_status=self._make_shared_status_handler(shared_owner_id),
                     )
                     self._bind_packet_handler(shared_client)
                     await shared_client.connect()
