@@ -420,10 +420,13 @@ class GrixTransportClient:
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
         stripped_session = session_id.strip()
-        digest = hashlib.sha256(
-            f"{stripped_session}:{time.monotonic_ns()}".encode()
-        ).hexdigest()[:16]
-        client_msg_id = f"hermes_media_{digest}"
+        if event_id:
+            client_msg_id = f"hermes_media_{event_id.strip()}"
+        else:
+            digest = hashlib.sha256(
+                f"{stripped_session}:{time.monotonic_ns()}".encode()
+            ).hexdigest()[:16]
+            client_msg_id = f"hermes_media_{digest}"
 
         payload: Dict[str, Any] = {
             "session_id": stripped_session,

@@ -120,8 +120,11 @@ async def _grix_file_upload_handler(args: dict, **kwargs) -> str:
             "message_id": send_result.get("message_id"),
         })
     except Exception as exc:
-        logger.warning("grix_file_upload failed: %s", exc)
-        return tool_error(f"file upload failed: {exc}")
+        logger.warning("grix_file_upload failed: %s", exc, exc_info=True)
+        safe_msg = str(exc)
+        if len(safe_msg) > 200:
+            safe_msg = safe_msg[:200] + "..."
+        return tool_error(f"file upload failed: {safe_msg}")
 
 
 def register_file_upload_tool(ctx=None) -> None:

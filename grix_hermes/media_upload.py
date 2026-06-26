@@ -161,10 +161,16 @@ async def upload_file_to_media(
             try:
                 body = json.loads(raw_text) if raw_text else {}
             except (json.JSONDecodeError, ValueError):
-                raise RuntimeError(f"presign returned non-JSON response ({resp.status}): {raw_text[:256]}")
+                logger.debug("presign non-JSON response (%d): %.256s", resp.status, raw_text)
+                raise RuntimeError(f"presign returned non-JSON response (HTTP {resp.status})")
             if not isinstance(body, dict):
-                raise RuntimeError(f"presign returned unexpected format: {type(body).__name__}")
-            if resp.status >= 400 or int(body.get("code", -1)) != 0:
+                raise RuntimeError(f"presign returned unexpected response format")
+            raw_code = body.get("code")
+            try:
+                code_ok = int(raw_code) == 0 if raw_code is not None else False
+            except (TypeError, ValueError):
+                code_ok = False
+            if resp.status >= 400 or not code_ok:
                 msg = body.get("msg") or resp.reason or "presign failed"
                 raise RuntimeError(f"presign request failed: {msg}")
 
@@ -200,4 +206,7 @@ async def upload_file_to_media(
 
 def _read_file_bytes(file_path: str) -> bytes:
     with open(file_path.strip(), "rb") as f:
-        return f.read()
+        data = f.read(MAX_FILE_BYTES + 1)
+        if len(data) > MAX_FILE_BYTES:
+            raise ValueError(f"file exceeds 50MB limit during read: {file_path}")
+        return data
