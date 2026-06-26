@@ -3,8 +3,6 @@
 import logging
 from typing import Any, Dict
 
-from .contract import CAP_AGENT_INVOKE_V1
-
 logger = logging.getLogger(__name__)
 
 GRIX_FILE_UPLOAD_SCHEMA = {
@@ -56,7 +54,7 @@ def _check_file_upload() -> bool:
         adapter = runner.adapters.get(Platform("grix"))
         if not adapter:
             return False
-        return CAP_AGENT_INVOKE_V1 in (adapter.connection.capabilities or [])
+        return bool(adapter.connection.endpoint and adapter.connection.api_key)
     except Exception:
         return False
 

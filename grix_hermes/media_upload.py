@@ -9,9 +9,10 @@ Aligns with grix-connector's uploadReplyFileToAgentMedia flow:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -69,8 +70,9 @@ def resolve_presign_url(ws_endpoint: str) -> str:
         raise ValueError(f"endpoint must start with ws:// or wss://: {ws_endpoint}")
 
     base_path = parsed.path.rstrip("/")
-    if base_path.endswith("/ws"):
-        base_path = base_path[:-3]
+    if not base_path.endswith("/ws"):
+        raise ValueError(f"endpoint must end with /ws: {ws_endpoint}")
+    base_path = base_path[:-3]
     if not base_path:
         raise ValueError(f"cannot derive presign path from endpoint: {ws_endpoint}")
 
@@ -123,7 +125,6 @@ async def upload_file_to_media(
     api_key: str,
     session_id: str,
     file_path: str,
-    timeout: int = 30,
 ) -> Dict[str, Any]:
     """Upload a local file to Grix platform storage via presign.
 
@@ -131,16 +132,17 @@ async def upload_file_to_media(
     """
     import aiohttp
 
-    file_name, _, _ = validate_file(file_path)
+    file_name, _, size = validate_file(file_path)
     content_type = resolve_content_type(file_name)
     attachment_type = resolve_attachment_type(content_type)
 
     presign_url = resolve_presign_url(ws_endpoint)
-    logger.info("Requesting presign URL: %s (file=%s)", presign_url, file_name)
+    logger.info("Requesting presign URL: %s (file=%s, %d bytes)", presign_url, file_name, size)
 
-    async with aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=timeout),
-    ) as http:
+    presign_timeout = aiohttp.ClientTimeout(total=15)
+    upload_timeout = aiohttp.ClientTimeout(total=max(60, size // (256 * 1024)))
+
+    async with aiohttp.ClientSession() as http:
         # Step 1: request presign
         async with http.post(
             presign_url,
@@ -153,8 +155,15 @@ async def upload_file_to_media(
                 "Authorization": f"Bearer {api_key.strip()}",
                 "Content-Type": "application/json",
             },
+            timeout=presign_timeout,
         ) as resp:
-            body = await resp.json(content_type=None)
+            raw_text = await resp.text()
+            try:
+                body = json.loads(raw_text) if raw_text else {}
+            except (json.JSONDecodeError, ValueError):
+                raise RuntimeError(f"presign returned non-JSON response ({resp.status}): {raw_text[:256]}")
+            if not isinstance(body, dict):
+                raise RuntimeError(f"presign returned unexpected format: {type(body).__name__}")
             if resp.status >= 400 or int(body.get("code", -1)) != 0:
                 msg = body.get("msg") or resp.reason or "presign failed"
                 raise RuntimeError(f"presign request failed: {msg}")
@@ -173,6 +182,7 @@ async def upload_file_to_media(
             upload_url,
             data=file_bytes,
             headers={"Content-Type": content_type},
+            timeout=upload_timeout,
         ) as resp:
             if resp.status >= 400:
                 raise RuntimeError(f"file upload failed: {resp.status} {resp.reason}")
