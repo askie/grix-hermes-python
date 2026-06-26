@@ -129,6 +129,7 @@ def register(ctx):
         ("egg_tool", "register_egg_tool"),
         ("update_tool", "register_update_tool"),
         ("file_link_tool", "register_file_link_tool"),
+        ("file_upload_tool", "register_file_upload_tool"),
         ("access_control_tool", "register_access_control_tool"),
     ]:
         try:
