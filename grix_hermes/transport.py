@@ -408,6 +408,57 @@ class GrixTransportClient:
             "packet": packet,
         }
 
+    async def send_media(
+        self,
+        session_id: str,
+        content: str,
+        extra: Dict[str, Any],
+        *,
+        reply_to_message_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        event_id: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        stripped_session = session_id.strip()
+        if event_id:
+            client_msg_id = f"hermes_media_{event_id.strip()}"
+        else:
+            digest = hashlib.sha256(
+                f"{stripped_session}:{time.monotonic_ns()}".encode()
+            ).hexdigest()[:16]
+            client_msg_id = f"hermes_media_{digest}"
+
+        payload: Dict[str, Any] = {
+            "session_id": stripped_session,
+            "msg_type": 2,
+            "content": content,
+            "client_msg_id": client_msg_id,
+            "extra": extra,
+        }
+        if reply_to_message_id:
+            payload["quoted_message_id"] = reply_to_message_id.strip()
+        if thread_id:
+            payload["thread_id"] = thread_id.strip()
+        if event_id:
+            payload["event_id"] = event_id.strip()
+
+        packet = await self.request(
+            CMD_SEND_MSG,
+            payload,
+            expected=(CMD_SEND_ACK, CMD_SEND_NACK, CMD_ERROR),
+            timeout_ms=timeout_ms,
+        )
+        if packet["cmd"] != CMD_SEND_ACK:
+            raise self._packet_error(packet)
+        return {
+            "ok": True,
+            "message_id": (
+                str(packet["payload"].get("msg_id") or packet["payload"].get("client_msg_id") or "").strip()
+                or None
+            ),
+            "packet": packet,
+        }
+
     async def edit_message(
         self,
         session_id: str,
