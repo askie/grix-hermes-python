@@ -21,7 +21,7 @@ grix-hermes = "grix_hermes"
 include = ["grix_hermes*"]
 
 [tool.setuptools.package-data]
-grix_hermes = ["plugin.yaml", "plugin_skills/*/SKILL.md"]
+grix_hermes = ["plugin_skills/*/SKILL.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
