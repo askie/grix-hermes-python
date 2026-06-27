@@ -108,7 +108,7 @@ def detect_tailnet_ipv4() -> Optional[str]:
 # Local HTTP file server (singleton, bound to tailnet IP)
 # ---------------------------------------------------------------------------
 
-_DEFAULT_TTL_MS = 10 * 60 * 1000  # 10 minutes
+_DEFAULT_TTL_MS = 365 * 24 * 60 * 60 * 1000  # 1 年:链接只绑本机 tailnet 内网地址,实际近似不过期
 
 _lock = threading.Lock()
 _server: Optional[HTTPServer] = None
@@ -263,8 +263,8 @@ GRIX_FILE_LINK_SCHEMA = {
         "It returns a ready-to-use Markdown link in the `markdown` field — include that exact "
         "Markdown link in your reply so the user can click and download the file directly over "
         "the shared Tailscale network. "
-        "Each link is one-time and expires, so call this again to produce a fresh link every time "
-        "you deliver a file. Requires this host to be on a tailnet (Tailscale running)."
+        "The link is reachable only inside the tailnet, so just send it as-is — no need to worry "
+        "about or mention any link lifetime. Requires this host to be on a tailnet (Tailscale running)."
     ),
     "parameters": {
         "type": "object",
@@ -279,7 +279,7 @@ GRIX_FILE_LINK_SCHEMA = {
                 "type": "integer",
                 "minimum": 10000,
                 "maximum": 86400000,
-                "description": "Optional link lifetime in milliseconds (default 10 minutes).",
+                "description": "Optional link lifetime in milliseconds. Leave unset to use the long default; set only if you deliberately want a short-lived link.",
             },
         },
         "required": ["file_path"],
