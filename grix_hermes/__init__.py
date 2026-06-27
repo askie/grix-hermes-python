@@ -62,6 +62,60 @@ PLUGIN_SKILLS = {
 }
 
 
+# ─── 技能优先约定 ───────────────────────────────────────────────────────────
+# 凡是挂在某个 plugin skill 名下的工具，注册时在其 description 末尾统一追加一句
+# 指引：使用前先按对应 skill 规程执行，不要绕过 skill 直接裸调本工具。工具→技能
+# 的映射直接从 PLUGIN_SKILLS 反推（单一事实源），新增技能/工具无需改动这里。
+_TOOL_SKILLS: dict = {}
+for _sname, _sdef in PLUGIN_SKILLS.items():
+    for _tool in _sdef["tools"]:
+        _skills = _TOOL_SKILLS.setdefault(_tool, [])
+        if _sname not in _skills:
+            _skills.append(_sname)
+
+
+def _skill_guidance(tool_name: str) -> str:
+    skills = _TOOL_SKILLS.get(tool_name)
+    if not skills:
+        return ""
+    if len(skills) == 1:
+        return (
+            f" Before using this tool, follow the `{skills[0]}` skill's procedure "
+            "first; do not invoke this tool directly without going through that "
+            "skill's guidance."
+        )
+    return (
+        " Before using this tool, follow the matching Grix skill's procedure first "
+        "(the `grix-*` / `message-*` skill that covers your chosen action); do not "
+        "invoke this tool directly without going through that skill's guidance."
+    )
+
+
+class _SkillGuidanceCtx:
+    """包裹宿主 ctx：每次工具注册时，给有配套 skill 的工具描述追加「技能优先」
+    指引；其余属性透传给真实 ctx。"""
+
+    def __init__(self, ctx):
+        self._ctx = ctx
+
+    def __getattr__(self, name):
+        return getattr(self._ctx, name)
+
+    def register_tool(self, *args, **kwargs):
+        tool_name = kwargs.get("name")
+        guidance = _skill_guidance(tool_name) if tool_name else ""
+        if guidance:
+            description = kwargs.get("description")
+            if isinstance(description, str) and description:
+                kwargs["description"] = description + guidance
+            schema = kwargs.get("schema")
+            if isinstance(schema, dict) and isinstance(schema.get("description"), str):
+                schema = dict(schema)
+                schema["description"] = schema["description"] + guidance
+                kwargs["schema"] = schema
+        return self._ctx.register_tool(*args, **kwargs)
+
+
 def _skill_metadata(skill_def: dict) -> dict:
     return {
         "tools": list(skill_def["tools"]),
@@ -123,6 +177,7 @@ def register(ctx):
 
     import importlib
 
+    guidance_ctx = _SkillGuidanceCtx(ctx)
     for _module, _fn_name in [
         ("invoke_tool", "register_invoke_tool"),
         ("auth_tools", "register_auth_tools"),
@@ -134,7 +189,7 @@ def register(ctx):
     ]:
         try:
             _mod = importlib.import_module(f".{_module}", __name__)
-            getattr(_mod, _fn_name)(ctx)
+            getattr(_mod, _fn_name)(guidance_ctx)
         except Exception as exc:
             import logging
             logging.getLogger(__name__).warning("Failed to register %s: %s", _module, exc)
