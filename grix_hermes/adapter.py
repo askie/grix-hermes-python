@@ -186,32 +186,58 @@ def build_grix_connection_config(config: PlatformConfig) -> GrixConnectionConfig
     return build_connection_config(extra, api_key)
 
 
+# 明确指向永久失败的 HTTP 状态码（客户端错误）。注意 408(超时) / 429(限流)
+# 不在此列 —— 它们是瞬时的，仍应重试。
+_NON_RETRYABLE_HTTP = frozenset({400, 401, 403, 404, 405, 406, 409, 410, 422})
+
+# 文本层面明确指向永久失败的信号（鉴权/凭证类）。命中即放弃。
+_NON_RETRYABLE_TOKENS = (
+    "unauthorized",
+    "forbidden",
+    "invalid api key",
+    "invalid token",
+    "authentication failed",
+    "auth rejected",
+)
+
+
 def _coerce_retryable(error: Exception) -> bool:
+    """判断连接/发送错误是否值得重连。
+
+    采用「默认可重试」的黑名单策略：只有明确指向永久失败的错误（鉴权拒绝、
+    4xx 客户端错误）才放弃，其余一律重试。原因是代价不对称 —— 框架侧已有
+    最多 20 次、退避封顶 5 分钟的上限，错判「可重试」最多多试几次就停；而
+    错判「不可重试」会让平台被移出重试队列、彻底死连，必须人工重启容器。
+    服务端 5xx / 408 / 429 是典型瞬时故障（网关滚动重启、过载），必须重试 ——
+    旧白名单不含 HTTP 状态码，把 ws 握手 502/503 误判为永久失败，正是这次
+    彻底掉线的直接原因。
+    """
+    # 鉴权拒绝：坏凭证不会因为重试而变好，永久失败。
+    if isinstance(error, GrixAuthRejectedError):
+        return False
+
+    # 明确的瞬时类型：连接关闭、依赖缺失、握手限流(4008)。
     if isinstance(error, (GrixConnectionClosedError, GrixDependencyError)):
-        return True
-    lowered = str(error).lower()
-    if not lowered:
         return True
     if isinstance(error, GrixPacketError) and error.code == 4008:
         return True
-    return any(
-        token in lowered
-        for token in (
-            "connect",
-            "connection",
-            "network",
-            "timeout",
-            "temporarily unavailable",
-            "closing transport",
-            "not connected",
-            "not authenticated",
-            "broken pipe",
-            "reset by peer",
-            "too fast",
-            "rate limit",
-            "throttl",
-        )
-    )
+
+    # HTTP 状态码：aiohttp 的 WSServerHandshakeError / ClientResponseError 带 .status。
+    # 5xx 服务端错误、408 超时、429 限流 → 瞬时可重试；明确 4xx → 永久失败。
+    status = getattr(error, "status", None)
+    if isinstance(status, int):
+        if status >= 500 or status in (408, 429):
+            return True
+        if status in _NON_RETRYABLE_HTTP:
+            return False
+
+    # 文本兜底：仅在命中明确的永久失败信号时才放弃。
+    lowered = str(error).lower()
+    if any(token in lowered for token in _NON_RETRYABLE_TOKENS):
+        return False
+
+    # 默认可重试（未知错误、空文本、各类网络/服务端瞬时故障都归此）。
+    return True
 
 
 def _resolve_message_type(message: GrixInboundMessage) -> MessageType:
