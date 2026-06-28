@@ -28,6 +28,8 @@ COOLDOWN_S = 30 * 60  # 30 minutes after failure
 MAX_DAILY_ATTEMPTS = 2
 MAX_VERSION_ATTEMPTS = 3
 API_TIMEOUT_S = 10
+UPDATE_MAX_ATTEMPTS = 4
+UPDATE_RETRY_BASE_S = 1.5
 PLUGIN_NAME = "grix-hermes"
 PLUGIN_GIT_REPO = "askie/grix-hermes-python"
 
@@ -78,22 +80,31 @@ def ws_to_http(ws_url: str) -> str:
 #  State / pending file helpers
 # ---------------------------------------------------------------------------
 
-def _data_dir() -> Path:
-    d = Path.home() / ".hermes" / ".grix-upgrade"
+def _sanitize_key(agent_id: Optional[str]) -> str:
+    key = "".join(c for c in (agent_id or "").strip() if c.isalnum() or c in "-_")
+    return key or "default"
+
+
+def _data_dir(agent_id: Optional[str] = None) -> Path:
+    # Per-agent subdir: multiple gateways (profiles) on one host must never
+    # clobber each other's pending/state — a sibling's failed upgrade must not
+    # remove our pending file (losing our success report) nor pollute our
+    # rate-limit counters.
+    d = Path.home() / ".hermes" / ".grix-upgrade" / _sanitize_key(agent_id)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _state_file() -> Path:
-    return _data_dir() / "state.json"
+def _state_file(agent_id: Optional[str] = None) -> Path:
+    return _data_dir(agent_id) / "state.json"
 
 
-def _pending_file() -> Path:
-    return _data_dir() / "pending.json"
+def _pending_file(agent_id: Optional[str] = None) -> Path:
+    return _data_dir(agent_id) / "pending.json"
 
 
-def _read_state() -> Dict[str, Any]:
-    f = _state_file()
+def _read_state(agent_id: Optional[str] = None) -> Dict[str, Any]:
+    f = _state_file(agent_id)
     if not f.exists():
         return {"daily_attempts": {}, "version_attempts": {}}
     try:
@@ -102,8 +113,8 @@ def _read_state() -> Dict[str, Any]:
         return {"daily_attempts": {}, "version_attempts": {}}
 
 
-def _write_state(state: Dict[str, Any]) -> None:
-    f = _state_file()
+def _write_state(state: Dict[str, Any], agent_id: Optional[str] = None) -> None:
+    f = _state_file(agent_id)
     tmp = f.with_suffix(".tmp")
     tmp.write_text(json.dumps(state))
     tmp.rename(f)
@@ -113,20 +124,20 @@ def _today() -> str:
     return time.strftime("%Y-%m-%d")
 
 
-def _pending_exists() -> bool:
-    return _pending_file().exists()
+def _pending_exists(agent_id: Optional[str] = None) -> bool:
+    return _pending_file(agent_id).exists()
 
 
-def _write_pending(from_version: str, target_version: str) -> None:
-    _pending_file().write_text(json.dumps({
+def _write_pending(from_version: str, target_version: str, agent_id: Optional[str] = None) -> None:
+    _pending_file(agent_id).write_text(json.dumps({
         "from_version": from_version,
         "target_version": target_version,
         "timestamp": time.time(),
     }))
 
 
-def _read_pending() -> Optional[Dict[str, Any]]:
-    f = _pending_file()
+def _read_pending(agent_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    f = _pending_file(agent_id)
     if not f.exists():
         return None
     try:
@@ -135,8 +146,8 @@ def _read_pending() -> Optional[Dict[str, Any]]:
         return None
 
 
-def _remove_pending() -> None:
-    f = _pending_file()
+def _remove_pending(agent_id: Optional[str] = None) -> None:
+    f = _pending_file(agent_id)
     try:
         f.unlink(missing_ok=True)
     except Exception:
@@ -156,11 +167,13 @@ class UpgradeChecker:
         api_key: str,
         channel: str = "stable",
         is_busy: Optional[Callable[[], bool]] = None,
+        agent_id: Optional[str] = None,
     ):
         self._endpoint = endpoint
         self._api_key = api_key
         self._channel = channel
         self._is_busy = is_busy
+        self._agent_id = agent_id
         self._running = False
         self._stopped = False
         self._task: Optional[asyncio.Task] = None
@@ -197,7 +210,7 @@ class UpgradeChecker:
             pass
 
     async def _handle_pending_on_startup(self) -> None:
-        pending = _read_pending()
+        pending = _read_pending(self._agent_id)
         if not pending:
             return
 
@@ -224,7 +237,7 @@ class UpgradeChecker:
                 "error_code": "STARTUP_MISMATCH",
                 "error_msg": f"expected {target}, got {current}",
             })
-        _remove_pending()
+        _remove_pending(self._agent_id)
 
     # ----- check / upgrade -----
 
@@ -240,7 +253,7 @@ class UpgradeChecker:
             self._running = False
 
     async def _check(self) -> None:
-        if _pending_exists():
+        if _pending_exists(self._agent_id):
             return
 
         resp = await self._query_upgrade()
@@ -259,7 +272,7 @@ class UpgradeChecker:
         start_time = time.monotonic()
 
         try:
-            _write_pending(from_ver, target)
+            _write_pending(from_ver, target, self._agent_id)
 
             await self._do_upgrade()
 
@@ -288,7 +301,7 @@ class UpgradeChecker:
         except Exception as exc:
             msg = str(exc)
             logger.error("[upgrade] failed: %s", msg)
-            _remove_pending()
+            _remove_pending(self._agent_id)
             self._record_failure(target)
 
             duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -304,7 +317,7 @@ class UpgradeChecker:
     # ----- rate limiting -----
 
     def _check_rate_limit(self, target: str) -> bool:
-        state = _read_state()
+        state = _read_state(self._agent_id)
 
         last_fail = state.get("last_failure_at")
         if last_fail:
@@ -326,7 +339,7 @@ class UpgradeChecker:
         return True
 
     def _record_failure(self, target: str) -> None:
-        state = _read_state()
+        state = _read_state(self._agent_id)
         today = _today()
         state["last_failure_at"] = time.time()
         state["last_failure_version"] = target
@@ -334,7 +347,7 @@ class UpgradeChecker:
         da[today] = da.get(today, 0) + 1
         va = state.setdefault("version_attempts", {})
         va[target] = va.get(target, 0) + 1
-        _write_state(state)
+        _write_state(state, self._agent_id)
 
     # ----- HTTP API -----
 
@@ -410,13 +423,28 @@ class UpgradeChecker:
     # ----- upgrade execution -----
 
     async def _do_upgrade(self) -> None:
-        """Run ``hermes plugins update`` to upgrade the plugin."""
-        code, _stdout, stderr = await self._run_cmd(["hermes", "plugins", "update", PLUGIN_NAME])
-        if code == 0:
-            logger.info("[upgrade] hermes plugins update succeeded")
-            return
+        """Run ``hermes plugins update`` to upgrade the plugin.
 
-        logger.info("[upgrade] update failed (exit %d), trying install from source", code)
+        Retries with randomized backoff: when several gateways (profiles) on one
+        host upgrade at once they contend on Hermes' plugin registry lock, and a
+        loser exits non-zero even though its own git pull already landed — a
+        short retry rides over the contention before the full-reinstall fallback.
+        """
+        import random
+
+        last_code = -1
+        last_stderr = ""
+        for attempt in range(1, UPDATE_MAX_ATTEMPTS + 1):
+            code, _stdout, stderr = await self._run_cmd(["hermes", "plugins", "update", PLUGIN_NAME])
+            if code == 0:
+                logger.info("[upgrade] hermes plugins update succeeded (attempt %d)", attempt)
+                return
+            last_code, last_stderr = code, stderr
+            logger.info("[upgrade] update attempt %d/%d failed (exit %d)", attempt, UPDATE_MAX_ATTEMPTS, code)
+            if attempt < UPDATE_MAX_ATTEMPTS:
+                await asyncio.sleep(UPDATE_RETRY_BASE_S * attempt + random.uniform(0, 1.0))
+
+        logger.info("[upgrade] update exhausted %d attempts, trying install from source", UPDATE_MAX_ATTEMPTS)
         code2, _stdout2, stderr2 = await self._run_cmd(
             ["hermes", "plugins", "install", PLUGIN_GIT_REPO, "--enable"],
         )
@@ -425,8 +453,8 @@ class UpgradeChecker:
             return
 
         raise RuntimeError(
-            f"both update (exit {code}) and install (exit {code2}) failed; "
-            f"stderr={stderr2[:500]}"
+            f"both update (exit {last_code}) and install (exit {code2}) failed; "
+            f"stderr={(stderr2 or last_stderr)[:500]}"
         )
 
     @staticmethod

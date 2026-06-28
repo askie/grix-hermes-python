@@ -1747,6 +1747,7 @@ class GrixAdapter(BasePlatformAdapter):
             self._upgrade_checker = UpgradeChecker(
                 endpoint=self.connection.endpoint,
                 api_key=self.connection.api_key,
+                agent_id=self.connection.agent_id,
             )
             await self._upgrade_checker.start()
             logger.info("[%s] Upgrade checker started", self.name)
