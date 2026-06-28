@@ -80,8 +80,10 @@ def ws_to_http(ws_url: str) -> str:
 #  State / pending file helpers
 # ---------------------------------------------------------------------------
 
-def _sanitize_key(agent_id: Optional[str]) -> str:
-    key = "".join(c for c in (agent_id or "").strip() if c.isalnum() or c in "-_")
+def _sanitize_key(agent_id: Optional[object]) -> str:
+    # agent_id may arrive as int (snowflake) or str — coerce before sanitizing.
+    raw = str(agent_id).strip() if agent_id else ""
+    key = "".join(c for c in raw if c.isalnum() or c in "-_")
     return key or "default"
 
 
