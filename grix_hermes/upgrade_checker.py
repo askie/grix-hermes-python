@@ -33,18 +33,17 @@ PLUGIN_GIT_REPO = "askie/grix-hermes-python"
 
 
 def resolve_plugin_version() -> str:
-    """Resolve the installed grix-hermes version at runtime.
+    """Resolve the running grix-hermes version at runtime.
 
-    Installed wheels expose it via package metadata; source / editable installs
-    fall back to ``plugin.yaml`` — the single authoritative version declaration
-    (see ``_version.py``).
+    Reads the running plugin directory's own ``plugin.yaml`` first — that is the
+    single authoritative version declaration (see ``_version.py``) and the exact
+    file ``hermes plugins update`` (git pull) rewrites on upgrade, so the version
+    we report always matches the code actually installed. Package metadata is
+    only a fallback for installs where ``plugin.yaml`` is not alongside the code
+    (e.g. a pip/wheel install), and must not shadow the directory plugin — a
+    stale editable/wheel dist would otherwise make a successful upgrade look
+    rolled back.
     """
-    try:
-        from importlib.metadata import version
-
-        return version(PLUGIN_NAME)
-    except Exception:
-        pass
     try:
         import re
 
@@ -56,6 +55,12 @@ def resolve_plugin_version() -> str:
         )
         if match:
             return match.group(1)
+    except Exception:
+        pass
+    try:
+        from importlib.metadata import version
+
+        return version(PLUGIN_NAME)
     except Exception:
         pass
     return "0.0.0"
