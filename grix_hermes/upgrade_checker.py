@@ -33,7 +33,12 @@ PLUGIN_GIT_REPO = "askie/grix-hermes-python"
 
 
 def resolve_plugin_version() -> str:
-    """Resolve the installed grix-hermes version at runtime."""
+    """Resolve the installed grix-hermes version at runtime.
+
+    Installed wheels expose it via package metadata; source / editable installs
+    fall back to ``plugin.yaml`` — the single authoritative version declaration
+    (see ``_version.py``).
+    """
     try:
         from importlib.metadata import version
 
@@ -41,14 +46,16 @@ def resolve_plugin_version() -> str:
     except Exception:
         pass
     try:
-        import tomllib
+        import re
 
-        toml_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
-        with open(toml_path, "rb") as f:
-            data = tomllib.load(f)
-        v = data.get("project", {}).get("version")
-        if v:
-            return v
+        manifest = Path(__file__).resolve().parent.parent / "plugin.yaml"
+        match = re.search(
+            r"""^version:\s*["']?([^"'\s]+)""",
+            manifest.read_text(encoding="utf-8"),
+            re.MULTILINE,
+        )
+        if match:
+            return match.group(1)
     except Exception:
         pass
     return "0.0.0"
