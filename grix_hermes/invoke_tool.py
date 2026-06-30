@@ -35,6 +35,8 @@ SUPPORTED_ACTIONS = {
     "session_send": "Send a message into a session AS THE OWNER (owner relay)",
     "chat_state_query": "Query chat-level task states across the owner's sessions (supports session_id/page/page_size/state filtering)",
     "chat_state_update": "Manually update the task state of a specific chat session (params: session_id, state, reason[optional])",
+    "egg_search": "Search the egg marketplace (params: keyword, category_id, locale, page, page_size)",
+    "egg_get": "Get egg details by ID (params: id[required], locale, version)",
 }
 
 GRIX_INVOKE_SCHEMA = {
@@ -51,7 +53,8 @@ GRIX_INVOKE_SCHEMA = {
         "agent_category_update, agent_category_assign, agent_api_key_rotate\n"
         "  Agent dispatch: dispatch_agent, agent_introduction_update\n"
         "  Owner relay: call_owner, session_send\n"
-        "  Chat state: chat_state_query, chat_state_update"
+        "  Chat state: chat_state_query, chat_state_update\n"
+        "  Egg marketplace: egg_search, egg_get"
     ),
     "parameters": {
         "type": "object",
