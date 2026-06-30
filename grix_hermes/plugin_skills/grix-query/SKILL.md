@@ -15,7 +15,7 @@ grix_invoke(action="<ACTION>", params={...})
 Parameter names use snake_case (sent verbatim to the backend).
 
 - `contact_search` — params: `id` (contact ID) **or** `keyword`; optional `limit` (1–100), `offset`.
-- `session_search` — params: `keyword`; optional `session_type` (1 = private chat, 2 = group chat, omit = all), `limit`, `offset`. Each result item includes `session_type`.
+- `session_search` — params: `keyword`; optional `session_type` (1 = private chats only, 2 = group chats only; **omit to return all sessions regardless of type**), `limit`, `offset`. Each result item includes `session_type`.
 - `message_history` — params: `session_id` (required); optional `before_id` (pagination cursor), `limit`.
 - `message_search` — params: `session_id` (required), `keyword`; optional `before_id`, `limit`.
 
