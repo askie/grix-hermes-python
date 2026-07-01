@@ -706,7 +706,7 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return False
 
-    async def connect(self) -> bool:
+    async def connect(self, **kwargs) -> bool:
         if not self.connection.endpoint or not self.connection.agent_id or not self.connection.api_key:
             logger.error("[%s] Missing GRIX_ENDPOINT, GRIX_AGENT_ID, or GRIX_API_KEY", self.name)
             self._set_fatal_error(
