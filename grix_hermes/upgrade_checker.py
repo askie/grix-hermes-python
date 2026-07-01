@@ -435,28 +435,34 @@ class UpgradeChecker:
         import random
 
         last_code = -1
-        last_stderr = ""
+        last_out = ""
         for attempt in range(1, UPDATE_MAX_ATTEMPTS + 1):
-            code, _stdout, stderr = await self._run_cmd(["hermes", "plugins", "update", PLUGIN_NAME])
+            code, stdout, stderr = await self._run_cmd(["hermes", "plugins", "update", PLUGIN_NAME])
             if code == 0:
                 logger.info("[upgrade] hermes plugins update succeeded (attempt %d)", attempt)
                 return
-            last_code, last_stderr = code, stderr
-            logger.info("[upgrade] update attempt %d/%d failed (exit %d)", attempt, UPDATE_MAX_ATTEMPTS, code)
+            # ``hermes`` prints git failures (e.g. dirty tree, non-ff) to stdout, not
+            # stderr, so capture both — reporting stderr alone leaves the real cause blank.
+            last_code, last_out = code, "\n".join(p for p in (stdout, stderr) if p)
+            logger.info(
+                "[upgrade] update attempt %d/%d failed (exit %d): %s",
+                attempt, UPDATE_MAX_ATTEMPTS, code, last_out[:500] or "<no output>",
+            )
             if attempt < UPDATE_MAX_ATTEMPTS:
                 await asyncio.sleep(UPDATE_RETRY_BASE_S * attempt + random.uniform(0, 1.0))
 
         logger.info("[upgrade] update exhausted %d attempts, trying install from source", UPDATE_MAX_ATTEMPTS)
-        code2, _stdout2, stderr2 = await self._run_cmd(
+        code2, stdout2, stderr2 = await self._run_cmd(
             ["hermes", "plugins", "install", PLUGIN_GIT_REPO, "--enable"],
         )
         if code2 == 0:
             logger.info("[upgrade] hermes plugins install succeeded")
             return
 
+        install_out = "\n".join(p for p in (stdout2, stderr2) if p)
         raise RuntimeError(
             f"both update (exit {last_code}) and install (exit {code2}) failed; "
-            f"stderr={(stderr2 or last_stderr)[:500]}"
+            f"output={(install_out or last_out)[:500] or '<no output>'}"
         )
 
     @staticmethod
