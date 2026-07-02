@@ -2242,10 +2242,23 @@ class GrixAdapter(BasePlatformAdapter):
                     source = self.build_source(chat_id=session_id, chat_type="dm")
                 await self._force_stop_session(source, key, reply_to=None)
 
-            # 清掉残留 pending 事件（同样按 session_id 边界匹配）
+            # 清掉残留 pending 事件（同样按 session_id 边界匹配）。
+            # pending 事件已 ack 给平台，静默丢弃会让平台侧 durable run 与
+            # 会话任务状态永远停留在 running（幽灵任务），必须逐条以终态收口。
             for key in list(self._pending_messages.keys()):
                 if _matches(key):
-                    self._pending_messages.pop(key, None)
+                    dropped = self._pending_messages.pop(key, None)
+                    event_id = getattr(dropped, "event_id", None) if dropped else None
+                    if not event_id and dropped is not None:
+                        event_id = self._active_state().reply_event_ids.get(
+                            (session_id, str(getattr(dropped, "message_id", "") or ""))
+                        )
+                    if event_id:
+                        await self._complete_event_if_needed(
+                            str(event_id),
+                            status=STATUS_FAILED,
+                            message="canceled by queue clear",
+                        )
 
             await self._active_client().send_queue_clear_result(
                 session_id=session_id,
