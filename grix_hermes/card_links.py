@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import urllib.parse
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 def _clean(value: Optional[str]) -> str:
@@ -130,6 +131,42 @@ def build_progress_card(
         fb = f"{fb} {pct}%"
 
     return _build_link(fb, f"grix://card/progress?{urllib.parse.urlencode(params)}")
+
+
+def build_agent_question_card(
+    request_id: str,
+    question: str,
+    options: Optional[List[str]] = None,
+    header: Optional[str] = None,
+) -> str:
+    """Build a ``grix://card/agent_question`` deep-link (single-question form).
+
+    Matches the server's ``agent_question`` biz_card contract (see
+    ``aibot/backend/internal/agentadapter/agentcards/normalize.go``): a
+    ``questions`` array with ``header`` + ``prompt`` (both required) and an
+    optional ``options`` list. The server renders this as a tappable choice
+    card instead of plain numbered text. ``request_id`` is required by the
+    server (empty rejects the whole card) but otherwise inert here — the
+    answer round-trips locally via ``clarify_gateway``, not a server-side
+    elicitation resolution, so callers can pass the local ``clarify_id``.
+    """
+    request_id = _clean(request_id)
+    question = _clean(question)
+    if not request_id or not question:
+        raise ValueError("agent question card requires request_id and question text")
+
+    normalized_options = [_clean(o) for o in (options or []) if _clean(o)]
+    card_question: Dict[str, object] = {
+        "index": 1,
+        "header": _clean(header) or question,
+        "prompt": question,
+    }
+    if normalized_options:
+        card_question["options"] = normalized_options
+
+    payload = {"request_id": request_id, "mode": "form", "questions": [card_question]}
+    data = urllib.parse.urlencode({"d": json.dumps(payload, ensure_ascii=False)})
+    return _build_link(f"[Agent Question] {question}", f"grix://card/agent_question?{data}")
 
 
 def dispatch_card_builder(kind: str, params: Dict[str, object]) -> str:
