@@ -105,6 +105,13 @@ _CURRENT_CLIENT_CTX: ContextVar[Optional[GrixTransportClient]] = ContextVar(
     "grix_hermes_current_client", default=None
 )
 
+# 当前处理任务的 session_key：on_processing_start 时绑定，随 asyncio 任务链路 /
+# 工具线程 context 拷贝传播。grix_reply 用它精确定位本次任务的应答目标（同一群
+# 多个 per-user session 并发时 chat_id 无法消歧）。
+_CURRENT_REPLY_SESSION_KEY: ContextVar[Optional[str]] = ContextVar(
+    "grix_hermes_current_reply_session_key", default=None
+)
+
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
 _EVENT_DEDUP_WINDOW_SECONDS = 300
 _EVENT_DEDUP_MAX_SIZE = 1000
@@ -144,6 +151,10 @@ class _OwnerState:
     busy_ack_msg_ids: Dict[str, Tuple[str, str, Any]] = field(default_factory=dict)
     tool_progress_msg_ids: Set[str] = field(default_factory=set)
     session_connector_hints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # 正在处理中的任务的最终应答目标（session_key → chat_id / 触发消息 / 事件 / 来源
+    # client / 主循环 loop）。grix_reply 工具据此自动补引用并路由回事件来源连接；
+    # on_processing_start 写入、on_processing_complete 清除。
+    active_reply_targets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 def check_grix_requirements() -> bool:
@@ -436,6 +447,9 @@ async def resolve_grix_target(
 class GrixAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 1800
     _SEND_MIN_INTERVAL = 0.5
+    # 编辑消息的瞬时失败重试参数（覆盖 ws 内部重连窗口，约 3×3s）。
+    _EDIT_RETRY_ATTEMPTS = 4
+    _EDIT_RETRY_DELAY_S = 3.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(_PLATFORM_VALUE))
@@ -815,7 +829,13 @@ class GrixAdapter(BasePlatformAdapter):
         content: str,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        *,
+        force_quote: bool = False,
     ) -> SendResult:
+        # 引用收敛（对齐 connector 语义）：过程消息一律不带引用——服务端把
+        # 「agent 引用另一 agent 的消息」视为隐式 @ 并触发对方接活，流式过程里每条
+        # 带引用的消息都会重复误触发。最终应答由 grix_reply 工具走 force_quote=True
+        # 显式补引用；reply_to 仍保留用于 busy-ack 跟踪等内部匹配。
         client = await self._get_ready_client(operation="send")
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
@@ -909,7 +929,7 @@ class GrixAdapter(BasePlatformAdapter):
                 receipt = await client.send_text(
                     str(session_id),
                     chunk,
-                    reply_to_message_id=reply_to if is_first else None,
+                    reply_to_message_id=reply_to if (is_first and force_quote) else None,
                     thread_id=thread_id,
                     biz_card=biz_card if is_first else None,
                     channel_data=channel_data if is_first else None,
@@ -945,6 +965,29 @@ class GrixAdapter(BasePlatformAdapter):
                 raw_response=exc,
                 retryable=_coerce_retryable(exc),
             )
+
+    async def send_final_reply(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        quoted_message_id: Optional[str] = None,
+        source_client: Optional[GrixTransportClient] = None,
+    ) -> SendResult:
+        """发送任务的最终应答：带引用（引用触发消息即完成信号，可触发下一个 agent
+        接活），并显式还原事件来源连接的 ContextVar（工具 handler 脱离 packet 上下文，
+        不能靠隐式路由）。供 grix_reply 工具调用。"""
+        token = _CURRENT_CLIENT_CTX.set(source_client) if source_client is not None else None
+        try:
+            return await self.send(
+                str(chat_id),
+                content,
+                reply_to=quoted_message_id,
+                force_quote=bool(quoted_message_id),
+            )
+        finally:
+            if token is not None:
+                _CURRENT_CLIENT_CTX.reset(token)
 
     async def send_exec_approval(
         self,
@@ -1037,35 +1080,54 @@ class GrixAdapter(BasePlatformAdapter):
                 content = progress_card
 
         _ = finalize
-        client = await self._get_ready_client(operation="edit_message")
-        if not client:
-            return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
-        try:
-            source_hint = self._active_state().latest_sources.get(str(chat_id))
-            session_id, _thread_id = await resolve_grix_target(
-                client,
-                self.connection,
-                str(chat_id),
-                source_hint=source_hint,
-            )
-            receipt = await client.edit_message(
-                str(session_id),
-                str(message_id),
-                self.format_message(content),
-            )
-            return SendResult(
-                success=bool(receipt.get("ok")),
-                message_id=receipt.get("message_id"),
-                raw_response=receipt,
-                retryable=False,
-            )
-        except Exception as exc:
-            return SendResult(
-                success=False,
-                error=str(exc),
-                raw_response=exc,
-                retryable=_coerce_retryable(exc),
-            )
+        # 编辑失败自动重试：hermes 网关把一次编辑失败视为「本轮编辑永久不可用」，
+        # 之后所有内容都退化成不带引用的碎片补发（断句根因）。ws 内部重连期间的
+        # 瞬时失败在这里就地等待并重试，让上层完全无感；只有明确的永久性错误
+        # （如消息不存在）才立即上抛。
+        last_error = "GRIX transport is not connected"
+        last_raw: Any = None
+        for attempt in range(self._EDIT_RETRY_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(self._EDIT_RETRY_DELAY_S)
+            client = await self._get_ready_client(operation="edit_message")
+            if not client:
+                continue
+            try:
+                source_hint = self._active_state().latest_sources.get(str(chat_id))
+                session_id, _thread_id = await resolve_grix_target(
+                    client,
+                    self.connection,
+                    str(chat_id),
+                    source_hint=source_hint,
+                )
+                receipt = await client.edit_message(
+                    str(session_id),
+                    str(message_id),
+                    self.format_message(content),
+                )
+                return SendResult(
+                    success=bool(receipt.get("ok")),
+                    message_id=receipt.get("message_id"),
+                    raw_response=receipt,
+                    retryable=False,
+                )
+            except Exception as exc:
+                # 服务端 4xxx NACK（参数错/消息不存在/权限拒绝，4008 握手限流除外）
+                # 重试不会变好，立即上抛让上层走碎片补发，别浪费重试窗口。
+                _nack_code = exc.code if isinstance(exc, GrixPacketError) else None
+                _permanent_nack = (
+                    isinstance(_nack_code, int) and 4000 <= _nack_code < 5000 and _nack_code != 4008
+                )
+                if _permanent_nack or not _coerce_retryable(exc):
+                    return SendResult(
+                        success=False,
+                        error=str(exc),
+                        raw_response=exc,
+                        retryable=False,
+                    )
+                last_error = str(exc)
+                last_raw = exc
+        return SendResult(success=False, error=last_error, raw_response=last_raw, retryable=True)
 
     async def delete_message(
         self,
@@ -1245,6 +1307,9 @@ class GrixAdapter(BasePlatformAdapter):
         message_id = str(event.message_id or "").strip()
         if message_id and self._active_state().processing_message_ids.get(session_key) == message_id:
             self._active_state().processing_message_ids.pop(session_key, None)
+        _reply_target = self._active_state().active_reply_targets.get(session_key)
+        if _reply_target and (not message_id or _reply_target.get("message_id") == message_id):
+            self._active_state().active_reply_targets.pop(session_key, None)
         if message_id and self.is_message_revoked(session_key, message_id):
             self._active_state().revoked_message_keys.discard((session_key, message_id))
             logger.debug(
@@ -1273,6 +1338,27 @@ class GrixAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
         self._active_state().processing_message_ids[session_key] = str(event.message_id)
+        # 记录最终应答目标：grix_reply 工具在任务收尾时据此把最终总结发到正确会话
+        # 并自动引用触发消息（引用即完成信号，可触发下一个 agent 接活）。工具 handler
+        # 运行在独立线程/事件循环，这里顺带记下事件来源 client 与主循环 loop，发送时
+        # 显式还原 ContextVar 并调度回主循环，避免跨 owner 串连接、跨 loop 竞态。
+        try:
+            _loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _loop = None
+        self._active_state().active_reply_targets[session_key] = {
+            "session_key": session_key,
+            "chat_id": str(event.source.chat_id),
+            "message_id": str(event.message_id),
+            "event_id": str(raw_message.get("event_id") or "").strip(),
+            "client": _CURRENT_CLIENT_CTX.get(),
+            "loop": _loop,
+            "started_at": time.monotonic(),
+        }
+        # 同一群多个 per-user session 并发时 chat_id 无法消歧；把 session_key 绑到
+        # 本次处理任务的 context（asyncio 任务链路 + 工具线程都会拷贝传播），
+        # grix_reply 优先按它精确匹配。
+        _CURRENT_REPLY_SESSION_KEY.set(session_key)
 
     def is_message_revoked(self, session_key: str, message_id: str) -> bool:
         normalized_message_id = str(message_id or "").strip()
