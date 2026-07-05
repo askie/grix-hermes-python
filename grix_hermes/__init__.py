@@ -171,7 +171,13 @@ def register(ctx):
         platform_hint=(
             "You are chatting via the Grix platform. "
             "Grix supports markdown text, interactive cards, message editing, "
-            "and message revocation. Keep responses concise."
+            "and message revocation. Keep responses concise. "
+            "When you finish a task, deliver the final conclusion by calling the "
+            "grix_reply tool exactly once — it quotes the message that triggered "
+            "you, and that quote is the completion signal (it may hand the work "
+            "to another agent). Streamed plain text is for progress notes only "
+            "and never carries a quote; do not restate the conclusion as plain "
+            "text after calling grix_reply."
         ),
     )
 
@@ -180,6 +186,7 @@ def register(ctx):
     guidance_ctx = _SkillGuidanceCtx(ctx)
     for _module, _fn_name in [
         ("invoke_tool", "register_invoke_tool"),
+        ("reply_tool", "register_reply_tool"),
         ("auth_tools", "register_auth_tools"),
         ("egg_tool", "register_egg_tool"),
         ("update_tool", "register_update_tool"),
