@@ -27,6 +27,7 @@ from gateway.session import build_session_key
 from .card_links import build_agent_question_card
 from .compat import build_card_action_user_text, build_exec_approval_message
 from .exec_command import parse_exec_command, handle_skills_command
+from .question_command import parse_grix_question_command
 from .tool_progress_cards import (
     build_tool_execution_channel_data,
     detect_hook_status,
@@ -1444,6 +1445,51 @@ class GrixAdapter(BasePlatformAdapter):
             return False
         return (session_key, normalized_message_id) in self._active_state().revoked_message_keys
 
+    async def _try_resolve_question_reply(
+        self,
+        message: GrixInboundMessage,
+        session_key: str,
+    ) -> Tuple[bool, GrixInboundMessage]:
+        """拦截服务端由提问卡点击改写来的 ``/grix question`` 命令。
+
+        服务端把 agent_question_reply 卡片 URI 改写成
+        ``/grix question <request_id> <答案>`` 后才投递给 hermes 系 agent
+        （aibot backend/internal/agentadapter/hermes/adapter.go 的
+        NormalizeOutbound → grixactions.RewriteToLegacyCommand，hermes 严格
+        公有协议 profile 的约定）。request_id 就是 send_clarify 注册的
+        clarify_id，按它直接解锁阻塞中的 clarify 线程。
+
+        返回 ``(handled, message)``：解锁成功时 handled=True（事件已完成，
+        调用方直接返回）；没有待解锁项（已超时/旧卡片）或不是该命令时
+        handled=False——前者把可读答案文本替换进 message 继续走普通消息
+        流程，模型仍能看到用户的选择，而不是被网关当未知命令吞掉。
+        """
+        parsed = parse_grix_question_command(message.text or "")
+        if parsed is None:
+            return False, message
+
+        request_id, answer_text = parsed
+        resolved = False
+        try:
+            from tools.clarify_gateway import resolve_gateway_clarify
+            resolved = bool(resolve_gateway_clarify(request_id, answer_text))
+        except Exception:
+            logger.exception(
+                "[%s] GRIX question reply resolve failed request_id=%s event_id=%s",
+                self.name, request_id, message.event_id,
+            )
+        logger.info(
+            "[%s] GRIX question reply intercepted request_id=%s resolved=%s event_id=%s session_key=%s",
+            self.name, request_id, resolved, message.event_id, session_key,
+        )
+        if resolved:
+            if self._client:
+                await self._complete_event_if_needed(
+                    message.event_id, status=STATUS_RESPONDED,
+                )
+            return True, message
+        return False, dataclasses.replace(message, text=answer_text)
+
     def _build_record_only_attachment_summary(self, message: GrixInboundMessage) -> str:
         attachments = list(message.attachments or [])
         if not attachments:
@@ -2067,6 +2113,13 @@ class GrixAdapter(BasePlatformAdapter):
                         message.event_id,
                         status=STATUS_RESPONDED,
                     )
+                return
+
+        # /grix question 拦截：服务端把提问卡的点击回复改写成旧式命令后才投递，
+        # 不拦截的话 hermes 网关会把它当未知斜杠命令吞掉，clarify 只能等到超时。
+        if message.text:
+            handled, message = await self._try_resolve_question_reply(message, session_key)
+            if handled:
                 return
 
         if _is_record_only_message(message):
