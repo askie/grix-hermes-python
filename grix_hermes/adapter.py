@@ -105,6 +105,13 @@ _CURRENT_CLIENT_CTX: ContextVar[Optional[GrixTransportClient]] = ContextVar(
     "grix_hermes_current_client", default=None
 )
 
+# 当前处理任务的 session_key：on_processing_start 时绑定，随 asyncio 任务链路 /
+# 工具线程 context 拷贝传播。grix_reply 用它精确定位本次任务的应答目标（同一群
+# 多个 per-user session 并发时 chat_id 无法消歧）。
+_CURRENT_REPLY_SESSION_KEY: ContextVar[Optional[str]] = ContextVar(
+    "grix_hermes_current_reply_session_key", default=None
+)
+
 _ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
 _EVENT_DEDUP_WINDOW_SECONDS = 300
 _EVENT_DEDUP_MAX_SIZE = 1000
@@ -1340,12 +1347,18 @@ class GrixAdapter(BasePlatformAdapter):
         except RuntimeError:
             _loop = None
         self._active_state().active_reply_targets[session_key] = {
+            "session_key": session_key,
             "chat_id": str(event.source.chat_id),
             "message_id": str(event.message_id),
             "event_id": str(raw_message.get("event_id") or "").strip(),
             "client": _CURRENT_CLIENT_CTX.get(),
             "loop": _loop,
+            "started_at": time.monotonic(),
         }
+        # 同一群多个 per-user session 并发时 chat_id 无法消歧；把 session_key 绑到
+        # 本次处理任务的 context（asyncio 任务链路 + 工具线程都会拷贝传播），
+        # grix_reply 优先按它精确匹配。
+        _CURRENT_REPLY_SESSION_KEY.set(session_key)
 
     def is_message_revoked(self, session_key: str, message_id: str) -> bool:
         normalized_message_id = str(message_id or "").strip()

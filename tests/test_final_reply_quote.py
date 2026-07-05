@@ -285,13 +285,17 @@ def _install_runner(monkeypatch, inst):
     monkeypatch.setattr(sys.modules["gateway.run"], "_gateway_runner_ref", lambda: runner)
 
 
-def _put_target(inst, chat_id="chat-1", message_id="trigger-1", client=None):
-    inst._owner_states[""].active_reply_targets[f"sk:{chat_id}"] = {
+def _put_target(inst, chat_id="chat-1", message_id="trigger-1", client=None,
+                session_key=None, started_at=0.0):
+    key = session_key or f"sk:{chat_id}"
+    inst._owner_states[""].active_reply_targets[key] = {
+        "session_key": key,
         "chat_id": chat_id,
         "message_id": message_id,
         "event_id": "ev-1",
         "client": client,
         "loop": None,
+        "started_at": started_at,
     }
 
 
@@ -356,6 +360,49 @@ def test_reply_tool_quote_override(monkeypatch):
 
     assert out.startswith("OK:")
     assert client.sent[0]["reply_to_message_id"] == "other-msg"
+
+
+def test_reply_tool_context_key_disambiguates_same_chat(monkeypatch):
+    """同一群两个 per-user session 并发时，按任务链路 context 的 session_key 精确归属。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _install_runner(monkeypatch, inst)
+    _put_target(inst, chat_id="group-1", message_id="from-user-a", client=client,
+                session_key="sk:group-1:user-a", started_at=1.0)
+    _put_target(inst, chat_id="group-1", message_id="from-user-b", client=client,
+                session_key="sk:group-1:user-b", started_at=2.0)
+
+    async def _run_in_ctx():
+        token = adapter_mod._CURRENT_REPLY_SESSION_KEY.set("sk:group-1:user-a")
+        try:
+            return await reply_tool_mod._grix_reply_handler({"text": "A 的结论"})
+        finally:
+            adapter_mod._CURRENT_REPLY_SESSION_KEY.reset(token)
+
+    out = asyncio.run(_run_in_ctx())
+
+    assert out.startswith("OK:")
+    assert client.sent[-1]["reply_to_message_id"] == "from-user-a"
+
+
+def test_reply_tool_same_chat_without_context_picks_latest(monkeypatch):
+    """拿不到 context 归属时，显式 session_id 在同群多任务下取最新启动的。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _install_runner(monkeypatch, inst)
+    _put_target(inst, chat_id="group-1", message_id="older", client=client,
+                session_key="sk:group-1:user-a", started_at=1.0)
+    _put_target(inst, chat_id="group-1", message_id="newer", client=client,
+                session_key="sk:group-1:user-b", started_at=2.0)
+
+    out = asyncio.run(
+        reply_tool_mod._grix_reply_handler({"text": "结论", "session_id": "group-1"})
+    )
+
+    assert out.startswith("OK:")
+    assert client.sent[-1]["reply_to_message_id"] == "newer"
 
 
 def test_reply_tool_second_call_drops_quote(monkeypatch):

@@ -85,8 +85,21 @@ def _resolve_reply_target(
     targets: Dict[str, Dict[str, Any]],
     session_id: str,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """按 session_id 精确匹配；未指定时仅当只有一个进行中任务才可自动解析。
-    返回 (entry, error)。"""
+    """解析当前任务的应答目标，返回 (entry, error)。
+
+    优先级：
+    1. 任务链路 context 里的 session_key 精确匹配（并发任务下唯一可靠的归属）；
+    2. 显式 session_id 按 chat_id 匹配（同群多个 per-user session 并发时取最新启动的）；
+    3. 只有一个进行中任务时自动解析。
+    """
+    from .adapter import _CURRENT_REPLY_SESSION_KEY
+
+    ctx_key = _CURRENT_REPLY_SESSION_KEY.get()
+    if ctx_key and ctx_key in targets:
+        entry = targets[ctx_key]
+        if not session_id or str(entry.get("chat_id")) == session_id:
+            return entry, None
+
     if session_id:
         matched = [t for t in targets.values() if str(t.get("chat_id")) == session_id]
         if not matched:
@@ -94,7 +107,8 @@ def _resolve_reply_target(
                 f"no active task found for session {session_id}; "
                 f"active sessions: {sorted({str(t.get('chat_id')) for t in targets.values()}) or 'none'}"
             )
-        return matched[0], None
+        matched.sort(key=lambda t: t.get("started_at") or 0.0)
+        return matched[-1], None
     if not targets:
         return None, "no active task run; grix_reply can only be used while handling a task"
     if len(targets) > 1:
