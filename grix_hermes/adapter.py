@@ -1171,6 +1171,26 @@ class GrixAdapter(BasePlatformAdapter):
                 retryable=_coerce_retryable(exc),
             )
 
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        # Grix 前端原生渲染 Markdown 图片。宿主网关会把回复里的 ![alt](url)
+        # 抽出来改走本方法；基类兜底是「caption\nurl」纯文本（图片被降级成
+        # 裸链接），所以这里必须还原成 Markdown 图片原样投递。
+        alt = " ".join((caption or "").split())
+        alt = alt.replace("[", "(").replace("]", ")")
+        return await self.send(
+            chat_id=chat_id,
+            content=f"![{alt}]({image_url})",
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         client = await self._get_ready_client(operation="send_typing")
         if not client:
