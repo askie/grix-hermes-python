@@ -24,6 +24,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
 from gateway.session import build_session_key
 
+from .card_links import build_agent_question_card
 from .compat import build_card_action_user_text, build_exec_approval_message
 from .exec_command import parse_exec_command, handle_skills_command
 from .tool_progress_cards import (
@@ -988,6 +989,63 @@ class GrixAdapter(BasePlatformAdapter):
         finally:
             if token is not None:
                 _CURRENT_CLIENT_CTX.reset(token)
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[List[str]],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """覆写基类的纯文本编号列表：choices 非空时发标准 agent_question 提问卡
+        （服务端识别为 waiting_question，客户端渲染成可点选项），而不是靠文本猜测。
+
+        答案回流复用现成机制、不需要新的入站代码：点击卡片选项 → 平台把 card_action
+        转成普通文本消息（已有的 build_card_action_user_text 路径）→ 落进
+        mark_awaiting_text 打开的会话级文本拦截（tools.clarify_gateway），和基类
+        的纯文本兜底走的是同一条已验证的回收路径。开放式提问（choices 为空）
+        与基类行为一致，直接发无卡片文本。
+        """
+        if not choices:
+            return await self.send(str(chat_id), f"❓ {question}", metadata=metadata)
+
+        client = await self._get_ready_client(operation="send_clarify")
+        if not client:
+            return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
+
+        from tools.clarify_gateway import mark_awaiting_text
+        mark_awaiting_text(clarify_id)
+
+        source_hint = self._active_state().latest_sources.get(str(chat_id))
+        session_id, thread_id = await resolve_grix_target(
+            client,
+            self.connection,
+            str(chat_id),
+            thread_id=self._metadata_thread_id(metadata),
+            source_hint=source_hint,
+        )
+        card_content = build_agent_question_card(clarify_id, question, options=choices)
+        try:
+            receipt = await client.send_text(
+                str(session_id),
+                card_content,
+                thread_id=thread_id,
+            )
+            return SendResult(
+                success=bool(receipt.get("ok")),
+                message_id=receipt.get("message_id"),
+                raw_response=receipt,
+                retryable=False,
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error=str(exc),
+                raw_response=exc,
+                retryable=_coerce_retryable(exc),
+            )
 
     async def send_exec_approval(
         self,
