@@ -358,6 +358,67 @@ def test_reply_tool_quote_override(monkeypatch):
     assert client.sent[0]["reply_to_message_id"] == "other-msg"
 
 
+def test_reply_tool_second_call_drops_quote(monkeypatch):
+    """完成信号只能出现一次：重复调用不再带引用，避免二次触发接活。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _install_runner(monkeypatch, inst)
+    _put_target(inst, client=client)
+
+    out1 = asyncio.run(reply_tool_mod._grix_reply_handler({"text": "结论一"}))
+    out2 = asyncio.run(reply_tool_mod._grix_reply_handler({"text": "补充说明"}))
+
+    assert out1.startswith("OK:") and out2.startswith("OK:")
+    assert client.sent[0]["reply_to_message_id"] == "trigger-1"
+    assert client.sent[1]["reply_to_message_id"] is None
+    assert "already been sent" in out2 or "already" in out2
+
+
+def test_reply_tool_failed_send_does_not_mark_replied(monkeypatch):
+    """首次发送失败不应占用完成信号，重试仍要带引用。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _install_runner(monkeypatch, inst)
+    _put_target(inst, client=client)
+
+    calls = {"n": 0}
+    real_send_text = client.send_text
+
+    async def _flaky_send_text(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TimeoutError("send_msg timeout")
+        return await real_send_text(*a, **kw)
+
+    client.send_text = _flaky_send_text
+
+    out1 = asyncio.run(reply_tool_mod._grix_reply_handler({"text": "结论"}))
+    assert out1.startswith("ERR:")
+
+    out2 = asyncio.run(reply_tool_mod._grix_reply_handler({"text": "结论"}))
+    assert out2.startswith("OK:")
+    assert client.sent[-1]["reply_to_message_id"] == "trigger-1"
+
+
+def test_edit_message_permanent_nack_no_retry(monkeypatch):
+    """服务端 4xxx NACK（非 4008）重试不会变好，应立即上抛。"""
+    from grix_hermes.transport import GrixPacketError
+
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    monkeypatch.setattr(adapter_mod.GrixAdapter, "_EDIT_RETRY_DELAY_S", 0.0)
+    client = FakeTransportClient()
+    client.edit_errors = [GrixPacketError("send_nack", 4001, "message not found")] * 10
+    inst = _make_adapter(client)
+
+    result = _with_ctx(client, inst.edit_message("chat-1", "m1", "updated text"))
+
+    assert result.success is False
+    assert result.retryable is False
+    assert len(client.edits) == 1
+
+
 def test_reply_tool_falls_back_to_primary_client(monkeypatch):
     """目标里没记到来源 client（登记时脱离 packet 上下文）时回退主连接。"""
     monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)

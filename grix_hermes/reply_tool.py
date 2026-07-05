@@ -71,10 +71,13 @@ def _check_reply() -> bool:
 
 def _collect_reply_targets(adapter) -> Dict[str, Dict[str, Any]]:
     """跨所有 owner 分桶收集正在处理中的应答目标（工具上下文可能拿不到
-    packet ContextVar，不能只看 _active_state 的那一桶）。"""
+    packet ContextVar，不能只看 _active_state 的那一桶）。
+
+    工具 handler 与网关主循环跑在不同线程，先快照再遍历，避免
+    「dictionary changed size during iteration」竞态。"""
     targets: Dict[str, Dict[str, Any]] = {}
-    for state in adapter._owner_states.values():
-        targets.update(state.active_reply_targets)
+    for state in list(adapter._owner_states.values()):
+        targets.update(dict(state.active_reply_targets))
     return targets
 
 
@@ -122,7 +125,12 @@ async def _grix_reply_handler(args: dict, **kwargs) -> str:
         if resolve_error:
             return tool_error(resolve_error)
 
-        quoted_message_id = quoted_override or str(entry.get("message_id") or "").strip() or None
+        # 重复调用保护：完成信号（引用）每轮只能出现一次，第二次起除非显式指定
+        # quoted_message_id，否则不带引用发送，避免二次触发下一个 agent。
+        already_replied = bool(entry.get("replied"))
+        quoted_message_id = quoted_override or (
+            None if already_replied else str(entry.get("message_id") or "").strip() or None
+        )
         chat_id = str(entry.get("chat_id") or "").strip()
         source_client = entry.get("client") or adapter._client
 
@@ -144,11 +152,18 @@ async def _grix_reply_handler(args: dict, **kwargs) -> str:
 
         if not getattr(result, "success", False):
             return tool_error(f"final reply send failed: {getattr(result, 'error', 'unknown error')}")
-        return tool_result({
+        entry["replied"] = True
+        payload: Dict[str, Any] = {
             "ok": True,
             "message_id": getattr(result, "message_id", None),
             "quoted_message_id": quoted_message_id,
-        })
+        }
+        if already_replied:
+            payload["note"] = (
+                "final reply was already sent for this task; this message was "
+                "delivered without the completion quote"
+            )
+        return tool_result(payload)
     except Exception as exc:
         logger.warning("grix_reply failed: %s", exc, exc_info=True)
         safe_msg = str(exc)

@@ -1105,7 +1105,13 @@ class GrixAdapter(BasePlatformAdapter):
                     retryable=False,
                 )
             except Exception as exc:
-                if not _coerce_retryable(exc):
+                # 服务端 4xxx NACK（参数错/消息不存在/权限拒绝，4008 握手限流除外）
+                # 重试不会变好，立即上抛让上层走碎片补发，别浪费重试窗口。
+                _nack_code = exc.code if isinstance(exc, GrixPacketError) else None
+                _permanent_nack = (
+                    isinstance(_nack_code, int) and 4000 <= _nack_code < 5000 and _nack_code != 4008
+                )
+                if _permanent_nack or not _coerce_retryable(exc):
                     return SendResult(
                         success=False,
                         error=str(exc),
