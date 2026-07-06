@@ -459,6 +459,8 @@ class GrixAdapter(BasePlatformAdapter):
         self._client: Optional[GrixTransportClient] = None
         self._connector = None
         self._disconnect_requested = False
+        # 上次上报的技能集指纹：运行期按会话活动重扫时，仅在清单变化时才推 agent_skills_update。
+        self._last_skills_hash: str = ""
         self._token_lock_identity: Optional[str] = None
         # agent 共享：所有 per-chat / per-event 状态收口到 _OwnerState，按当前 packet
         # 的 _CURRENT_CLIENT_CTX 解析出的 owner_key 分桶，跨 owner 物理隔离。详见
@@ -779,8 +781,13 @@ class GrixAdapter(BasePlatformAdapter):
         await self._start_upgrade_checker()
         return True
 
-    async def _report_skills(self) -> None:
-        """扫描本地 skills 并通过 agent_skills_update 上报给后端。"""
+    async def _report_skills(self, *, force: bool = True) -> None:
+        """扫描本地 skills 并通过 agent_skills_update 上报给后端。
+
+        force=True（连接/重连）：无条件上报，重连后后端 profile 需要重建。
+        force=False（会话活动触发）：仅当清单相对上次上报发生变化时才推，避免刷屏——
+        用户新增/改名技能后无需整插件重启即可刷新工具栏清单。
+        """
         try:
             from .exec_command import scan_hermes_skills
             entries = scan_hermes_skills()
@@ -788,7 +795,13 @@ class GrixAdapter(BasePlatformAdapter):
                 {"name": s.name, "description": s.description, "source": s.source}
                 for s in entries
             ]
-            if self._client and skills:
+            if not skills:
+                return
+            digest = json.dumps([f"{s['source']}:{s['name']}" for s in skills])
+            if not force and digest == self._last_skills_hash:
+                return
+            self._last_skills_hash = digest
+            if self._client:
                 # 启动时主连接的管理性主动调用,不在 packet handler 上下文,显式走主连接。
                 await self._client.send_skills_update(skills)
                 logger.info("[%s] Reported %d skill(s)", self.name, len(skills))
@@ -1438,6 +1451,10 @@ class GrixAdapter(BasePlatformAdapter):
         # 本次处理任务的 context（asyncio 任务链路 + 工具线程都会拷贝传播），
         # grix_reply 优先按它精确匹配。
         _CURRENT_REPLY_SESSION_KEY.set(session_key)
+
+        # 运行期技能刷新：与 grix-connector 的 eventStarted 统一入口对齐——处理消息时
+        # 按当前技能重扫，清单变化才上报，用户新增/改名技能无需重启插件即可刷新工具栏。
+        await self._report_skills(force=False)
 
     def is_message_revoked(self, session_key: str, message_id: str) -> bool:
         normalized_message_id = str(message_id or "").strip()
