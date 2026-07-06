@@ -1,0 +1,15 @@
+1602:deltas_were_sent = {"yes": False}
+1660:deltas_were_sent["yes"] = True
+1733:deltas_were_sent = {"yes": False}  # Track if any delta
+1747:def _fire_first_delta():
+1901:_fire_first_delta()
+1908:_fire_first_delta()
+1910:deltas_were_sent["yes"] = True
+1984:_fire_first_delta()
+2197:_fire_first_delta()
+2207:_fire_first_delta()
+2209:deltas_were_sent["yes"] = True
+2213:_fire_first_delta()
+2277:if deltas_were_sent["yes"]:
+2351:deltas_were_sent["yes"] = False
+2610:if deltas_were_sent["yes"]:
