@@ -314,12 +314,19 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     # agent 共享：被共享者连接握手时带 shared_owner_id，后端据此认定本连接身份。
     if config.shared_owner_id:
         payload["shared_owner_id"] = config.shared_owner_id
-    payload["host_meta"] = {
+    host_meta = {
         "hostname": get_hostname(),
         "platform": platform.system().lower(),
         "arch": platform.machine(),
         "os_release": platform.release(),
     }
+    try:
+        from .tailnet_file_server import host_meta_fields
+
+        host_meta.update(host_meta_fields())
+    except Exception:
+        pass
+    payload["host_meta"] = host_meta
     return payload
 
 

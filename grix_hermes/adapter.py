@@ -53,6 +53,7 @@ from .contract import (
     ERR_STOP_HANDLER_FAILED,
     ERR_UNSUPPORTED_DECISION,
     ERR_UNSUPPORTED_LOCAL_ACTION,
+    LOCAL_ACTION_CREATE_FOLDER,
     LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
@@ -1853,6 +1854,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_file_list(action)
             return
 
+        if action.action_type == LOCAL_ACTION_CREATE_FOLDER:
+            await self._handle_create_folder(action)
+            return
+
         if action.action_type == LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH:
             await self._handle_upgrade_push(action)
             return
@@ -1941,6 +1946,25 @@ class GrixAdapter(BasePlatformAdapter):
             action_id=action.action_id,
             status=result["status"],
             result=payload,
+            error_code=result.get("error_code"),
+            error_message=result.get("error_msg"),
+        )
+
+    async def _handle_create_folder(self, action: GrixLocalAction) -> None:
+        from .create_folder import handle_create_folder_action
+        from .file_list import real_home_dir
+
+        if not self._active_client():
+            return
+        result = handle_create_folder_action(
+            action.params,
+            resolve_cwd=lambda _session_id: None,
+            fallback_dir=real_home_dir(),
+        )
+        await self._active_client().send_local_action_result(
+            action_id=action.action_id,
+            status=result["status"],
+            result=result.get("result"),
             error_code=result.get("error_code"),
             error_message=result.get("error_msg"),
         )
