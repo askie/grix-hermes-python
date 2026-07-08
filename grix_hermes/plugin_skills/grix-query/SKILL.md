@@ -1,7 +1,7 @@
 ---
 name: grix-query
 description: Query Grix contacts, sessions, and messages through the Python grix_invoke Hermes tool.
-trigger: 当用户要查找联系人、搜索会话、列出可见会话、或查看某个已知会话的历史消息时
+trigger: 当用户要查找联系人、搜索会话、列出可见会话或收藏会话、或查看某个已知会话的历史消息时
 ---
 
 # Grix Query
@@ -16,6 +16,7 @@ Parameter names use snake_case (sent verbatim to the backend).
 
 - `contact_search` — params: `id` (contact ID) **or** `keyword`; optional `limit` (1–100), `offset`.
 - `session_search` — params: `keyword`; optional `session_type` (1 = private chats only, 2 = group chats only; **omit to return all sessions regardless of type**), `limit`, `offset`. Each result item includes `session_type`.
+- `search_favorite_sessions` — the owner's favorited sessions; optional `keyword` filter, `limit`, `offset`.
 - `message_history` — params: `session_id` (required); optional `before_id` (pagination cursor), `limit`.
 - `message_search` — params: `session_id` (required), `keyword`; optional `before_id`, `limit`.
 

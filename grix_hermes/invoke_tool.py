@@ -12,6 +12,7 @@ SUPPORTED_ACTIONS = {
     "delete_msg": "Delete (unsend/recall) a message",
     "contact_search": "Search contacts by keyword or ID",
     "session_search": "Search sessions by keyword",
+    "search_favorite_sessions": "List the owner's favorited sessions (optional keyword filter)",
     "message_history": "Get message history for a session",
     "message_search": "Search messages by keyword in a session",
     "group_create": "Create a new group",
@@ -45,7 +46,7 @@ GRIX_INVOKE_SCHEMA = {
         "Unified Grix API — all operations go through the agent_invoke channel.\n\n"
         "Supported actions:\n"
         "  Message: send_msg, delete_msg\n"
-        "  Query: contact_search, session_search, message_history, message_search\n"
+        "  Query: contact_search, session_search, search_favorite_sessions, message_history, message_search\n"
         "  Group: group_create, group_detail_read, group_leave_self, group_member_add, "
         "group_member_remove, group_member_role_update, group_all_members_muted_update, "
         "group_member_speaking_update, group_dissolve\n"

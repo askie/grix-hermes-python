@@ -10,18 +10,22 @@ Use the Python Hermes tool `grix_invoke`.
 
 ## Dispatch a task — `dispatch_agent`
 
-Hand work to another of the owner's agents. The backend opens (or reuses) a
-private session between the owner and that agent, binds the working directory
-when the agent type requires it (claude/codex/etc.), and sends the task in as
-the owner so the agent starts working.
+Hand work to another of the owner's agents. The backend creates a **new**
+private session between the owner and that agent for each dispatch (it does not
+reuse past sessions), binds the working directory when the agent type requires
+it (claude/codex/etc.), and sends the task in as the owner so the agent starts
+working.
 
 ```text
-grix_invoke(action="dispatch_agent", params={"agent_id": "<ID>", "cwd": "<ABS_PATH>", "task": "<TEXT>"})
+grix_invoke(action="dispatch_agent", params={"agent_id": "<ID>", "cwd": "<ABS_PATH>", "task": "<TEXT>", "title": "<SHORT_TITLE>"})
 ```
 
 - `agent_id` (required) — target agent's numeric ID, as a string.
 - `cwd` (required) — absolute working directory for the task.
 - `task` (required) — text description of what to do.
+- `title` (optional) — short title (a few words) summarizing the core of the
+  task; becomes the new session's title. If omitted, the backend derives one
+  from the task text.
 
 ## After dispatching — monitor and report back (don't fire-and-forget)
 
