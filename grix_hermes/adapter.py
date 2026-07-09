@@ -63,6 +63,7 @@ from .contract import (
     LOCAL_ACTION_FILE_LIST,
     LOCAL_ACTION_GET_SESSION_USAGE,
     STATUS_ALREADY_FINISHED,
+    STATUS_CANCELED,
     STATUS_FAILED,
     STATUS_OK,
     STATUS_RESPONDED,
@@ -161,6 +162,13 @@ class _OwnerState:
     # client / 主循环 loop）。grix_reply 工具据此自动补引用并路由回事件来源连接；
     # on_processing_start 写入、on_processing_complete 清除。
     active_reply_targets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # 事件收口登记（对齐 connector：event_result 在任务真正结束时才发）。
+    # open：session_key → 已投给 handle_message、尚未收口的 event_id（到达顺序）。
+    # running：session_key → 当前这轮后台任务认领的 event_id（含被合并进同一轮的
+    # 排队事件）。on_processing_start 从 open 认领到 running，on_processing_complete
+    # 按任务真实结果统一收口。
+    session_open_event_ids: Dict[str, List[str]] = field(default_factory=dict)
+    session_running_event_ids: Dict[str, List[str]] = field(default_factory=dict)
 
 
 def check_grix_requirements() -> bool:
@@ -486,6 +494,10 @@ class GrixAdapter(BasePlatformAdapter):
         self._shutting_down = False
         # 自升级检查器
         self._upgrade_checker: Optional["UpgradeChecker"] = None
+        # 正在 handle_message 派发途中的事件（session_key → event_id 集合）。
+        # on_processing_complete 的扫尾收口跳过这些事件：它们可能马上会入队/
+        # 被认领，提前发 responded 就回到"任务没结束先报完成"的老毛病。
+        self._inflight_dispatch_event_ids: Dict[str, Set[str]] = {}
 
     @staticmethod
     def _owner_key_of(client: Optional[GrixTransportClient]) -> str:
@@ -1428,46 +1440,92 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
-        if raw_message.get("_grix_kind") != "message":
+        if raw_message.get("_grix_kind") not in ("message", "card_action"):
             return
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        state = self._active_state()
         message_id = str(event.message_id or "").strip()
-        if message_id and self._active_state().processing_message_ids.get(session_key) == message_id:
-            self._active_state().processing_message_ids.pop(session_key, None)
-        _reply_target = self._active_state().active_reply_targets.get(session_key)
+        if message_id and state.processing_message_ids.get(session_key) == message_id:
+            state.processing_message_ids.pop(session_key, None)
+        _reply_target = state.active_reply_targets.get(session_key)
         if _reply_target and (not message_id or _reply_target.get("message_id") == message_id):
-            self._active_state().active_reply_targets.pop(session_key, None)
+            state.active_reply_targets.pop(session_key, None)
+
+        raw_event_id = str(raw_message.get("event_id") or "").strip()
+
+        # 本轮任务收口的事件集：on_processing_start 认领的全部事件（含被合并进
+        # 同一轮的排队事件）+ 触发事件本身（认领缺失时兜底）。
+        event_ids = state.session_running_event_ids.pop(session_key, [])
+        if raw_event_id and raw_event_id not in event_ids:
+            event_ids.append(raw_event_id)
+
+        # 触发消息被撤回：该事件不再上报结果（后端已随撤回清理），
+        # 但同轮认领的其他事件仍需正常收口。
         if message_id and self.is_message_revoked(session_key, message_id):
-            self._active_state().revoked_message_keys.discard((session_key, message_id))
+            state.revoked_message_keys.discard((session_key, message_id))
+            if raw_event_id:
+                event_ids = [eid for eid in event_ids if eid != raw_event_id]
             logger.debug(
                 "[%s] Skipping completion for revoked GRIX message %s/%s",
                 self.name,
                 event.source.chat_id,
                 message_id,
             )
-            return
-        event_id = raw_message.get("event_id")
-        if not isinstance(event_id, str) or not event_id.strip():
-            return
 
+        # 会话已无排队消息时，顺带收口本轮内被旁路消化、未进入后台任务的事件
+        # （如 clarify 文本答复、/approve 等旁路命令）——否则它们无人认领。
+        # 仍在派发途中的事件除外：它们可能马上入队/被下一轮认领，不能提前收口。
+        _debounce_pending = bool(getattr(self, "_text_debounce", {}).get(session_key))
+        if session_key not in self._pending_messages and not _debounce_pending:
+            _inflight = self._inflight_dispatch().get(session_key) or ()
+            remaining = state.session_open_event_ids.pop(session_key, [])
+            deferred = [eid for eid in remaining if eid in _inflight]
+            if deferred:
+                state.session_open_event_ids[session_key] = deferred
+            for eid in remaining:
+                if eid not in _inflight and eid not in event_ids:
+                    event_ids.append(eid)
+
+        if not event_ids:
+            return
         is_success = outcome == ProcessingOutcome.SUCCESS or outcome is True
-        status = STATUS_RESPONDED if is_success else STATUS_FAILED
-        message = None if is_success else "message processing failed"
-        await self._complete_event_if_needed(event_id.strip(), status=status, message=message)
+        is_cancelled = outcome == getattr(ProcessingOutcome, "CANCELLED", None)
+        if is_success:
+            status, message = STATUS_RESPONDED, None
+        elif is_cancelled:
+            # 主动停止（/stop、event_stop、queue_clear）触发的预期取消，
+            # 与 connector 一致上报 canceled 而非 failed。
+            status, message = STATUS_CANCELED, "stopped by user"
+        else:
+            status, message = STATUS_FAILED, "message processing failed"
+        for eid in event_ids:
+            await self._complete_event_if_needed(eid, status=status, message=message)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
-        if raw_message.get("_grix_kind") != "message" or not event.message_id:
+        if raw_message.get("_grix_kind") not in ("message", "card_action"):
             return
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
+        # 认领本轮任务要收口的事件：会话上所有尚未认领的入站事件（含被合并进
+        # 本轮的排队事件）。on_processing_complete 按任务真实结果统一发 event_result。
+        state = self._active_state()
+        running = state.session_open_event_ids.pop(session_key, [])
+        raw_event_id = str(raw_message.get("event_id") or "").strip()
+        if raw_event_id and raw_event_id not in running:
+            running.append(raw_event_id)
+        if running:
+            state.session_running_event_ids[session_key] = running
+
+        if raw_message.get("_grix_kind") != "message" or not event.message_id:
+            return
         self._active_state().processing_message_ids[session_key] = str(event.message_id)
         # 记录最终应答目标：grix_reply 工具在任务收尾时据此把最终总结发到正确会话
         # 并自动引用触发消息（引用即完成信号，可触发下一个 agent 接活）。工具 handler
@@ -2283,11 +2341,21 @@ class GrixAdapter(BasePlatformAdapter):
             reply_to_message_id=message.reply_to_message_id,
         )
 
+        # 登记待收口事件：真正的 event_result 由 on_processing_complete 在
+        # 后台任务结束时按真实结果发出（对齐 connector 的回合收口语义）。
+        # 注意 handle_message 是"派后台任务/入队后立即返回"的，不能在它返回后
+        # 就发 responded——那是任务开始，不是任务结束。
+        _open_ids = self._active_state().session_open_event_ids.setdefault(session_key, [])
+        if message.event_id not in _open_ids:
+            _open_ids.append(message.event_id)
+        self._inflight_dispatch().setdefault(session_key, set()).add(message.event_id)
+
         try:
             if session_key not in self._active_sessions and message.message_id:
                 self._active_state().processing_message_ids[session_key] = message.message_id
             await self.handle_message(event)
         except Exception as exc:
+            self._discard_open_event(session_key, message.event_id)
             if self._client:
                 await self._complete_event_if_needed(
                     message.event_id,
@@ -2295,12 +2363,24 @@ class GrixAdapter(BasePlatformAdapter):
                     message=str(exc),
                 )
             raise
+        finally:
+            _inflight = self._inflight_dispatch().get(session_key)
+            if _inflight is not None:
+                _inflight.discard(message.event_id)
+                if not _inflight:
+                    self._inflight_dispatch().pop(session_key, None)
 
-        # Close the event after successful processing.
-        # This must happen AFTER handle_message returns (all streaming +
-        # final sends complete) so the backend pending event stays alive
-        # throughout the entire response lifecycle.
-        if self._client:
+        # 兜底：handle_message 返回后，事件既没被后台任务认领（会话未激活）、
+        # 也没有排队等待下一轮，说明它已被同步路径消化且不会再有人收口——
+        # 按旧语义立即发 responded，避免后端事件悬挂。
+        if (
+            self._client
+            and self._event_still_open(session_key, message.event_id)
+            and session_key not in self._active_sessions
+            and session_key not in self._pending_messages
+            and not getattr(self, "_text_debounce", {}).get(session_key)
+        ):
+            self._discard_open_event(session_key, message.event_id)
             await self._complete_event_if_needed(
                 message.event_id, status=STATUS_RESPONDED,
             )
@@ -2441,6 +2521,16 @@ class GrixAdapter(BasePlatformAdapter):
                 session_id=revoke.session_id,
                 message_id=revoke.message_id,
             )
+
+        # 被撤回消息对应的事件不再上报结果（后端已随撤回清理），从收口登记表移除。
+        revoked_event_id = self._active_state().reply_event_ids.get(
+            (revoke.session_id, revoke.message_id)
+        )
+        if session_key and revoked_event_id:
+            self._discard_open_event(session_key, revoked_event_id)
+            running_ids = self._active_state().session_running_event_ids.get(session_key)
+            if running_ids and revoked_event_id in running_ids:
+                running_ids.remove(revoked_event_id)
 
         pending_event = self._pending_messages.get(session_key or "")
         if pending_event and pending_event.message_id == revoke.message_id:
@@ -2596,6 +2686,18 @@ class GrixAdapter(BasePlatformAdapter):
                             message="canceled by queue clear",
                         )
 
+            # 收口登记表里该会话所有未认领 / 已认领未完成的事件（覆盖被合并进
+            # pending 后 event_id 已丢失的排队事件），避免后端事件悬挂。
+            state = self._active_state()
+            for registry in (state.session_open_event_ids, state.session_running_event_ids):
+                for key in [k for k in registry if _matches(k)]:
+                    for eid in registry.pop(key, []):
+                        await self._complete_event_if_needed(
+                            str(eid),
+                            status=STATUS_FAILED,
+                            message="canceled by queue clear",
+                        )
+
             await self._active_client().send_queue_clear_result(
                 session_id=session_id,
                 success=True,
@@ -2741,6 +2843,27 @@ class GrixAdapter(BasePlatformAdapter):
             chat_type=stop.chat_type,
         )
 
+    def _inflight_dispatch(self) -> Dict[str, Set[str]]:
+        # 惰性初始化：测试常用 __new__ 绕过 __init__ 构造 adapter。
+        store = getattr(self, "_inflight_dispatch_event_ids", None)
+        if store is None:
+            store = {}
+            self._inflight_dispatch_event_ids = store
+        return store
+
+    def _event_still_open(self, session_key: str, event_id: str) -> bool:
+        return event_id in self._active_state().session_open_event_ids.get(session_key, [])
+
+    def _discard_open_event(self, session_key: str, event_id: str) -> None:
+        state = self._active_state()
+        ids = state.session_open_event_ids.get(session_key)
+        if not ids:
+            return
+        if event_id in ids:
+            ids.remove(event_id)
+        if not ids:
+            state.session_open_event_ids.pop(session_key, None)
+
     async def _complete_event_if_needed(
         self,
         event_id: str,
@@ -2751,7 +2874,19 @@ class GrixAdapter(BasePlatformAdapter):
         if not self._client or not event_id or event_id in self._active_state().completed_event_ids:
             return
         try:
-            await self._active_client().complete_event(
+            # 收口可能发生在任务结束时（距事件到达已很久），期间主连接可能已
+            # 重连换新对象；走 _get_ready_client 感知重连拿存活连接，而不是
+            # 直接用 ContextVar 里可能已失效的旧 client。
+            client = await self._get_ready_client(operation="complete_event")
+            if client is None:
+                logger.warning(
+                    "[%s] GRIX complete_event skipped (no ready client) for %s status=%s",
+                    self.name,
+                    event_id,
+                    status,
+                )
+                return
+            await client.complete_event(
                 event_id=event_id,
                 status=status,
                 message=message,
