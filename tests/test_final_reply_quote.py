@@ -96,10 +96,19 @@ class _SendResult:
 
 adapter_mod.SendResult = _SendResult
 
-# test_agent_share 的 stub ProcessingOutcome 没有 SUCCESS 属性；补齐以免受
-# 测试文件加载顺序影响。
-if not hasattr(adapter_mod.ProcessingOutcome, "SUCCESS"):
-    adapter_mod.ProcessingOutcome = type("ProcessingOutcome", (), {"SUCCESS": object()})
+# test_agent_share 的 stub ProcessingOutcome 缺成员；补齐以免受测试文件加载
+# 顺序影响（真实枚举两个成员都有，不会走到 setattr）。
+for _name in ("SUCCESS", "CANCELLED"):
+    if not hasattr(adapter_mod.ProcessingOutcome, _name):
+        try:
+            setattr(adapter_mod.ProcessingOutcome, _name, object())
+        except (AttributeError, TypeError):
+            adapter_mod.ProcessingOutcome = type(
+                "ProcessingOutcome",
+                (),
+                {"SUCCESS": object(), "CANCELLED": object()},
+            )
+            break
 
 
 class FakeTransportClient:
@@ -144,6 +153,8 @@ def _make_adapter(client=None):
     inst._disconnect_requested = False
     inst._client = client or FakeTransportClient()
     inst._pending_messages = {}
+    inst._active_sessions = {}
+    inst._inflight_dispatch_event_ids = {}
     inst.truncate_message = lambda content, limit, len_fn=None: [content]
     return inst
 
