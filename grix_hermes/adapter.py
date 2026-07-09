@@ -39,12 +39,14 @@ from .agent_status_cards import (
     detect_agent_status,
 )
 from .contract import (
+    AUTH_CODE_AGENT_DELETED,
     CMD_CONTROL_SHARE_SET,
     CMD_EVENT_CANCEL,
     CMD_EVENT_EDIT,
     CMD_EVENT_MSG,
     CMD_EVENT_REVOKE,
     CMD_EVENT_STOP,
+    CMD_KICKED,
     CMD_LOCAL_ACTION,
     CMD_QUEUE_CLEAR,
     ERR_APPROVAL_NOT_FOUND,
@@ -57,6 +59,7 @@ from .contract import (
     LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
+    KICKED_REASON_AGENT_DELETED,
     LOCAL_ACTION_FILE_LIST,
     LOCAL_ACTION_GET_SESSION_USAGE,
     STATUS_ALREADY_FINISHED,
@@ -460,6 +463,8 @@ class GrixAdapter(BasePlatformAdapter):
         self._client: Optional[GrixTransportClient] = None
         self._connector = None
         self._disconnect_requested = False
+        # agent 已在平台删除（auth_ack 10008 / kicked reason=agent_deleted）：置位后永久禁止重连。
+        self._agent_deleted = False
         # 上次上报的技能集指纹：运行期按会话活动重扫时，仅在清单变化时才推 agent_skills_update。
         self._last_skills_hash: str = ""
         self._token_lock_identity: Optional[str] = None
@@ -671,6 +676,8 @@ class GrixAdapter(BasePlatformAdapter):
         sending responses through the same adapter reference, avoiding the
         "transport not connected" failure caused by gateway adapter replacement.
         """
+        if self._agent_deleted:
+            return False
         async with self._reconnect_lock:
             # Double-check: another coroutine may have already reconnected.
             client = self._client
@@ -709,6 +716,26 @@ class GrixAdapter(BasePlatformAdapter):
                         attempt,
                     )
                     return True
+                except GrixAuthRejectedError as exc:
+                    # 鉴权拒绝不会因重试而变好，立即放弃；10008 = agent 已删除，永久停止重连。
+                    if exc.code == AUTH_CODE_AGENT_DELETED:
+                        self._agent_deleted = True
+                        logger.error(
+                            "[%s] Agent 已在平台删除（auth_ack %d），终止重连: %s",
+                            self.name,
+                            AUTH_CODE_AGENT_DELETED,
+                            exc,
+                        )
+                        self._set_fatal_error("grix_agent_deleted", str(exc), retryable=False)
+                    else:
+                        logger.error(
+                            "[%s] Internal reconnect auth rejected (attempt %d), not retrying: %s",
+                            self.name,
+                            attempt,
+                            exc,
+                        )
+                        self._set_fatal_error("grix_auth_rejected", str(exc), retryable=False)
+                    return False
                 except Exception as exc:
                     logger.warning(
                         "[%s] Internal reconnect attempt %d failed: %s",
@@ -768,7 +795,18 @@ class GrixAdapter(BasePlatformAdapter):
         try:
             await self._client.connect()
         except GrixAuthRejectedError as exc:
-            self._set_fatal_error("grix_auth_rejected", str(exc), retryable=False)
+            if exc.code == AUTH_CODE_AGENT_DELETED:
+                # agent 已在平台删除：fatal，永久停止重连（与 connector 行为一致）。
+                self._agent_deleted = True
+                logger.error(
+                    "[%s] Agent 已在平台删除（auth_ack %d），停止重连: %s",
+                    self.name,
+                    AUTH_CODE_AGENT_DELETED,
+                    exc,
+                )
+                self._set_fatal_error("grix_agent_deleted", str(exc), retryable=False)
+            else:
+                self._set_fatal_error("grix_auth_rejected", str(exc), retryable=False)
             await self._safe_release_lock()
             return False
         except Exception as exc:
@@ -1701,7 +1739,7 @@ class GrixAdapter(BasePlatformAdapter):
             return False
 
     async def _handle_transport_status(self, status: Dict[str, Any]) -> None:
-        if self._disconnect_requested:
+        if self._disconnect_requested or self._agent_deleted:
             return
         if status.get("connected", True):
             return
@@ -1745,6 +1783,8 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._handle_event_cancel_packet(payload)
             elif cmd == CMD_QUEUE_CLEAR:
                 await self._handle_queue_clear_packet(payload)
+            elif cmd == CMD_KICKED:
+                await self._handle_kicked_packet(payload, source_client)
             elif cmd == CMD_CONTROL_SHARE_SET:
                 # 共享名单仅主连接处理：共享子连接虽然也可能收到，但 diff 须由主实例统一做。
                 if source_client is None or source_client is self._client:
@@ -1762,6 +1802,44 @@ class GrixAdapter(BasePlatformAdapter):
         finally:
             if token is not None:
                 _CURRENT_CLIENT_CTX.reset(token)
+
+    async def _handle_kicked_packet(
+        self,
+        payload: Dict[str, Any],
+        source_client: Optional[GrixTransportClient],
+    ) -> None:
+        """服务端 kicked 通知。reason=agent_deleted 时按 fatal 处理：
+        agent 已在平台删除，停止整个 adapter 并永久禁止重连（与 connector 行为一致）。
+        其他 reason（如连接被替换）不在这里处理——传输层断开后走既有重连路径。"""
+        reason = str(payload.get("reason") or "")
+        if reason != KICKED_REASON_AGENT_DELETED:
+            logger.warning(
+                "[%s] kicked by server reason=%s (transport close will follow existing reconnect path)",
+                self.name,
+                reason or "<none>",
+            )
+            return
+        # 共享子连接收到的删除信号不单独处理：主连接必然也会收到，由主连接统一收口。
+        if source_client is not None and self._client is not None and source_client is not self._client:
+            logger.warning(
+                "[%s] kicked(agent_deleted) on shared client, waiting for primary to handle",
+                self.name,
+            )
+            return
+        if self._agent_deleted:
+            return
+        self._agent_deleted = True
+        logger.error(
+            "[%s] Agent 已在平台删除（kicked reason=%s），停止连接并永久禁止重连",
+            self.name,
+            reason,
+        )
+        self._set_fatal_error("grix_agent_deleted", "agent deleted on platform", retryable=False)
+        try:
+            await self.disconnect()
+        except Exception as exc:
+            logger.warning("[%s] disconnect after agent_deleted failed: %s", self.name, exc)
+        await self._notify_fatal_error()
 
     async def _handle_share_set_packet(self, payload: Dict[str, Any]) -> None:
         """agent 共享：后端下发当前被共享者全量名单，diff 后增删共享子连接。
