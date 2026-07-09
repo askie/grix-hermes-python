@@ -173,6 +173,35 @@ async def scenario_busy_queue(inst, client):
     print("  ok: 忙时排队 → 两个事件各自在所属轮次结束后收口 (responded)")
 
 
+async def scenario_burst_merge(inst, client):
+    """忙时三连发：第 2/3 条排队（可能合并成一轮），全部事件最终各归其轮收口。"""
+
+    async def slow_handler(event):
+        await asyncio.sleep(0.3)
+        return f"答复:{event.text[:10]}"
+
+    inst.set_message_handler(slow_handler)
+
+    await inst._handle_message_packet(packet("ev-x", "m-x", "第一条"))
+    await asyncio.sleep(0.05)
+    await inst._handle_message_packet(packet("ev-y", "m-y", "第二条"))
+    await inst._handle_message_packet(packet("ev-z", "m-z", "第三条"))
+
+    assert not client.completed, f"排队事件被提前收口: {client.completed}"
+
+    for _ in range(200):
+        rows = {eid for _, eid, _s in client.completed}
+        if {"ev-x", "ev-y", "ev-z"} <= rows:
+            break
+        await asyncio.sleep(0.05)
+
+    rows = {eid: s for _, eid, s in client.completed}
+    assert rows.get("ev-x") == "responded", client.completed
+    assert rows.get("ev-y") == "responded", client.completed
+    assert rows.get("ev-z") == "responded", client.completed
+    print("  ok: 三连发排队/合并 → 三个事件全部收口 (responded)，无泄漏")
+
+
 async def scenario_stop_cancels(inst, client):
     async def slow_handler(event):
         await asyncio.sleep(5)
@@ -203,6 +232,7 @@ async def main():
         ("慢任务成功收口", scenario_slow_success),
         ("处理器失败收口", scenario_failure),
         ("忙时排队收口", scenario_busy_queue),
+        ("三连发合并收口", scenario_burst_merge),
         ("停止任务收口", scenario_stop_cancels),
     ]:
         client = FakeTransportClient()
