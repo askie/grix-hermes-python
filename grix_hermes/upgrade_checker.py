@@ -327,6 +327,12 @@ class UpgradeChecker:
         resort — on Windows it maps to TerminateProcess (hard kill, shutdown
         handlers never run) and it assumes something external revives us.
         """
+        if self._stopped:
+            # The checker was stopped, i.e. the gateway is already shutting
+            # down on its own — injecting a restart (or SIGTERM) here would
+            # flip an operator's planned stop into an unwanted revival.
+            logger.info("[upgrade] skip restart: shutdown already in progress")
+            return
         if self._restart:
             try:
                 if self._restart():
