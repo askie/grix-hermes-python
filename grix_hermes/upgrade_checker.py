@@ -170,12 +170,14 @@ class UpgradeChecker:
         channel: str = "stable",
         is_busy: Optional[Callable[[], bool]] = None,
         agent_id: Optional[str] = None,
+        restart: Optional[Callable[[], bool]] = None,
     ):
         self._endpoint = endpoint
         self._api_key = api_key
         self._channel = channel
         self._is_busy = is_busy
         self._agent_id = agent_id
+        self._restart = restart
         self._running = False
         self._stopped = False
         self._task: Optional[asyncio.Task] = None
@@ -298,7 +300,7 @@ class UpgradeChecker:
                     return
 
             logger.info("[upgrade] restarting process")
-            os.kill(os.getpid(), signal.SIGTERM)
+            self._restart_process()
 
         except Exception as exc:
             msg = str(exc)
@@ -315,6 +317,30 @@ class UpgradeChecker:
                 "error_msg": msg[:500],
                 "duration_ms": duration_ms,
             })
+
+    def _restart_process(self) -> None:
+        """Restart the hosting process after a successful upgrade.
+
+        Prefers the injected graceful-restart callback: the gateway drains
+        in-flight tasks, saves session state, and spawns its own successor,
+        so no external supervisor is needed. A bare SIGTERM is only the last
+        resort — on Windows it maps to TerminateProcess (hard kill, shutdown
+        handlers never run) and it assumes something external revives us.
+        """
+        if self._stopped:
+            # The checker was stopped, i.e. the gateway is already shutting
+            # down on its own — injecting a restart (or SIGTERM) here would
+            # flip an operator's planned stop into an unwanted revival.
+            logger.info("[upgrade] skip restart: shutdown already in progress")
+            return
+        if self._restart:
+            try:
+                if self._restart():
+                    return
+                logger.warning("[upgrade] graceful restart unavailable, falling back to SIGTERM")
+            except Exception as exc:
+                logger.error("[upgrade] graceful restart failed, falling back to SIGTERM: %s", exc)
+        os.kill(os.getpid(), signal.SIGTERM)
 
     # ----- rate limiting -----
 

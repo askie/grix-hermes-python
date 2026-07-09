@@ -2186,11 +2186,60 @@ class GrixAdapter(BasePlatformAdapter):
                 endpoint=self.connection.endpoint,
                 api_key=self.connection.api_key,
                 agent_id=self.connection.agent_id,
+                is_busy=self._gateway_is_busy,
+                restart=self._request_gateway_restart,
             )
             await self._upgrade_checker.start()
             logger.info("[%s] Upgrade checker started", self.name)
         except Exception as exc:
             logger.warning("[%s] Failed to start upgrade checker: %s", self.name, exc)
+
+    def _gateway_is_busy(self) -> bool:
+        """Whether the hosting gateway has agent runs in flight.
+
+        Same busy notion the gateway's /restart uses for its drain notice;
+        mirrors the connector's ``instances.some(busy)``. Never raises — a
+        probe failure must not turn a finished upgrade into a reported one.
+        """
+        try:
+            from gateway.run import _gateway_runner_ref
+
+            runner = _gateway_runner_ref()
+            return bool(runner and runner._running_agent_count() > 0)
+        except Exception:
+            return False
+
+    def _request_gateway_restart(self) -> bool:
+        """Ask the hosting GatewayRunner for a graceful self-restart.
+
+        Mirrors the gateway's own /restart command: under a service manager
+        (systemd) or container the gateway exits with the restart code and the
+        manager revives it; otherwise ``detached=True`` spawns a watcher that
+        waits for this PID to exit and runs ``hermes gateway restart``. Either
+        way the gateway drains in-flight tasks and saves state before exiting.
+
+        Returns True when the process's fate is already settled — restart
+        handed to the runner, or a stop/restart is actively draining (a planned
+        stop must not be flipped into a revival). Returns False when no runner
+        is reachable or the runner refused with no stop actually running (a
+        stale one-way restart latch), so the caller falls back to SIGTERM.
+        """
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        if not runner:
+            return False
+        stop_task = getattr(runner, "_stop_task", None)
+        if stop_task is not None and not stop_task.done():
+            return True
+        via_service = (
+            bool(os.environ.get("INVOCATION_ID"))
+            or os.path.exists("/.dockerenv")
+            or os.path.exists("/run/.containerenv")
+        )
+        if via_service:
+            return bool(runner.request_restart(detached=False, via_service=True))
+        return bool(runner.request_restart(detached=True, via_service=False))
 
     async def _handle_upgrade_push(self, action: "GrixLocalAction") -> None:
         if not self._active_client():
