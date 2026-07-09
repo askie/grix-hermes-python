@@ -2186,11 +2186,37 @@ class GrixAdapter(BasePlatformAdapter):
                 endpoint=self.connection.endpoint,
                 api_key=self.connection.api_key,
                 agent_id=self.connection.agent_id,
+                restart=self._request_gateway_restart,
             )
             await self._upgrade_checker.start()
             logger.info("[%s] Upgrade checker started", self.name)
         except Exception as exc:
             logger.warning("[%s] Failed to start upgrade checker: %s", self.name, exc)
+
+    def _request_gateway_restart(self) -> bool:
+        """Ask the hosting GatewayRunner for a graceful self-restart.
+
+        Mirrors the gateway's own /restart command: under a service manager
+        (systemd) or container the gateway exits with the restart code and the
+        manager revives it; otherwise ``detached=True`` spawns a watcher that
+        waits for this PID to exit and runs ``hermes gateway restart``. Either
+        way the gateway drains in-flight tasks and saves state before exiting.
+
+        Returns True when the restart was handed to the runner (including a
+        restart already in progress), False when no runner is reachable.
+        """
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        if not runner:
+            return False
+        under_service = bool(os.environ.get("INVOCATION_ID"))
+        in_container = os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+        if under_service or in_container:
+            runner.request_restart(detached=False, via_service=True)
+        else:
+            runner.request_restart(detached=True, via_service=False)
+        return True
 
     async def _handle_upgrade_push(self, action: "GrixLocalAction") -> None:
         if not self._active_client():
