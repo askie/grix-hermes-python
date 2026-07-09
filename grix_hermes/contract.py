@@ -52,6 +52,15 @@ CMD_QUEUE_SNAPSHOT = "queue_snapshot"
 # （主人 api_key + shared_owner_id）。仅主连接会收到。
 CMD_CONTROL_SHARE_SET = "control_share_set"
 
+# 服务端主动踢下线通知，载荷 {reason: str}。
+CMD_KICKED = "kicked"
+
+# auth_ack 错误码：agent 已删除或不存在（fatal，应永久停止重连；与 connector 语义一致）。
+AUTH_CODE_AGENT_DELETED = 10008
+
+# kicked 包 reason：agent 在线时被平台删除（与 auth_ack 10008 同等按 fatal 处理）。
+KICKED_REASON_AGENT_DELETED = "agent_deleted"
+
 STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_AUTH, "direction": "client_to_server", "purpose": "authenticate"},
     {"cmd": CMD_AUTH_ACK, "direction": "server_to_client", "purpose": "authentication_result"},
