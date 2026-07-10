@@ -290,14 +290,10 @@ class UpgradeChecker:
                 "duration_ms": duration_ms,
             })
 
-            if self._is_busy and self._is_busy():
-                logger.info("[upgrade] waiting for active tasks before restart")
-                deadline = time.monotonic() + 3600
-                while self._is_busy() and time.monotonic() < deadline and not self._stopped:
-                    await asyncio.sleep(5)
-                if self._stopped:
-                    logger.info("[upgrade] aborted: checker stopped during wait")
-                    return
+            # 等待活跃任务完成——有任务在跑就一直等，清空才重启，绝不强制打断
+            if not await self._wait_until_idle():
+                logger.info("[upgrade] aborted: checker stopped during wait")
+                return
 
             logger.info("[upgrade] restarting process")
             self._restart_process()
@@ -317,6 +313,28 @@ class UpgradeChecker:
                 "error_msg": msg[:500],
                 "duration_ms": duration_ms,
             })
+
+    async def _wait_until_idle(self) -> bool:
+        """Wait until all in-flight agent runs finish; True = clear to restart.
+
+        No max-wait: a busy gateway is never force-restarted — the installed
+        version simply takes effect at the next natural idle moment. Returns
+        False only when the checker is stopped mid-wait (shutdown in
+        progress), in which case the caller must skip the restart.
+        """
+        if not (self._is_busy and self._is_busy()):
+            return not self._stopped
+        logger.info("[upgrade] waiting until idle before restart (no max wait)")
+        last_log = time.monotonic()
+        while self._is_busy() and not self._stopped:
+            await asyncio.sleep(5)
+            if time.monotonic() - last_log >= 600:
+                last_log = time.monotonic()
+                logger.info("[upgrade] still waiting for active tasks before restart")
+        if self._stopped:
+            return False
+        logger.info("[upgrade] all tasks completed, proceeding with restart")
+        return True
 
     def _restart_process(self) -> None:
         """Restart the hosting process after a successful upgrade.
