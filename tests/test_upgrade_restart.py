@@ -308,3 +308,59 @@ def test_start_upgrade_checker_wires_callbacks(monkeypatch):
     assert checker is not None
     assert checker._restart == inst._request_gateway_restart
     assert checker._is_busy == inst._gateway_is_busy
+
+
+# ---------------------------------------------------------------------------
+#  UpgradeChecker._wait_until_idle（任务不清空不重启，无等待上限）
+# ---------------------------------------------------------------------------
+
+def _make_checker_with_busy(is_busy) -> UpgradeChecker:
+    return UpgradeChecker(
+        endpoint="wss://example.com/ws",
+        api_key="k",
+        agent_id="test-agent",
+        is_busy=is_busy,
+    )
+
+
+def test_wait_until_idle_waits_past_old_1h_cap(monkeypatch):
+    # 忙碌 800 轮（按真实 5s/轮折算超过旧的 3600s 上限）：旧逻辑会在 1 小时处
+    # 强制放行；现在必须等到不忙才返回 True。sleep 替换为瞬时完成。
+    calls = {"n": 0}
+
+    def is_busy():
+        calls["n"] += 1
+        return calls["n"] <= 800
+
+    async def fast_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+    checker = _make_checker_with_busy(is_busy)
+
+    assert asyncio.run(checker._wait_until_idle()) is True
+    assert calls["n"] > 800  # 一直等到 is_busy 变 False 才放行
+
+
+def test_wait_until_idle_stopped_mid_wait_returns_false(monkeypatch):
+    checker = _make_checker_with_busy(lambda: True)
+    rounds = {"n": 0}
+
+    async def stopping_sleep(_seconds):
+        rounds["n"] += 1
+        if rounds["n"] >= 3:
+            checker._stopped = True
+
+    monkeypatch.setattr(asyncio, "sleep", stopping_sleep)
+
+    assert asyncio.run(checker._wait_until_idle()) is False
+
+
+def test_wait_until_idle_immediate_when_not_busy():
+    checker = _make_checker_with_busy(lambda: False)
+    assert asyncio.run(checker._wait_until_idle()) is True
+
+
+def test_wait_until_idle_immediate_when_no_probe():
+    checker = _make_checker_with_busy(None)
+    assert asyncio.run(checker._wait_until_idle()) is True
