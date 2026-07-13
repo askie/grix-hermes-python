@@ -586,6 +586,42 @@ class GrixAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         return content.strip()
 
+    def format_tool_event(
+        self,
+        event: Any,
+        *,
+        mode: str = "all",
+        preview_max_len: int = 40,
+    ) -> Optional[str]:
+        """Render a ToolCallChunk as the raw ``emoji tool_name: "preview"`` line.
+
+        Grix renders tool progress as a tool_execution card keyed on the tool
+        name, so the adapter pins the machine-readable shape rather than the
+        friendly prose the gateway shows elsewhere ("📖 Reading docs/api.md"),
+        which carries no tool name.  ``detect_tool_progress`` still parses both
+        shapes, because the gateway does not route tool events through this
+        hook yet (``GatewayEventDispatcher`` is unwired upstream).
+        """
+        from gateway.stream_events import ToolCallChunk
+
+        if not isinstance(event, ToolCallChunk):
+            return None
+        if mode == "verbose":
+            return super().format_tool_event(
+                event, mode=mode, preview_max_len=preview_max_len,
+            )
+
+        from agent.display import get_tool_emoji
+
+        emoji = get_tool_emoji(event.tool_name, default="⚙️")
+        preview = event.preview
+        if not preview:
+            return f"{emoji} {event.tool_name}..."
+        cap = preview_max_len if preview_max_len > 0 else 40
+        if len(preview) > cap:
+            preview = preview[: cap - 3] + "..."
+        return f'{emoji} {event.tool_name}: "{preview}"'
+
     @staticmethod
     def _message_size(content: str) -> int:
         return len(content.encode("utf-8"))
