@@ -68,7 +68,7 @@ hermes [--profile <profile-name>] gateway status   # should report running
 
 Then read `logs/gateway.log` in the profile directory (`~/.hermes/logs/` for the default profile, `~/.hermes/profiles/<profile-name>/logs/` otherwise):
 
-- `[grix] connected to ...` → the agent is online in Grix
+- a line like `[Grix] Connected to wss://...` → the agent is online in Grix (grep case-insensitively; the exact prefix follows the agent name)
 - `no messaging platforms enabled` or `grix disabled` → the plugin is not enabled; check that `plugins.enabled` in that profile's `config.yaml` contains `grix-hermes`
 
 An empty value counts as unset: all three of `GRIX_ENDPOINT`, `GRIX_AGENT_ID` and `GRIX_API_KEY` must be present and non-empty, and `GRIX_ENDPOINT` must be copied verbatim from Grix — including the trailing `?agent_id=...`.
