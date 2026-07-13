@@ -58,6 +58,36 @@ Then restart the gateway:
 hermes gateway restart
 ```
 
+For a named profile, pass `--profile` before the subcommand: `hermes --profile <profile-name> gateway restart`.
+
+## Verify the connection
+
+```bash
+hermes [--profile <profile-name>] gateway status   # should report running
+```
+
+Then read `logs/gateway.log` in the profile directory (`~/.hermes/logs/` for the default profile, `~/.hermes/profiles/<profile-name>/logs/` otherwise):
+
+- `[grix] connected to ...` → the agent is online in Grix
+- `no messaging platforms enabled` or `grix disabled` → the plugin is not enabled; check that `plugins.enabled` in that profile's `config.yaml` contains `grix-hermes`
+
+An empty value counts as unset: all three of `GRIX_ENDPOINT`, `GRIX_AGENT_ID` and `GRIX_API_KEY` must be present and non-empty, and `GRIX_ENDPOINT` must be copied verbatim from Grix — including the trailing `?agent_id=...`.
+
+`GRIX_API_KEY` is a one-time secret. Keep it in the `.env` and nowhere else.
+
+## Connecting more than one agent
+
+A `.env` holds exactly one set of Grix credentials, so **one agent = one profile**:
+
+```bash
+hermes profile create <agent-slug>          # lowercase letters, digits, - and _
+# write the credentials into ~/.hermes/profiles/<agent-slug>/.env
+hermes --profile <agent-slug> plugins install askie/grix-hermes-python --enable
+hermes --profile <agent-slug> gateway restart
+```
+
+Each profile runs its own gateway, so agents stay isolated from one another.
+
 ## Plugin skills
 
 After installation, Hermes can load these namespaced skills:
