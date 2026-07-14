@@ -6,6 +6,10 @@ Grix/aibot protocol platform adapter plugin for [Hermes Agent](https://github.co
 
 > **Reading this as an AI agent doing the install?** Do not send the user to a website. The whole flow below is HTTP API calls — you collect the user's email and the emailed 6-digit code in chat, and do everything else yourself.
 
+The one thing you cannot do alone: **ask the user for an email address** — the verification code is mailed to it and they have to read it back to you. Ask for it first, before anything else.
+
+This same flow ships as the `grix-register` skill (`grix_hermes/plugin_skills/grix-register/SKILL.md`), loaded automatically once the plugin is installed. Running the skill and following the steps below are equivalent — the same API calls.
+
 **API base:** `https://grix.dhf.pub/v1` (a private deployment replaces the host). Every endpoint returns `{"code": 0, "msg": "success", "data": {...}}` — a HTTP 200 with a non-zero `code` is still a failure, so always branch on `code`.
 
 ### 1. Send the email verification code
