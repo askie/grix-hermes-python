@@ -4,14 +4,75 @@ Grix/aibot protocol platform adapter plugin for [Hermes Agent](https://github.co
 
 ## Get Grix credentials
 
-Open [grix.dhf.pub](https://grix.dhf.pub/), go to the `AI` section, and create an
-`API Agent`.
+> **Reading this as an AI agent doing the install?** Do not send the user to a website. The whole flow below is HTTP API calls — you collect the user's email and the emailed 6-digit code in chat, and do everything else yourself.
 
-You will get:
+**API base:** `https://grix.dhf.pub/v1` (a private deployment replaces the host). Every endpoint returns `{"code": 0, "msg": "success", "data": {...}}` — a HTTP 200 with a non-zero `code` is still a failure, so always branch on `code`.
 
-- `GRIX_ENDPOINT`
-- `GRIX_AGENT_ID`
-- `GRIX_API_KEY`
+### 1. Send the email verification code
+
+Ask the user for their email, then:
+
+```bash
+curl -s -X POST https://grix.dhf.pub/v1/auth/send-code \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"<user-email>","scene":"register"}'
+```
+
+Then ask the user for the 6-digit code from their inbox (tell them to check spam too). `code: 10003` = the email failed validation. `code: 10005` = a code was already sent recently — do not retry in a loop, wait ~5 minutes or use the code already sent.
+
+### 2. Register
+
+Generate a strong random password yourself (12+ chars, mixed case, digits, symbols) — do not ask the user to invent one.
+
+```bash
+curl -s -X POST https://grix.dhf.pub/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email": "<user-email>",
+    "password": "<generated-password>",
+    "email_code": "<code from the user>",
+    "device_id": "cli_<random-uuid>",
+    "platform": "cli"
+  }'
+```
+
+Returns `data.access_token`. **Show the user the generated password and tell them to save it.**
+
+Two different failures both come back as `code: 10001`, so read the `msg`, not just the code:
+
+- `邮箱验证码错误或已过期` — the code really is wrong or expired: ask for it again.
+- `注册失败，请检查邮箱验证码后重试` — despite what it says, this almost always means **the email is already registered**. Do not re-send the code in a loop; log in instead.
+
+To log in, you need the user's existing password — only ask, never guess:
+
+```bash
+curl -s -X POST https://grix.dhf.pub/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"<user-email>","password":"<password>","device_id":"cli_<random-uuid>","platform":"cli"}'
+```
+
+### 3. Create the API agent
+
+```bash
+curl -s -X POST https://grix.dhf.pub/v1/agents/create \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <access_token>' \
+  -d '{"agent_name":"<agent-name>","provider_type":3,"is_main":true}'
+```
+
+`provider_type: 3` is the Agent API type — the only type this plugin can drive. `is_main: true` gives the first agent the full initial permission scope.
+
+If a `provider_type: 3` agent with that name already exists, reuse it: `GET /v1/agents/list` (Bearer auth) to find the exact-name entry with `provider_type == 3` and `status != 3`, then `POST /v1/agents/<agent-id>/api/key/rotate` with `{}` for a fresh key. Rotation kills the old key immediately, so only rotate an agent the user really wants re-pointed at this machine.
+
+### 4. Map the fields into the environment variables
+
+| From `data` | Environment variable |
+|---|---|
+| `api_endpoint` | `GRIX_ENDPOINT` |
+| `id` | `GRIX_AGENT_ID` |
+| `api_key` | `GRIX_API_KEY` — **shown exactly once, never retrievable again** |
+
+`api_endpoint` comes back as `wss://grix.dhf.pub/v1/agent-api/ws?agent_id=<id>`; the `?agent_id=…` query is redundant here — keep only the part before `?`. Write the key into the profile `.env` and nowhere else.
 
 ## Install the plugin
 
