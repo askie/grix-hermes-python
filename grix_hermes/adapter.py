@@ -787,7 +787,14 @@ class GrixAdapter(BasePlatformAdapter):
                     self._client = new_client
                     self._mark_connected()
                     await self._report_skills()
-                    await self._replay_pending_completed_events()
+                    # 补发滞留的 event_result。重连回调不在 packet handler scope 内，
+                    # 必须显式把新主连接放进 ContextVar —— 否则下游 _active_client()
+                    # 取不到 client 而整批放弃补发（共享子连接重连路径同此写法）。
+                    token = _CURRENT_CLIENT_CTX.set(new_client)
+                    try:
+                        await self._replay_pending_completed_events()
+                    finally:
+                        _CURRENT_CLIENT_CTX.reset(token)
                     logger.info(
                         "[%s] Internal reconnect OK (attempt %d)",
                         self.name,
@@ -3154,7 +3161,9 @@ class GrixAdapter(BasePlatformAdapter):
                 )
                 replayed += 1
             except Exception as exc:
-                logger.debug(
+                # 补发是断连容错的最后一道防线：失败必须可见，不能吞成 debug——
+                # 静默失败会让事件在后端一直悬挂到超时，且无人察觉。
+                logger.warning(
                     "[%s] Re-play event_result for %s failed: %s",
                     self.name, eid, exc,
                 )
