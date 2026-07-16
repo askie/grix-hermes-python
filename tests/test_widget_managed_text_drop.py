@@ -1,0 +1,122 @@
+"""托管代答私聊 text_events=drop 行为测试。
+
+后端对 widget 客服等私聊托管场景下发 connector.text_events=drop（外加 tool/thinking
+drop）。验证 hermes send() 按调用入口（is_final_reply）判定：
+- 纯文本过程/续写（is_final_reply=False）被丢弃，不投递给对端；
+- grix_reply 正式应答（send_final_reply → is_final_reply=True）照常投递；
+- 开放式 clarify 提问照常投递（是发给对端的正常消息，非过程文本）；
+- 未下发该 hint 时纯文本正常投递（无回归）。
+
+复用 test_final_reply_quote 的 stub host + 假 transport。
+"""
+
+import sys
+from pathlib import Path
+
+_TESTS_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_TESTS_DIR))
+
+import test_final_reply_quote as h  # noqa: E402  触发 stub 安装
+
+adapter_mod = h.adapter_mod
+FakeTransportClient = h.FakeTransportClient
+_make_adapter = h._make_adapter
+_resolve_target = h._resolve_target
+_with_ctx = h._with_ctx
+
+MANAGED = {"tool_events": "drop", "thinking_events": "drop", "text_events": "drop"}
+
+
+def _set_hints(inst, chat_id, hints):
+    inst._active_state().session_connector_hints[str(chat_id)] = hints
+
+
+def test_managed_drops_plain_process_text(monkeypatch):
+    """托管场景：纯文本过程/续写被丢弃，但对 agent 报成功。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_hints(inst, "chat-1", MANAGED)
+
+    result = _with_ctx(
+        client, inst.send("chat-1", "在的呢～您可以直接说下使用场景", reply_to="t1")
+    )
+
+    assert result.success is True
+    assert client.sent == []
+
+
+def test_managed_keeps_final_reply(monkeypatch):
+    """托管场景：grix_reply 正式应答照常投递并带引用。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_hints(inst, "chat-1", MANAGED)
+
+    result = _with_ctx(
+        client,
+        inst.send_final_reply(
+            chat_id="chat-1",
+            content="正式客服回复",
+            quoted_message_id="t1",
+            source_client=client,
+        ),
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "正式客服回复"
+    assert client.sent[0]["reply_to_message_id"] == "t1"
+
+
+def test_managed_keeps_open_clarify(monkeypatch):
+    """托管场景：开放式提问是发给对端的正常消息，照常投递。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_hints(inst, "chat-1", MANAGED)
+
+    result = _with_ctx(
+        client, inst.send_clarify("chat-1", "请问您要咨询什么？", None, "cl1", "k")
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert "请问您要咨询什么？" in client.sent[0]["content"]
+
+
+def test_managed_final_reply_survives_status_lookalike(monkeypatch):
+    """正式应答正文即使长得像状态行(⏳ Working…)，托管场景也原样投递、不被误判丢弃。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_hints(inst, "chat-1", MANAGED)
+
+    lookalike = "⏳ Working 时段是 9:00-18:00，您方便时我随时对接。"
+    result = _with_ctx(
+        client,
+        inst.send_final_reply(
+            chat_id="chat-1",
+            content=lookalike,
+            quoted_message_id="t1",
+            source_client=client,
+        ),
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert "9:00-18:00" in client.sent[0]["content"]
+    assert client.sent[0]["reply_to_message_id"] == "t1"
+
+
+def test_no_hint_delivers_plain_text(monkeypatch):
+    """无托管 hint：纯文本进程消息正常投递（无回归）。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    result = _with_ctx(client, inst.send("chat-1", "普通进程消息", reply_to="t1"))
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "普通进程消息"

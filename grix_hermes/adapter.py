@@ -970,6 +970,7 @@ class GrixAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         *,
         force_quote: bool = False,
+        is_final_reply: bool = False,
     ) -> SendResult:
         # 引用收敛（对齐 connector 语义）：过程消息一律不带引用——服务端把
         # 「agent 引用另一 agent 的消息」视为隐式 @ 并触发对方接活，流式过程里每条
@@ -983,14 +984,22 @@ class GrixAdapter(BasePlatformAdapter):
         _hints = self._active_state().session_connector_hints.get(str(chat_id)) or {}
         _drop_thinking = _hints.get("thinking_events") == "drop"
         _drop_tools = _hints.get("tool_events") == "drop"
+        # 托管代答场景（后端对 widget 客服等私聊托管下发）：agent 代 owner 回复对端，
+        # 只有 grix_reply 的正式应答（is_final_reply=True）该给对端看；经 send() 的
+        # 纯文本过程/续写一律不投递。按调用入口判定，不依赖引用/force_quote——长回复
+        # 分片仅首片带引用、第二次 grix_reply 也不带引用，那些信号都是有损的。
+        _drop_text = _hints.get("text_events") == "drop"
 
         # Detect structured content and inject channel_data for card display.
         # Order matters: a gateway status line is checked first and short-circuits,
         # so it is never routed to the tool_execution path.  (Today's tool-progress
         # regex doesn't match these strings anyway, but ordering keeps the two
         # classifiers independent of future regex changes.)
+        # 正式应答（is_final_reply=True）无条件按普通消息投递：跳过 status/tool/hook
+        # 分类，避免正文恰好命中这些窄正则时被误判成过程卡片、或（托管/群聊 drop 时）
+        # 被当过程内容丢弃。分类仅对非最终的过程输出生效。
         tp = None  # set only on the tool-progress path; consumed after send below
-        status_text = detect_agent_status(content)
+        status_text = detect_agent_status(content) if not is_final_reply else None
         if status_text:
             if _drop_thinking:
                 # Backend instructed us to suppress thinking/status events.
@@ -1009,7 +1018,7 @@ class GrixAdapter(BasePlatformAdapter):
                 cd.update(build_agent_status_channel_data(status_text))
                 metadata["channel_data"] = cd
         else:
-            tp = detect_tool_progress(content)
+            tp = detect_tool_progress(content) if not is_final_reply else None
             if tp:
                 if _drop_tools:
                     # Backend instructed us to suppress tool execution events.
@@ -1023,7 +1032,7 @@ class GrixAdapter(BasePlatformAdapter):
                 cd.update(build_tool_execution_channel_data(tool_name, preview))
                 metadata["channel_data"] = cd
             else:
-                hs = detect_hook_status(content)
+                hs = detect_hook_status(content) if not is_final_reply else None
                 if hs:
                     if _drop_tools:
                         return SendResult(success=True, retryable=False)
@@ -1035,6 +1044,11 @@ class GrixAdapter(BasePlatformAdapter):
                     cd = dict(metadata.get("channel_data") or {})
                     cd.update(build_tool_execution_channel_data(action_name, description))
                     metadata["channel_data"] = cd
+                elif _drop_text and not is_final_reply:
+                    # 纯文本过程消息/续写（非 status/tool/hook 卡片）：托管场景下非最终
+                    # 应答一律不投递给对端。grix_reply 走 send_final_reply
+                    # (is_final_reply=True)，不受影响。
+                    return SendResult(success=True, retryable=False)
 
         await self._enforce_send_rate()
 
@@ -1123,6 +1137,7 @@ class GrixAdapter(BasePlatformAdapter):
                 content,
                 reply_to=quoted_message_id,
                 force_quote=bool(quoted_message_id),
+                is_final_reply=True,
             )
         finally:
             if token is not None:
@@ -1147,7 +1162,10 @@ class GrixAdapter(BasePlatformAdapter):
         与基类行为一致，直接发无卡片文本。
         """
         if not choices:
-            return await self.send(str(chat_id), f"❓ {question}", metadata=metadata)
+            # 开放式提问是发给对端的正常消息（非过程文本），托管场景也必须投递。
+            return await self.send(
+                str(chat_id), f"❓ {question}", metadata=metadata, is_final_reply=True
+            )
 
         client = await self._get_ready_client(operation="send_clarify")
         if not client:
