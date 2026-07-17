@@ -50,3 +50,26 @@ def test_group_plain_context_includes_sender():
 
 def test_empty_returns_blank():
     assert _render_grix_context_block(_msg({}, 2)) == ""
+
+
+def test_filters_open_session_directive():
+    bind_uri = "grix://open/session?cwd=%2FUsers%2Fmac%2Ftest&card_instance_id=open_session%3A1"
+    m = _msg(
+        {
+            "context_messages": [
+                {"msg_id": "50", "sender_id": "789", "content": "hi"},
+                {"msg_id": "51", "sender_id": "789", "content": bind_uri},
+                {"msg_id": "52", "sender_id": "789", "content": f"  {bind_uri}  "},
+            ]
+        },
+        1,
+    )
+    assert _render_grix_context_block(m) == "hi"
+
+
+def test_keeps_prose_mentioning_bind_uri():
+    m = _msg(
+        {"context_messages": [{"msg_id": "50", "sender_id": "789", "content": "标题显示原始 grix://open/session?cwd=... 链接"}]},
+        1,
+    )
+    assert _render_grix_context_block(m) == "标题显示原始 grix://open/session?cwd=... 链接"

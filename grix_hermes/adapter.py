@@ -12,6 +12,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 from contextlib import suppress
@@ -309,6 +310,16 @@ def _resolve_message_type(message: GrixInboundMessage) -> MessageType:
     return MessageType.DOCUMENT
 
 
+# 目录绑定指令（整条消息恰好是 grix://open/... URI）是平台生成的机器消息，
+# 会被记入可见历史并随 context_messages 下发——注入 agent 上下文前过滤掉。
+# 与 grix-connector 的 isOpenSessionDirectiveMessage 保持同一语义。
+_OPEN_SESSION_DIRECTIVE_PATTERN = re.compile(r"^grix://open/\S+$", re.IGNORECASE)
+
+
+def _is_open_session_directive(content: str) -> bool:
+    return bool(_OPEN_SESSION_DIRECTIVE_PATTERN.match(content.replace("&amp;", "&").strip()))
+
+
 def _render_grix_context_block(message: GrixInboundMessage) -> str:
     """Assemble the backend-provided context_messages into readable text that is
     prepended to the agent prompt. A quoted (replied-to) entry has its content
@@ -336,6 +347,8 @@ def _render_grix_context_block(message: GrixInboundMessage) -> str:
             continue
         content = str(item.get("content") or "").strip()
         if not content:
+            continue
+        if _is_open_session_directive(content):
             continue
         sender_id = str(item.get("sender_id") or "")
         if content.startswith(quoted_prefix):
