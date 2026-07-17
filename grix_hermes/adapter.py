@@ -1419,6 +1419,13 @@ class GrixAdapter(BasePlatformAdapter):
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
+        # 事件收口后不再点亮 composing（对齐 connector：event_result 上报即停止续期）。
+        # hermes 的"正在输入"心跳按 chat 起、只在所属后台任务收尾时取消；同一会话多轮
+        # 并发（群里不同发起人各一路）时可能残留一个没人取消的空转循环，它会每 2s 把
+        # composing 续起来，任务早已结束前端却一直转。事件收口状态是唯一可信的
+        # "还在干活"判据，用它兜住空转循环。
+        if not self._session_has_unsettled_events(str(chat_id).split(":")[0]):
+            return
         client = await self._get_ready_client(operation="send_typing")
         if not client:
             return
@@ -2412,25 +2419,32 @@ class GrixAdapter(BasePlatformAdapter):
                 session_id=message.session_id,
             )
 
-        # /stop 拦截：后端工具栏停止按钮通过 SendStopText 下发 "/stop" 文本命令
+        # /stop 拦截：后端工具栏停止按钮通过 SendStopText 下发 "/stop" 文本命令。
+        # 该事件只带 session_id + sender，没有会话类型，按它拼出的 session_key 一律是
+        # dm 形态，在群会话（<ns>:grix:group:<session_id>:<user_id>）里永远对不上。
+        # 停止的语义是"停这个会话里该 agent 的活"，所以按 session_id 找出该会话下所有
+        # 正在跑的任务逐个停。
         if message.text and message.text.strip().lower() == "/stop":
-            was_active = session_key in self._active_sessions
+            stop_keys = self._active_session_keys_for_session(message.session_id)
             logger.info(
-                "[%s] GRIX /stop command received event_id=%s session_id=%s session_key=%s was_active=%s active_sessions=%s",
-                self.name, message.event_id, message.session_id, session_key, was_active,
+                "[%s] GRIX /stop command received event_id=%s session_id=%s stop_keys=%s active_sessions=%s",
+                self.name, message.event_id, message.session_id, stop_keys,
                 list(self._active_sessions.keys()),
             )
-            if was_active:
-                await self._force_stop_session(
-                    source, session_key, reply_to=message.message_id,
-                )
+            stopped_any = False
+            for stop_key in stop_keys:
+                # 多路并发时全停，但只给用户一条停止确认。
+                if await self._force_stop_session(
+                    source, stop_key, reply_to=message.message_id, notify=not stopped_any,
+                ):
+                    stopped_any = True
             if self._client:
                 await self._complete_event_if_needed(
                     message.event_id, status=STATUS_RESPONDED,
                 )
             logger.info(
-                "[%s] GRIX /stop command handled event_id=%s was_active=%s",
-                self.name, message.event_id, was_active,
+                "[%s] GRIX /stop command handled event_id=%s stopped=%s",
+                self.name, message.event_id, stopped_any,
             )
             return
 
@@ -2977,6 +2991,7 @@ class GrixAdapter(BasePlatformAdapter):
         session_key: str,
         *,
         reply_to: Optional[str] = None,
+        notify: bool = True,
     ) -> bool:
         was_active = session_key in self._active_sessions
         if not was_active:
@@ -3014,17 +3029,18 @@ class GrixAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
-        thread_id = getattr(source, "thread_id", None)
-        thread_meta = {"thread_id": thread_id} if thread_id else None
-        try:
-            await self._send_with_retry(
-                chat_id=source.chat_id,
-                content="⚡ Stopped. You can continue this session.",
-                reply_to=reply_to,
-                metadata=thread_meta,
-            )
-        except Exception as exc:
-            logger.debug("[%s] Failed sending local stop confirmation for %s: %s", self.name, session_key, exc)
+        if notify:
+            thread_id = getattr(source, "thread_id", None)
+            thread_meta = {"thread_id": thread_id} if thread_id else None
+            try:
+                await self._send_with_retry(
+                    chat_id=source.chat_id,
+                    content="⚡ Stopped. You can continue this session.",
+                    reply_to=reply_to,
+                    metadata=thread_meta,
+                )
+            except Exception as exc:
+                logger.debug("[%s] Failed sending local stop confirmation for %s: %s", self.name, session_key, exc)
 
         logger.info("[%s] Locally stopped active GRIX session %s", self.name, session_key)
         return True
@@ -3037,6 +3053,39 @@ class GrixAdapter(BasePlatformAdapter):
             chat_id=stop.session_id,
             chat_type=stop.chat_type,
         )
+
+    @staticmethod
+    def _session_key_belongs_to_session(session_key: str, session_id: str) -> bool:
+        """session_key 是否属于某个 Grix 会话。
+
+        hermes 的 session_key 形如
+        ``<ns>:grix:<chat_type>:<session_id>[:<thread_id>][:<user_id>]``，
+        会话 id 是 uuid，与命名空间/平台/会话类型/用户 id 各段都不会撞。
+        """
+        if not session_id or not session_key:
+            return False
+        return session_id in session_key.split(":")
+
+    def _active_session_keys_for_session(self, session_id: str) -> List[str]:
+        """该 Grix 会话下所有正在跑的任务 key（群会话按发起人分路，可能不止一个）。"""
+        return [
+            key
+            for key in list(self._active_sessions.keys())
+            if self._session_key_belongs_to_session(key, session_id)
+        ]
+
+    def _session_has_unsettled_events(self, session_id: str) -> bool:
+        """该会话是否还有未收口的事件（已登记、尚未发出 event_result）。"""
+        state = self._active_state()
+        for registry in (
+            state.session_running_event_ids,
+            state.session_next_run_event_ids,
+            state.session_open_event_ids,
+        ):
+            for key, event_ids in registry.items():
+                if event_ids and self._session_key_belongs_to_session(key, session_id):
+                    return True
+        return False
 
     def _session_has_queued_work(self, session_key: str) -> bool:
         """会话是否还有排队待处理的消息（pending 队列或文本防抖缓冲）。
