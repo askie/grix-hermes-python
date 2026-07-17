@@ -823,21 +823,31 @@ class GrixTransportClient:
 
     async def _heartbeat_loop(self, heartbeat_sec: int) -> None:
         interval = max(heartbeat_sec, 5)
+        failures = 0
         try:
             while True:
                 await asyncio.sleep(interval)
-                await self.request(
-                    "ping",
-                    {"ts": _now_ms()},
-                    expected=("pong",),
-                    timeout_ms=min(interval * 1000, 15_000),
-                )
+                try:
+                    await self.request(
+                        "ping",
+                        {"ts": _now_ms()},
+                        expected=("pong",),
+                        timeout_ms=min(interval * 1000, 15_000),
+                    )
+                    failures = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if self._disconnect_requested:
+                        return
+                    # 单次 pong 超时可能只是链路拥塞（如重连补发洪峰把心跳挤在队列后），
+                    # 连续两次才判死，避免误杀健康但拥塞的连接形成断连-补发循环。
+                    failures += 1
+                    if failures >= 2:
+                        await self.disconnect(f"heartbeat failed: {exc}")
+                        return
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            if self._disconnect_requested:
-                return
-            await self.disconnect(f"heartbeat failed: {exc}")
 
     async def _send_packet_internal(
         self,
