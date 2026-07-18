@@ -2539,6 +2539,46 @@ class GrixAdapter(BasePlatformAdapter):
                 message.event_id,
             )
 
+        # 队列前置拦截（网关的同款拦截点在 handle_message 之后，被队列门控
+        # 挡住够不着，必须在这里等价复刻）：
+        # 1. clarify 文本回答——clarify 阻塞的轮次占着本会话执行槽位，打字
+        #    回答若按普通消息入队会排在该轮之后，clarify 只能等到超时。
+        #    与网关 run.py 拦截语义一致：非斜杠文本、命中待答 clarify 即解锁
+        #    并收口事件（agent 线程恢复后自己产出下一条用户可见消息）。
+        text_stripped = (message.text or "").strip()
+        if text_stripped and not text_stripped.startswith("/"):
+            resolved_clarify = False
+            try:
+                from tools.clarify_gateway import resolve_text_response_for_session
+            except ImportError:
+                resolve_text_response_for_session = None
+            if resolve_text_response_for_session is not None:
+                try:
+                    resolved_clarify = bool(
+                        resolve_text_response_for_session(session_key, text_stripped)
+                    )
+                except Exception:
+                    logger.exception(
+                        "[%s] clarify text-resolve failed event_id=%s session_key=%s",
+                        self.name, message.event_id, session_key,
+                    )
+            if resolved_clarify:
+                logger.info(
+                    "[%s] GRIX clarify text response intercepted event_id=%s session_key=%s",
+                    self.name, message.event_id, session_key,
+                )
+                await self._complete_event_if_needed(
+                    message.event_id, status=STATUS_RESPONDED,
+                )
+                return
+
+        # 2. 斜杠命令——网关本就支持在轮次运行中处理命令（/status、/new、
+        #    /queue、/approve 等），入队会把它们卡在长任务后面，因此绕过
+        #    队列直接投递，保持与入队前完全相同的即时命令语义。
+        if text_stripped.startswith("/"):
+            await self._dispatch_grix_event(message, source, session_key)
+            return
+
         # 消息事件统一先进显式队列（对齐 connector）：同会话已有执行中事件时
         # 排队等待，空闲则立即投递（submit 内同步触发 _on_queue_deliver）。
         # 队满拒绝 / 排队超时 / 取消由队列的 state_change 回调统一收口。

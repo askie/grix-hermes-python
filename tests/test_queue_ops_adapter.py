@@ -361,6 +361,109 @@ def test_event_stop_removes_queued_event_silently():
     assert not inst._event_queue.is_queued("e2")
 
 
+# ── 队列前置拦截：clarify 文本回答 / 斜杠命令绕行 ───────────────────────
+
+
+def _prepare_packet_adapter(monkeypatch, client):
+    """装一个能把 event_msg 包跑到队列门控的 adapter（其余依赖打桩）。"""
+    monkeypatch.setattr(
+        adapter_mod, "build_session_key", lambda source, **kw: f"sk:{source.chat_id}"
+    )
+    inst = _make_adapter(client)
+    inst.build_source = lambda **kw: SimpleNamespace(
+        chat_id=kw.get("chat_id"),
+        chat_type=kw.get("chat_type", "dm"),
+        user_id=kw.get("user_id"),
+        thread_id=kw.get("thread_id"),
+        chat_name=kw.get("chat_name"),
+        chat_topic=kw.get("chat_topic"),
+    )
+    inst._schedule_session_route_bind = lambda **kw: None
+
+    async def _ack(**kw):
+        return None
+
+    client.acknowledge_event = _ack
+    return inst
+
+
+def _text_packet(event_id, content, session_id="s1"):
+    return {
+        "event_id": event_id,
+        "session_id": session_id,
+        "msg_id": f"m-{event_id}",
+        "sender_id": "u1",
+        "event_type": "user_chat",
+        "content": content,
+    }
+
+
+def _install_fake_clarify(resolved, calls):
+    module = types.ModuleType("tools.clarify_gateway")
+
+    def resolve_text_response_for_session(session_key, response):
+        calls.append((session_key, response))
+        return resolved
+
+    module.resolve_text_response_for_session = resolve_text_response_for_session
+    sys.modules["tools.clarify_gateway"] = module
+    return module
+
+
+def test_clarify_text_answer_bypasses_queue(monkeypatch):
+    """clarify 阻塞占槽时，打字回答必须直接解锁 clarify 而不是排队等超时。"""
+    client = FakeTransportClient()
+    inst = _prepare_packet_adapter(monkeypatch, client)
+    calls = []
+    _install_fake_clarify(True, calls)
+    try:
+        # clarify 所在轮次占着 sk:s1 槽位
+        inst._event_queue.submit(_item(inst, "e-run", group_key="sk:s1"))
+        _run_with_ctx(
+            inst, client, inst._handle_message_packet(_text_packet("e-ans", "选方案A"))
+        )
+    finally:
+        sys.modules.pop("tools.clarify_gateway", None)
+
+    assert calls == [("sk:s1", "选方案A")]
+    # 回答事件即刻收口，不入队
+    assert {"event_id": "e-ans", "status": "responded", "message": None} in client.completed
+    assert inst._event_queue.queued_count == 0
+    assert inst._delivered == []
+
+
+def test_text_without_pending_clarify_goes_through_queue(monkeypatch):
+    """没有待答 clarify 时，普通文本照常走队列（空闲即投递）。"""
+    client = FakeTransportClient()
+    inst = _prepare_packet_adapter(monkeypatch, client)
+    calls = []
+    _install_fake_clarify(False, calls)
+    try:
+        _run_with_ctx(
+            inst, client, inst._handle_message_packet(_text_packet("e-1", "正常消息"))
+        )
+    finally:
+        sys.modules.pop("tools.clarify_gateway", None)
+
+    assert calls and calls[0][1] == "正常消息"
+    assert inst._delivered == ["e-1"]
+    assert inst._event_queue.is_running("e-1")
+
+
+def test_slash_command_bypasses_queue_when_busy(monkeypatch):
+    """斜杠命令绕过队列直接投递：网关支持忙时处理命令，不能被长任务卡住。"""
+    client = FakeTransportClient()
+    inst = _prepare_packet_adapter(monkeypatch, client)
+    inst._event_queue.submit(_item(inst, "e-run", group_key="sk:s1"))
+    _run_with_ctx(
+        inst, client, inst._handle_message_packet(_text_packet("e-cmd", "/status"))
+    )
+    # 命令即时投递，不占队列
+    assert inst._delivered[-1] == "e-cmd"
+    assert inst._event_queue.queued_count == 0
+    assert not inst._event_queue.is_running("e-cmd")
+
+
 # ── 收口即释放槽位并续投 ─────────────────────────────────────────────────
 
 
