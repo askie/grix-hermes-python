@@ -28,6 +28,7 @@ from .contract import (
     CMD_PING,
     CMD_PONG,
     CMD_QUEUE_CLEAR_RESULT,
+    CMD_QUEUE_REORDER_RESULT,
     CMD_QUEUE_SNAPSHOT,
     CMD_SEND_ACK,
     CMD_SEND_MSG,
@@ -614,15 +615,19 @@ class GrixTransportClient:
         event_id: str,
         accepted: bool,
         reason: Optional[str] = None,
+        final_state: Optional[str] = None,
     ) -> None:
         """对服务端 event_cancel 请求的回应。
 
-        accepted=True 表示已接受取消；reason 解释拒绝或失败原因。
+        accepted=True 表示已接受取消；final_state 为事件的最终生命周期状态
+        （如 canceled）；reason 解释拒绝或失败原因。
         """
         payload: Dict[str, Any] = {
             "event_id": event_id.strip(),
             "accepted": accepted,
         }
+        if final_state:
+            payload["final_state"] = final_state.strip()
         if reason:
             payload["reason"] = reason.strip()
         await self.send_packet(CMD_EVENT_CANCEL_RESULT, payload)
@@ -632,16 +637,31 @@ class GrixTransportClient:
         *,
         session_id: str,
         success: bool,
+        canceled_event_ids: Optional[List[str]] = None,
         message: Optional[str] = None,
     ) -> None:
-        """对服务端 queue_clear 请求的回应。"""
+        """对服务端 queue_clear 请求的回应（对齐 connector：带被取消的事件 id 列表）。"""
         payload: Dict[str, Any] = {
             "session_id": session_id.strip(),
             "success": success,
+            "canceled_event_ids": list(canceled_event_ids or []),
         }
         if message:
             payload["msg"] = message.strip()
         await self.send_packet(CMD_QUEUE_CLEAR_RESULT, payload)
+
+    async def send_queue_reorder_result(
+        self,
+        *,
+        session_id: str,
+        applied_event_ids: List[str],
+    ) -> None:
+        """对服务端 queue_reorder 请求的回应：应用后的实际排队顺序（队头在前）。"""
+        payload: Dict[str, Any] = {
+            "session_id": session_id.strip(),
+            "applied_event_ids": list(applied_event_ids),
+        }
+        await self.send_packet(CMD_QUEUE_REORDER_RESULT, payload)
 
     async def send_event_state(
         self,
@@ -666,20 +686,22 @@ class GrixTransportClient:
         self,
         *,
         session_id: str,
-        events: List[Any],
-        extra: Optional[Dict[str, Any]] = None,
+        running: List[str],
+        running_items: List[Dict[str, Any]],
+        queued: List[Dict[str, Any]],
     ) -> None:
-        """主动上报会话事件队列快照，由后端透传给 APP 端。
+        """主动上报会话事件队列快照，由后端透传给 APP 端（对齐 connector 载荷结构）。
 
-        events 为本会话当前队列内的事件描述列表，结构由 Agent 自行定义。
+        running 为正在执行的事件 id 列表；running_items / queued 为对应事件
+        描述（event_id、content_preview、position、actions 等）。
         """
         payload: Dict[str, Any] = {
             "session_id": session_id.strip(),
-            "events": list(events),
+            "running": list(running),
+            "running_items": list(running_items),
+            "queued": list(queued),
             "updated_at": _now_ms(),
         }
-        if extra:
-            payload.update(extra)
         await self.send_packet(CMD_QUEUE_SNAPSHOT, payload)
 
     async def bind_session_route(

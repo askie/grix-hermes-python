@@ -128,6 +128,9 @@ class GrixConnectionConfig:
     # agent 共享：为某被共享者建立独立 WS 连接时携带（连同主人 api_key）。
     # 后端据此把本连接身份认定为该被共享者；为空/None 表示主连接（主人本人）。
     shared_owner_id: Optional[str] = None
+    # 事件队列能力描述符（auth 握手时声明，对齐 connector 的 concurrency 字段），
+    # 键：max_concurrent / max_queued / queue_timeout_ms / cancelable_queued / cancelable_running。
+    concurrency: Optional[Dict[str, Any]] = None
 
 
 def _resolve_client_version() -> str:
@@ -190,7 +193,25 @@ def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> Gr
             1_000,
             300_000,
         ),
+        concurrency=resolve_event_queue_settings(extra),
     )
+
+
+def resolve_event_queue_settings(extra: Dict[str, Any]) -> Dict[str, Any]:
+    """从插件配置解析事件队列参数（含 auth 握手声明用的能力描述符）。
+
+    与 connector 的 concurrency 描述符字段一一对应。每会话串行执行
+    （max_concurrent=1），排队深度与超时可通过 ``event_queue`` 配置段覆盖。
+    """
+    raw = extra.get("event_queue")
+    settings = raw if isinstance(raw, dict) else {}
+    return {
+        "max_concurrent": 1,
+        "max_queued": clamp_int(settings.get("max_queued"), 5, 0, 100),
+        "queue_timeout_ms": clamp_int(settings.get("queue_timeout_ms"), 0, 0, 86_400_000),
+        "cancelable_queued": True,
+        "cancelable_running": True,
+    }
 
 
 @dataclass(frozen=True)
@@ -314,6 +335,9 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     # agent 共享：被共享者连接握手时带 shared_owner_id，后端据此认定本连接身份。
     if config.shared_owner_id:
         payload["shared_owner_id"] = config.shared_owner_id
+    # 事件队列能力声明（对齐 connector）：后端/APP 据此启用队列 UI 与操作。
+    if config.concurrency:
+        payload["concurrency"] = dict(config.concurrency)
     host_meta = {
         "hostname": get_hostname(),
         "platform": platform.system().lower(),
@@ -790,6 +814,48 @@ def normalize_queue_clear(payload: Dict[str, Any]) -> GrixQueueClearEvent:
         raise ValueError("queue_clear requires session_id")
 
     return GrixQueueClearEvent(
+        session_id=session_id,
+        raw=dict(payload),
+    )
+
+
+@dataclass(frozen=True)
+class GrixQueueReorderEvent:
+    session_id: str
+    ordered_event_ids: tuple[str, ...]
+    raw: Dict[str, Any] = None
+
+
+@dataclass(frozen=True)
+class GrixQueueSnapshotQueryEvent:
+    session_id: str
+    raw: Dict[str, Any] = None
+
+
+def normalize_queue_reorder(payload: Dict[str, Any]) -> GrixQueueReorderEvent:
+    session_id = normalize_id(payload.get("session_id"))
+    if not session_id:
+        raise ValueError("queue_reorder requires session_id")
+
+    raw_ids = payload.get("ordered_event_ids")
+    ordered = tuple(
+        normalize_id(entry)
+        for entry in (raw_ids if isinstance(raw_ids, (list, tuple)) else ())
+        if normalize_id(entry)
+    )
+    return GrixQueueReorderEvent(
+        session_id=session_id,
+        ordered_event_ids=ordered,
+        raw=dict(payload),
+    )
+
+
+def normalize_queue_snapshot_query(payload: Dict[str, Any]) -> GrixQueueSnapshotQueryEvent:
+    session_id = normalize_id(payload.get("session_id"))
+    if not session_id:
+        raise ValueError("queue_snapshot_query requires session_id")
+
+    return GrixQueueSnapshotQueryEvent(
         session_id=session_id,
         raw=dict(payload),
     )

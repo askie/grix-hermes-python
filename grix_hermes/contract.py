@@ -44,8 +44,11 @@ CMD_EVENT_CANCEL = "event_cancel"
 CMD_EVENT_CANCEL_RESULT = "event_cancel_result"
 CMD_QUEUE_CLEAR = "queue_clear"
 CMD_QUEUE_CLEAR_RESULT = "queue_clear_result"
+CMD_QUEUE_REORDER = "queue_reorder"
+CMD_QUEUE_REORDER_RESULT = "queue_reorder_result"
 CMD_EVENT_STATE = "event_state"
 CMD_QUEUE_SNAPSHOT = "queue_snapshot"
+CMD_QUEUE_SNAPSHOT_QUERY = "queue_snapshot_query"
 
 # agent 共享：后端 → 主连接下行命令，载荷 {agent_id: str, shared_to: [str, ...]}。
 # Hermes 收到后 diff 名单，为每个被共享者维护一条独立 WS 连接
@@ -76,8 +79,11 @@ STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_EVENT_CANCEL_RESULT, "direction": "client_to_server", "purpose": "cancel_event_result"},
     {"cmd": CMD_QUEUE_CLEAR, "direction": "server_to_client", "purpose": "clear_event_queue_request"},
     {"cmd": CMD_QUEUE_CLEAR_RESULT, "direction": "client_to_server", "purpose": "clear_event_queue_result"},
+    {"cmd": CMD_QUEUE_REORDER, "direction": "server_to_client", "purpose": "reorder_event_queue_request"},
+    {"cmd": CMD_QUEUE_REORDER_RESULT, "direction": "client_to_server", "purpose": "reorder_event_queue_result"},
     {"cmd": CMD_EVENT_STATE, "direction": "client_to_server", "purpose": "report_event_state"},
     {"cmd": CMD_QUEUE_SNAPSHOT, "direction": "client_to_server", "purpose": "report_event_queue_snapshot"},
+    {"cmd": CMD_QUEUE_SNAPSHOT_QUERY, "direction": "server_to_client", "purpose": "query_event_queue_snapshot"},
     {"cmd": CMD_EVENT_EDIT, "direction": "server_to_client", "purpose": "message_edit_event"},
     {"cmd": CMD_EVENT_REVOKE, "direction": "server_to_client", "purpose": "message_revoke_event"},
     {"cmd": CMD_SEND_MSG, "direction": "client_to_server", "purpose": "send_message"},

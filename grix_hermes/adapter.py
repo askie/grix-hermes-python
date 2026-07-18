@@ -50,6 +50,8 @@ from .contract import (
     CMD_KICKED,
     CMD_LOCAL_ACTION,
     CMD_QUEUE_CLEAR,
+    CMD_QUEUE_REORDER,
+    CMD_QUEUE_SNAPSHOT_QUERY,
     ERR_APPROVAL_NOT_FOUND,
     ERR_INVALID_LOCAL_ACTION,
     ERR_MISSING_APPROVAL_ID,
@@ -86,8 +88,21 @@ from .protocol import (
     normalize_inbound_message,
     normalize_local_action,
     normalize_queue_clear,
+    normalize_queue_reorder,
+    normalize_queue_snapshot_query,
     normalize_revoke_event,
     normalize_stop_event,
+    resolve_event_queue_settings,
+)
+from .event_queue import (
+    EventQueue,
+    EventQueueConfig,
+    QueueItem,
+    STATE_CANCELED as QUEUE_STATE_CANCELED,
+    STATE_FAILED as QUEUE_STATE_FAILED,
+    STATE_QUEUED as QUEUE_STATE_QUEUED,
+    STATE_RUNNING as QUEUE_STATE_RUNNING,
+    build_preview,
 )
 from .transport import (
     AIOHTTP_AVAILABLE,
@@ -541,6 +556,20 @@ class GrixAdapter(BasePlatformAdapter):
         # 注入当前轮）那一刻，把它名下登记的事件移交给消费方（当前轮 running
         # 或下一轮 next_run），合并丢失 event_id 也不会漏收口。
         self._pending_messages = _PendingMessagesDict(self._on_pending_consumed)
+        # 显式事件队列（对齐 connector 的 EventQueue）：每会话同时只执行一条
+        # 消息事件，其余在这里排队，支持快照/单删/重排/清空。事件收口
+        # （_complete_event_if_needed）释放槽位并续投下一条。纯内存态，进程
+        # 重启即丢（与 connector 一致）。排队期间不额外点亮 composing——同会话
+        # 必有一条运行中事件，其轮次的 typing 心跳已覆盖该会话的 composing。
+        _queue_settings = resolve_event_queue_settings(dict(config.extra or {}))
+        self._event_queue = EventQueue(
+            EventQueueConfig(
+                max_queued=int(_queue_settings["max_queued"]),
+                queue_timeout_ms=int(_queue_settings["queue_timeout_ms"]),
+            ),
+            on_deliver=self._on_queue_deliver,
+            on_state_change=self._on_queue_state_change,
+        )
 
     @staticmethod
     def _owner_key_of(client: Optional[GrixTransportClient]) -> str:
@@ -952,6 +981,11 @@ class GrixAdapter(BasePlatformAdapter):
             self._upgrade_checker = None
         # agent 共享：置位 shutting_down,串行等在途 share-set 同步结束,避免关停后泄漏。
         self._shutting_down = True
+        # 清空事件队列：排队事件随进程关停丢弃（内存态语义，与 connector 一致），
+        # 同时取消所有排队超时定时器，避免关停后残留回调。
+        queue = getattr(self, "_event_queue", None)
+        if queue is not None:
+            queue.destroy()
         async with self._share_sync_lock:
             shared_clients = list(self._shared_clients.values())
             self._shared_clients.clear()
@@ -1973,6 +2007,10 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._handle_event_cancel_packet(payload)
             elif cmd == CMD_QUEUE_CLEAR:
                 await self._handle_queue_clear_packet(payload)
+            elif cmd == CMD_QUEUE_REORDER:
+                await self._handle_queue_reorder_packet(payload)
+            elif cmd == CMD_QUEUE_SNAPSHOT_QUERY:
+                await self._handle_queue_snapshot_query_packet(payload)
             elif cmd == CMD_KICKED:
                 await self._handle_kicked_packet(payload, source_client)
             elif cmd == CMD_CONTROL_SHARE_SET:
@@ -2501,6 +2539,35 @@ class GrixAdapter(BasePlatformAdapter):
                 message.event_id,
             )
 
+        # 消息事件统一先进显式队列（对齐 connector）：同会话已有执行中事件时
+        # 排队等待，空闲则立即投递（submit 内同步触发 _on_queue_deliver）。
+        # 队满拒绝 / 排队超时 / 取消由队列的 state_change 回调统一收口。
+        item = QueueItem(
+            event_id=message.event_id,
+            session_id=message.session_id,
+            group_key=session_key,
+            owner_key=self._active_owner_key(),
+            preview=build_preview(message.text),
+            payload=(message, source, session_key),
+        )
+        verdict = self._event_queue.submit(item)
+        logger.debug(
+            "[%s] GRIX event %s queue submit verdict=%s session_key=%s queued=%d running=%d",
+            self.name,
+            message.event_id,
+            verdict,
+            session_key,
+            self._event_queue.queued_count,
+            self._event_queue.running_count,
+        )
+
+    async def _dispatch_grix_event(
+        self,
+        message: GrixInboundMessage,
+        source: Any,
+        session_key: str,
+    ) -> None:
+        """把一条已获得执行槽位的消息事件投递给 hermes 处理（收口登记 + 兜底）。"""
         event_text = message.text
         context_block = _render_grix_context_block(message)
         if context_block:
@@ -2779,8 +2846,13 @@ class GrixAdapter(BasePlatformAdapter):
         self._active_state().message_session_keys.pop((revoke.session_id, revoke.message_id), None)
 
     async def _handle_event_cancel_packet(self, payload: Dict[str, Any]) -> None:
-        """处理后端下发的 event_cancel：取消某个进行中的事件并上报结果。"""
-        if not self._active_client():
+        """处理后端下发的 event_cancel：精确取消单个事件（对齐 connector）。
+
+        排队中 → 直接从队列摘除并以 canceled 收口；运行中 → 只停该事件所在
+        的执行轮次，不影响同会话其他排队事件；都不是 → accepted=False。
+        """
+        client = self._active_client()
+        if not client:
             return
 
         try:
@@ -2790,27 +2862,42 @@ class GrixAdapter(BasePlatformAdapter):
             return
 
         try:
-            source = self._active_state().latest_sources.get(cancel.session_id)
-            if source is None:
-                source = self.build_source(chat_id=cancel.session_id, chat_type="dm")
-            session_key = build_session_key(
-                source,
-                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            )
-            await self._force_stop_session(
-                source,
-                session_key,
-                reply_to=cancel.event_id,
-            )
-            await self._complete_event_if_needed(
-                cancel.event_id,
-                status=STATUS_FAILED,
-                message="event canceled by user",
-            )
-            await self._active_client().send_event_cancel_result(
+            if self._event_queue.cancel_queued(cancel.event_id):
+                # canceled 终态与快照由 state_change 回调统一上报。
+                await client.send_event_cancel_result(
+                    event_id=cancel.event_id,
+                    accepted=True,
+                    final_state="canceled",
+                )
+                return
+
+            item = self._event_queue.find(cancel.event_id)
+            if item is not None and self._event_queue.is_running(cancel.event_id):
+                _message, source, session_key = item.payload
+                await self._force_stop_session(
+                    source,
+                    session_key,
+                    reply_to=cancel.event_id,
+                )
+                # 正常由轮次的 CANCELLED 收口钩子上报终态；这里兜底一次
+                # （幂等），防止轮次尚未真正启动时取消信号丢失。
+                await self._complete_event_if_needed(
+                    cancel.event_id,
+                    status=STATUS_CANCELED,
+                    message="event canceled by user",
+                )
+                await client.send_event_cancel_result(
+                    event_id=cancel.event_id,
+                    accepted=True,
+                    final_state="canceled",
+                )
+                await self._push_queue_snapshot(item.session_id, item.owner_key)
+                return
+
+            await client.send_event_cancel_result(
                 event_id=cancel.event_id,
-                accepted=True,
+                accepted=False,
+                reason="event not found or not cancelable",
             )
         except Exception as exc:
             logger.error(
@@ -2821,7 +2908,7 @@ class GrixAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             try:
-                await self._active_client().send_event_cancel_result(
+                await client.send_event_cancel_result(
                     event_id=cancel.event_id,
                     accepted=False,
                     reason=str(exc),
@@ -2830,8 +2917,13 @@ class GrixAdapter(BasePlatformAdapter):
                 pass
 
     async def _handle_queue_clear_packet(self, payload: Dict[str, Any]) -> None:
-        """处理后端下发的 queue_clear：清空某会话的待处理队列并上报结果。"""
-        if not self._active_client():
+        """处理后端下发的 queue_clear：清空某会话的排队事件并上报结果。
+
+        对齐 connector：只清"排队中（尚未运行）"的事件（逐条以 canceled 收口），
+        不打断正在运行的轮次——停止运行中事件走 event_stop / event_cancel。
+        """
+        client = self._active_client()
+        if not client:
             return
 
         try:
@@ -2840,59 +2932,20 @@ class GrixAdapter(BasePlatformAdapter):
             logger.warning("[%s] invalid queue_clear payload: %s", self.name, exc)
             return
 
+        owner_key = self._active_owner_key()
         try:
-            # grix-hermes 是消息适配器，没有显式队列；按本地状态清空所有
-            # 与该 session_id 关联的进行中处理与 pending 事件。
-            # session_key 由 hermes-agent 拼成 "agent:main:<platform>:<chat_type>:<chat_id>[:<extra>]"
-            # 形式，session_id 等于 chat_id，因此用冒号边界限定匹配，避免子串误伤。
-            session_id = clear.session_id
-            mid_marker = f":{session_id}:"
-            end_marker = f":{session_id}"
-
-            def _matches(key: str) -> bool:
-                return mid_marker in key or key.endswith(end_marker)
-
-            session_keys = [key for key in list(self._active_sessions) if _matches(key)]
-            for key in session_keys:
-                source = None
-                pending = self._pending_messages.get(key)
-                if pending is not None and getattr(pending, "source", None):
-                    source = pending.source
-                if source is None:
-                    source = self._active_state().latest_sources.get(session_id)
-                if source is None:
-                    source = self.build_source(chat_id=session_id, chat_type="dm")
-                await self._force_stop_session(source, key, reply_to=None)
-
-            # 清掉残留 pending 事件（同样按 session_id 边界匹配）。内部丢弃，
-            # 绕过 pending pop 通知；事件收口统一由下面的登记表扫尾完成
-            # （pending 事件在派发时已全部登记，含合并后 event_id 丢失的）。
-            for key in list(self._pending_messages.keys()):
-                if _matches(key):
-                    dict.pop(self._pending_messages, key, None)
-
-            # 以终态收口该会话全部未完成事件（未归属 / 已归属下一轮 / 运行中）。
-            # pending 事件已 ack 给平台，静默丢弃会让平台侧 durable run 与
-            # 会话任务状态永远停留在 running（幽灵任务）。状态对齐 connector：
-            # 队列清空上报 canceled。
-            state = self._active_state()
-            for registry in (
-                state.session_open_event_ids,
-                state.session_next_run_event_ids,
-                state.session_running_event_ids,
-            ):
-                for key in [k for k in registry if _matches(k)]:
-                    for eid in registry.pop(key, []):
-                        await self._complete_event_if_needed(
-                            str(eid),
-                            status=STATUS_CANCELED,
-                            message="canceled by queue clear",
-                        )
-
-            await self._active_client().send_queue_clear_result(
-                session_id=session_id,
-                success=True,
+            cleared = self._event_queue.clear(
+                clear.session_id,
+                owner_key,
+                reason="canceled by queue clear",
             )
+            # 每条被清事件的 canceled 终态由 state_change 回调统一上报。
+            await client.send_queue_clear_result(
+                session_id=clear.session_id,
+                success=True,
+                canceled_event_ids=[item.event_id for item in cleared],
+            )
+            await self._push_queue_snapshot(clear.session_id, owner_key)
         except Exception as exc:
             logger.error(
                 "[%s] queue_clear handler failed for %s: %s",
@@ -2902,7 +2955,7 @@ class GrixAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             try:
-                await self._active_client().send_queue_clear_result(
+                await client.send_queue_clear_result(
                     session_id=clear.session_id,
                     success=False,
                     message=str(exc),
@@ -2910,8 +2963,217 @@ class GrixAdapter(BasePlatformAdapter):
             except Exception:
                 pass
 
+    async def _handle_queue_reorder_packet(self, payload: Dict[str, Any]) -> None:
+        """处理后端下发的 queue_reorder：按期望顺序重排某会话的排队事件。
+
+        愿望清单语义（对齐 connector）：清单里已出队的 id 忽略，队列里新入队
+        的项按原相对顺序排在尾部，绝不报错；回包带应用后的实际顺序。
+        """
+        client = self._active_client()
+        if not client:
+            return
+
+        try:
+            reorder = normalize_queue_reorder(payload)
+        except ValueError as exc:
+            logger.warning("[%s] invalid queue_reorder payload: %s", self.name, exc)
+            return
+
+        owner_key = self._active_owner_key()
+        try:
+            applied = self._event_queue.reorder(
+                reorder.session_id,
+                list(reorder.ordered_event_ids),
+                owner_key,
+            )
+            await client.send_queue_reorder_result(
+                session_id=reorder.session_id,
+                applied_event_ids=applied,
+            )
+            await self._push_queue_snapshot(reorder.session_id, owner_key)
+        except Exception as exc:
+            logger.error(
+                "[%s] queue_reorder handler failed for %s: %s",
+                self.name,
+                reorder.session_id,
+                exc,
+                exc_info=True,
+            )
+
+    async def _handle_queue_snapshot_query_packet(self, payload: Dict[str, Any]) -> None:
+        """处理后端下发的 queue_snapshot_query：立即回一条该会话的队列快照。
+
+        会话没有任何排队/运行事件时回空快照——前端靠它清理本地残留状态
+        （push 通道丢消息时的兜底通道，对齐 connector）。
+        """
+        if not self._active_client():
+            return
+
+        try:
+            query = normalize_queue_snapshot_query(payload)
+        except ValueError as exc:
+            logger.warning("[%s] invalid queue_snapshot_query payload: %s", self.name, exc)
+            return
+
+        await self._push_queue_snapshot(query.session_id, self._active_owner_key())
+
+    # ── 事件队列接线 ────────────────────────────────────────────────────
+
+    def _client_for_owner(self, owner_key: str) -> Optional[GrixTransportClient]:
+        """按 owner_key 解析当前存活连接：主连接或对应被共享者的子连接。"""
+        if owner_key and owner_key != _PRIMARY_OWNER_KEY:
+            return self._shared_clients.get(owner_key)
+        return self._client
+
+    def _on_queue_deliver(self, item: QueueItem) -> None:
+        """队列回调：事件获得执行槽位。派后台任务真正投递（回调本身须同步返回）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            logger.error(
+                "[%s] queue deliver without running loop event_id=%s", self.name, item.event_id,
+            )
+            return
+        loop.create_task(self._deliver_queued_event(item))
+
+    async def _deliver_queued_event(self, item: QueueItem) -> None:
+        """投递一条队列事件：还原来源连接上下文后走正常派发链路。
+
+        排队事件的投递发生在原 packet 上下文之外（上一轮收口触发的续投），
+        必须显式把 _CURRENT_CLIENT_CTX 还原为事件来源 owner 的存活连接，
+        保证回执/状态都从同一条连接发出。
+        """
+        message, source, session_key = item.payload
+        client = self._client_for_owner(item.owner_key)
+        token = _CURRENT_CLIENT_CTX.set(client)
+        try:
+            await self._dispatch_grix_event(message, source, session_key)
+        except Exception as exc:
+            logger.error(
+                "[%s] queued event dispatch failed event_id=%s: %s",
+                self.name,
+                item.event_id,
+                exc,
+                exc_info=True,
+            )
+            # _dispatch_grix_event 的异常路径已按 failed 收口（并释放槽位）；
+            # 这里只兜异常本身，避免炸掉投递任务。
+        finally:
+            _CURRENT_CLIENT_CTX.reset(token)
+
+    def _on_queue_state_change(self, item: QueueItem, state: str, meta: Dict[str, Any]) -> None:
+        """队列回调：事件状态变化。派后台任务上报（回调本身须同步返回）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._report_queue_state(item, state, dict(meta)))
+
+    async def _report_queue_state(self, item: QueueItem, state: str, meta: Dict[str, Any]) -> None:
+        """上报队列事件状态（event_state + 快照）；队列级终态补发 event_result。
+
+        canceled/failed 表示事件从未进入执行（排队中被取消/清空/超时/队满
+        拒绝），不会有轮次收口钩子替它发终态，必须在这里补发 event_result
+        （对齐 connector：queued 态终结需要发 event_result）。
+        """
+        client = self._client_for_owner(item.owner_key)
+        token = _CURRENT_CLIENT_CTX.set(client) if client is not None else None
+        try:
+            if client is not None:
+                extra: Dict[str, Any] = {"content_preview": item.preview}
+                if state == QUEUE_STATE_QUEUED:
+                    extra["queue_position"] = meta.get("queue_position")
+                    extra["queue_total"] = meta.get("queue_total")
+                    extra["actions"] = [{"type": "cancel"}]
+                elif state == QUEUE_STATE_RUNNING:
+                    extra["actions"] = [{"type": "stop"}]
+                elif meta.get("reason"):
+                    extra["reason"] = meta["reason"]
+                try:
+                    await client.send_event_state(
+                        event_id=item.event_id,
+                        session_id=item.session_id,
+                        state=state,
+                        extra=extra,
+                    )
+                except Exception as exc:
+                    logger.debug("[%s] send_event_state failed for %s: %s", self.name, item.event_id, exc)
+                await self._push_queue_snapshot(item.session_id, item.owner_key)
+
+            if state in (QUEUE_STATE_CANCELED, QUEUE_STATE_FAILED):
+                status = STATUS_CANCELED if state == QUEUE_STATE_CANCELED else STATUS_FAILED
+                await self._complete_event_if_needed(
+                    item.event_id,
+                    status=status,
+                    message=str(meta.get("reason") or ""),
+                )
+        finally:
+            if token is not None:
+                _CURRENT_CLIENT_CTX.reset(token)
+
+    async def _push_queue_snapshot(self, session_id: str, owner_key: str) -> None:
+        """向后端推送某会话的队列快照（空快照也推，供前端清理残留状态）。"""
+        client = self._client_for_owner(owner_key)
+        if client is None:
+            return
+        snap = self._event_queue.snapshot(session_id, owner_key)
+        running_items = [
+            {
+                "event_id": entry["event_id"],
+                "content_preview": entry["content_preview"],
+                "title": entry["content_preview"],
+                "summary": entry["content_preview"],
+                "actions": [{"type": "stop"}],
+            }
+            for entry in snap["running_items"]
+        ]
+        queued = [
+            {
+                "event_id": entry["event_id"],
+                "position": entry["position"],
+                "content_preview": entry["content_preview"],
+                "title": entry["content_preview"],
+                "summary": entry["content_preview"],
+                "actions": [{"type": "cancel"}],
+            }
+            for entry in snap["queued"]
+        ]
+        try:
+            await client.send_queue_snapshot(
+                session_id=session_id,
+                running=snap["running"],
+                running_items=running_items,
+                queued=queued,
+            )
+        except Exception as exc:
+            logger.debug("[%s] send_queue_snapshot failed for %s: %s", self.name, session_id, exc)
+
     async def _handle_stop_packet(self, payload: Dict[str, Any]) -> None:
         stop = normalize_stop_event(payload)
+
+        # 停的是"排队中（尚未运行）"的事件：精确摘除即可，不打断正在运行的
+        # 轮次、不动队列里其他事件（对齐 connector）。静默移除——不发 canceled
+        # 终态，只回 stop 协议（ack + stopped）。
+        removed = self._event_queue.remove_queued(stop.event_id)
+        if removed is not None:
+            logger.info(
+                "[%s] GRIX event_stop removed queued(not-running) event event_id=%s stop_id=%s session_id=%s",
+                self.name, stop.event_id, stop.stop_id, stop.session_id,
+            )
+            if self._client:
+                await self._active_client().acknowledge_stop(
+                    event_id=stop.event_id,
+                    stop_id=stop.stop_id,
+                    accepted=True,
+                )
+                await self._complete_stop(
+                    event_id=stop.event_id,
+                    stop_id=stop.stop_id,
+                    status=STATUS_STOPPED,
+                )
+            await self._push_queue_snapshot(removed.session_id, removed.owner_key)
+            return
+
         source = self._resolve_stop_source(stop)
         session_key = build_session_key(
             source,
@@ -3143,6 +3405,16 @@ class GrixAdapter(BasePlatformAdapter):
         status: str,
         message: Optional[str] = None,
     ) -> None:
+        # 事件收口是所有终态路径（responded/canceled/failed）的统一汇聚点：
+        # 无论后续能否上报，先释放该事件占用的队列槽位并触发续投（幂等）。
+        # 测试用 __new__ 构造的裸 adapter 没有 _event_queue，getattr 兜底。
+        queue = getattr(self, "_event_queue", None)
+        if queue is not None and event_id:
+            released = queue.find(event_id) if queue.is_running(event_id) else None
+            queue.complete(event_id)
+            if released is not None:
+                await self._push_queue_snapshot(released.session_id, released.owner_key)
+
         if not self._client or not event_id or event_id in self._active_state().completed_event_ids:
             return
         # 无论本次发送成功与否都先记录终态：收口发生在任务结束时（距事件到达
