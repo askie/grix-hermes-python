@@ -52,6 +52,7 @@ from .contract import (
     CMD_QUEUE_CLEAR,
     CMD_QUEUE_REORDER,
     CMD_QUEUE_SNAPSHOT_QUERY,
+    CMD_SKILL_SYNC,
     ERR_APPROVAL_NOT_FOUND,
     ERR_INVALID_LOCAL_ACTION,
     ERR_MISSING_APPROVAL_ID,
@@ -548,6 +549,7 @@ class GrixAdapter(BasePlatformAdapter):
         self._shutting_down = False
         # 自升级检查器
         self._upgrade_checker: Optional["UpgradeChecker"] = None
+        self._skill_syncer: Optional["SkillSyncer"] = None
         # 正在 handle_message 派发途中的事件（session_key → event_id 集合）。
         # 收口扫尾/排队归属都跳过这些事件：它们可能马上会入队/被认领，
         # 提前定归属就回到"任务没结束先报完成"的老毛病。
@@ -948,6 +950,7 @@ class GrixAdapter(BasePlatformAdapter):
         logger.info("[%s] Connected to %s", self.name, self.connection.endpoint)
         await self._report_skills()
         await self._start_upgrade_checker()
+        await self._start_skill_syncer()
         return True
 
     async def _report_skills(self, *, force: bool = True) -> None:
@@ -982,6 +985,11 @@ class GrixAdapter(BasePlatformAdapter):
         if self._upgrade_checker:
             self._upgrade_checker.stop()
             self._upgrade_checker = None
+        # getattr 防御：部分测试用 __new__ 构造 adapter 跳过 __init__（同 _event_queue 先例）。
+        skill_syncer = getattr(self, "_skill_syncer", None)
+        if skill_syncer:
+            skill_syncer.stop()
+            self._skill_syncer = None
         # agent 共享：置位 shutting_down,串行等在途 share-set 同步结束,避免关停后泄漏。
         self._shutting_down = True
         # 清空事件队列：排队事件已 ack 给平台，静默丢弃会留下永远 running 的
@@ -2030,6 +2038,16 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._handle_queue_snapshot_query_packet(payload)
             elif cmd == CMD_KICKED:
                 await self._handle_kicked_packet(payload, source_client)
+            elif cmd == CMD_SKILL_SYNC:
+                # 技能库变更提醒：立即触发本机下拉同步（轮询兜底仍在）。
+                logger.info(
+                    "[%s] skill_sync received owner=%s name=%s",
+                    self.name,
+                    payload.get("owner_id", ""),
+                    payload.get("name", ""),
+                )
+                if self._skill_syncer:
+                    self._skill_syncer.trigger_sync()
             elif cmd == CMD_CONTROL_SHARE_SET:
                 # 共享名单仅主连接处理：共享子连接虽然也可能收到，但 diff 须由主实例统一做。
                 if source_client is None or source_client is self._client:
@@ -2329,6 +2347,33 @@ class GrixAdapter(BasePlatformAdapter):
             logger.info("[%s] Upgrade checker started", self.name)
         except Exception as exc:
             logger.warning("[%s] Failed to start upgrade checker: %s", self.name, exc)
+
+    async def _start_skill_syncer(self) -> None:
+        """启动自定义技能下拉同步器（docs/architecture/38）。
+
+        落盘 ~/.hermes/skills（scan_hermes_skills 的既有扫描目录），同步有变化时
+        经 _report_skills(force=False) 刷新工具栏清单。启动失败不影响主链路。
+        """
+        try:
+            from .skill_syncer import SkillSyncer
+
+            # connect() 重入（宿主重连场景）时先停旧实例，避免双 loop 并行。
+            if self._skill_syncer:
+                self._skill_syncer.stop()
+                self._skill_syncer = None
+
+            async def _on_change() -> None:
+                await self._report_skills(force=False)
+
+            self._skill_syncer = SkillSyncer(
+                endpoint=self.connection.endpoint,
+                api_key=self.connection.api_key,
+                on_change=_on_change,
+            )
+            await self._skill_syncer.start()
+            logger.info("[%s] Skill syncer started", self.name)
+        except Exception as exc:
+            logger.warning("[%s] Failed to start skill syncer: %s", self.name, exc)
 
     def _gateway_is_busy(self) -> bool:
         """Whether the hosting gateway has agent runs in flight.
