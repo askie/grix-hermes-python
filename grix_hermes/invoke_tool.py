@@ -38,6 +38,8 @@ SUPPORTED_ACTIONS = {
     "chat_state_update": "Manually update the task state of a specific chat session (params: session_id, state, reason[optional])",
     "egg_search": "Search the egg marketplace (params: keyword, category_id, locale, page, page_size)",
     "egg_get": "Get egg details by ID (params: id[required], locale, version)",
+    "skill_set": "Create/update/delete an owner's custom skill in the multi-machine-synced skill library (params: name[required], content[required]; empty content deletes by name)",
+    "skill_get": "Read an owner's custom skill by name, or list the skill library when no name given (params: name[optional])",
 }
 
 GRIX_INVOKE_SCHEMA = {
@@ -55,7 +57,8 @@ GRIX_INVOKE_SCHEMA = {
         "  Agent dispatch: dispatch_agent, agent_introduction_update\n"
         "  Owner relay: call_owner, session_send\n"
         "  Chat state: chat_state_query, chat_state_update\n"
-        "  Egg marketplace: egg_search, egg_get"
+        "  Egg marketplace: egg_search, egg_get\n"
+        "  Custom skills (multi-machine synced): skill_set, skill_get"
     ),
     "parameters": {
         "type": "object",
