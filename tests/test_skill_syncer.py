@@ -237,6 +237,75 @@ def test_stop_clears_pending_rerun():
         assert state["round"] == 1
 
 
+def test_digest_change_refetches_and_overwrites():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        fetch1 = make_fetch(
+            [{"id": "10", "name": "a", "version": "1", "digest": "d1"}], {"10": "v1"}
+        )
+        asyncio.run(new_syncer(tmp, fetch1).sync_once())
+        assert (tmp / "a" / "SKILL.md").read_text(encoding="utf-8") == "v1"
+
+        fetch2 = make_fetch(
+            [{"id": "10", "name": "a", "version": "2", "digest": "d2"}], {"10": "v2"}
+        )
+        asyncio.run(new_syncer(tmp, fetch2).sync_once())
+        assert (tmp / "a" / "SKILL.md").read_text(encoding="utf-8") == "v2"
+        m = read_manifest(tmp)
+        assert m["skills"]["a"]["digest"] == "d2"
+        assert m["skills"]["a"]["version"] == "2"
+
+
+def test_collision_names_land_distinct_dirs_and_delete_one_keeps_other():
+    # a:b 与 a?b 净化后同为 a_b，靠原名哈希分目录；平台删其一不得伤及另一个。
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        fetch = make_fetch(
+            [
+                {"id": "30", "name": "a:b", "version": "1", "digest": "d1"},
+                {"id": "31", "name": "a?b", "version": "1", "digest": "d2"},
+            ],
+            {"30": "colon", "31": "question"},
+        )
+        asyncio.run(new_syncer(tmp, fetch).sync_once())
+        m = read_manifest(tmp)
+        dir_colon, dir_question = m["skills"]["a:b"]["dir"], m["skills"]["a?b"]["dir"]
+        assert dir_colon != dir_question
+        assert (tmp / dir_colon / "SKILL.md").read_text(encoding="utf-8") == "colon"
+        assert (tmp / dir_question / "SKILL.md").read_text(encoding="utf-8") == "question"
+
+        # 平台删掉 a:b → 只清它的目录，a?b 完好。
+        fetch2 = make_fetch(
+            [{"id": "31", "name": "a?b", "version": "1", "digest": "d2"}], {"31": "question"}
+        )
+        asyncio.run(new_syncer(tmp, fetch2).sync_once())
+        assert not (tmp / dir_colon).exists()
+        assert (tmp / dir_question / "SKILL.md").read_text(encoding="utf-8") == "question"
+        assert "a:b" not in read_manifest(tmp)["skills"]
+
+
+def test_dir_rule_migration_cleans_old_dir():
+    # 历史 manifest 记的旧目录名与新净化规则产出不同：迁到新目录并清掉旧目录。
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        old_dir = tmp / "a_b"
+        old_dir.mkdir(parents=True)
+        (old_dir / "SKILL.md").write_text("old", encoding="utf-8")
+        (tmp / ".grix-sync.json").write_text(
+            json.dumps({"skills": {"a:b": {"id": "30", "version": "1", "digest": "stale", "dir": "a_b"}}}),
+            encoding="utf-8",
+        )
+        fetch = make_fetch(
+            [{"id": "30", "name": "a:b", "version": "2", "digest": "d2"}], {"30": "new"}
+        )
+        asyncio.run(new_syncer(tmp, fetch).sync_once())
+        m = read_manifest(tmp)
+        new_dir = m["skills"]["a:b"]["dir"]
+        assert new_dir != "a_b"
+        assert (tmp / new_dir / "SKILL.md").read_text(encoding="utf-8") == "new"
+        assert not old_dir.exists()
+
+
 def test_on_change_fires_only_when_changed():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)

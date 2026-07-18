@@ -210,12 +210,14 @@ class SkillSyncer:
 
             self._write_manifest(manifest)
         finally:
-            self._running = False
+            # on_change 放在 running=False 之前（仍在防重入区内）：避免回调扫目录
+            # 期间新触发直接起新一轮同步与之交叠（审查建议）。
             if changed and self._on_change is not None:
                 try:
                     await self._on_change()
                 except Exception as exc:
                     logger.debug("[skill-sync] on_change callback failed: %s", exc)
+            self._running = False
             # 本轮期间到达过触发 → 补跑一轮收敛最新状态（已停则不补）。
             if self._rerun_pending:
                 self._rerun_pending = False
