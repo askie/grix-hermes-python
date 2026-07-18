@@ -3416,8 +3416,12 @@ class GrixAdapter(BasePlatformAdapter):
             self.name, stop.event_id, was_active,
         )
 
-        is_duplicate = self._remember_event_id(stop.event_id)
-        if is_duplicate:
+        # 停止指令的幂等只看"该事件的停止是否已完成过"（completed_stop_results）。
+        # 不能复用消息投递的 seen_event_ids 去重：stop 携带的 event_id 就是被停
+        # 事件的 id，投递时必然已记录，会把首次停止误判为重复而漏发 stop_result
+        # （connector 参考实现对 stop 不做事件级去重，每次都回终态）。
+        prior_stop = self._active_state().completed_stop_results.get(stop.event_id)
+        if prior_stop is not None:
             if self._client:
                 await self._active_client().acknowledge_stop(
                     event_id=stop.event_id,
@@ -3749,6 +3753,13 @@ class GrixAdapter(BasePlatformAdapter):
             return
         result = self._active_state().completed_stop_results.get(event_id)
         if not result:
+            # 缓存缺失（如清理淘汰）时兜底回终态，绝不静默吞掉 stop_result——
+            # 服务端收不到 result 会让停止按钮永久 loading。
+            await self._complete_stop(
+                event_id=event_id,
+                stop_id=stop_id,
+                status=STATUS_ALREADY_FINISHED,
+            )
             return
         await self._active_client().complete_stop(
             event_id=event_id,
