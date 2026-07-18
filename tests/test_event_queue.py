@@ -78,9 +78,9 @@ def test_submit_busy_group_queues_with_position():
     assert queue.submit(_item("e3")) == SUBMIT_QUEUED
     assert rec.delivered == ["e1"]
     queued_states = [s for s in rec.states if s[1] == STATE_QUEUED]
-    # e2 入队广播 pos 1/1；e3 入队后广播 e2=1/2、e3=2/2
-    assert queued_states[-2:] == [
-        ("e2", STATE_QUEUED, {"queue_position": 1, "queue_total": 2}),
+    # 入队只通知新项（对齐 connector）：e2=1/1、e3=2/2，不广播全会话
+    assert queued_states == [
+        ("e2", STATE_QUEUED, {"queue_position": 1, "queue_total": 1}),
         ("e3", STATE_QUEUED, {"queue_position": 2, "queue_total": 2}),
     ]
 
@@ -250,6 +250,26 @@ def test_pause_resume_gate():
     assert rec.delivered == []  # 还有 barrier 原因，闸门未开
     queue.resume("barrier")
     assert rec.delivered == ["e1"]
+
+
+def test_drain_all_queued_is_silent_and_complete():
+    queue, rec = _make_queue()
+    queue.submit(_item("e1"))
+    queue.submit(_item("e2"))
+    queue.submit(_item("x1", session_id="s2", group_key="g2"))
+    queue.submit(_item("x2", session_id="s2", group_key="g2"))
+    drained = queue.drain_all_queued()
+    assert [item.event_id for item in drained] == ["e2", "x2"]
+    assert queue.queued_count == 0
+    assert not any(state in (STATE_CANCELED, STATE_FAILED) for _, state, _ in rec.states)
+
+
+def test_session_refs_covers_running_and_queued():
+    queue, _rec = _make_queue()
+    queue.submit(_item("e1", session_id="s1"))
+    queue.submit(_item("e2", session_id="s1"))
+    queue.submit(_item("x1", session_id="s2", group_key="g2", owner_key="other"))
+    assert queue.session_refs() == [("s1", ""), ("s2", "other")]
 
 
 def test_build_preview():

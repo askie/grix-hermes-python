@@ -464,6 +464,107 @@ def test_slash_command_bypasses_queue_when_busy(monkeypatch):
     assert not inst._event_queue.is_running("e-cmd")
 
 
+# ── 审查修复回归：撤回摘队 / 投递竞态 / 编辑排队消息 / 取消回退 ─────────
+
+
+def test_revoke_removes_queued_event(monkeypatch):
+    """排队中消息被撤回：必须从队列摘除，不能轮到它时再投给 agent。"""
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._event_queue.submit(_item(inst, "e1"))
+    inst._event_queue.submit(_item(inst, "e2"))
+    state = inst._owner_states[""]
+    state.reply_event_ids[("s1", "m2")] = "e2"
+
+    async def _ack(**kw):
+        return None
+
+    client.acknowledge_event = _ack
+    _run_with_ctx(
+        inst,
+        client,
+        inst._handle_revoke_packet(
+            {"event_id": "rv-1", "session_id": "s1", "msg_id": "m2"}
+        ),
+    )
+    assert not inst._event_queue.is_queued("e2")
+    # 槽位上运行中的 e1 不受影响；e2 不会再被投递
+    assert inst._event_queue.is_running("e1")
+
+
+def test_canceled_before_delivery_task_runs_is_not_dispatched():
+    """竞态守卫：投递任务调度后、运行前事件被收口 → 放弃投递。"""
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1"))
+        # 投递任务已 create_task 但尚未运行，事件先被收口（模拟取消抢先）
+        inst._event_queue.complete("e1")
+        await _settle()
+
+    _run_with_ctx(inst, client, _flow())
+    assert inst._delivered == []
+
+
+def test_edit_updates_queued_message(monkeypatch):
+    """排队中消息被编辑：payload 文本就地替换，执行时用编辑后内容。"""
+    from grix_hermes.protocol import normalize_inbound_message
+
+    client = FakeTransportClient()
+    inst = _prepare_packet_adapter(monkeypatch, client)
+    message = normalize_inbound_message(_text_packet("e2", "旧内容"))
+    source = SimpleNamespace(chat_id="s1", thread_id=None)
+    inst._event_queue.submit(_item(inst, "e1"))
+    inst._event_queue.submit(
+        QueueItem(
+            event_id="e2",
+            session_id="s1",
+            group_key="g1",
+            owner_key="",
+            preview="旧内容",
+            payload=(message, source, "g1"),
+        )
+    )
+    _run_with_ctx(
+        inst,
+        client,
+        inst._handle_edit_packet(
+            {"session_id": "s1", "msg_id": "m-e2", "content": "新内容"}
+        ),
+    )
+    queued = inst._event_queue.find("e2")
+    assert queued is not None
+    assert queued.payload[0].text == "新内容"
+    assert queued.preview == "新内容"
+
+
+def test_event_cancel_falls_back_to_session_stop_for_untracked_event():
+    """队列不认识的事件（斜杠命令绕行直投）取消时回退旧语义：停会话轮次。"""
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._active_sessions["sk:s1"] = object()
+    stopped = []
+
+    async def _fake_force_stop(source, session_key, **kw):
+        stopped.append(session_key)
+        return True
+
+    inst._force_stop_session = _fake_force_stop
+    inst.build_source = lambda **kw: SimpleNamespace(
+        chat_id=kw.get("chat_id"), chat_type=kw.get("chat_type", "dm"),
+        user_id=None, thread_id=None,
+    )
+    _run_with_ctx(
+        inst,
+        client,
+        inst._handle_event_cancel_packet({"event_id": "cmd-ev", "session_id": "s1"}),
+    )
+    assert stopped == ["sk:s1"]
+    assert client.cancel_results[-1]["accepted"] is True
+    assert {"event_id": "cmd-ev", "status": "canceled", "message": "event canceled by user"} in client.completed
+
+
 # ── 收口即释放槽位并续投 ─────────────────────────────────────────────────
 
 

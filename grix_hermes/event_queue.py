@@ -124,8 +124,15 @@ class EventQueue:
     def group_busy(self, group_key: str) -> bool:
         return any(item.group_key == group_key for item in self._running.values())
 
-    def has_queued_for_group(self, group_key: str) -> bool:
-        return any(item.group_key == group_key for item in self._queued)
+    def queued_items(self) -> List[QueueItem]:
+        """排队中事件的只读快照副本（顺序即队列顺序）。"""
+        return list(self._queued)
+
+    def session_refs(self) -> List[tuple[str, str]]:
+        """当前持有事件（运行中或排队中）的全部 (session_id, owner_key) 组合。"""
+        refs = {(item.session_id, item.owner_key) for item in self._running.values()}
+        refs.update((item.session_id, item.owner_key) for item in self._queued)
+        return sorted(refs)
 
     def snapshot(self, session_id: str, owner_key: str = "") -> Dict[str, Any]:
         """按会话取快照：running / running_items / queued（含 1 起位置）。"""
@@ -187,7 +194,18 @@ class EventQueue:
             return SUBMIT_REJECTED
 
         self._queued.append(item)
-        self._notify_positions(item.session_id, item.owner_key)
+        # 只通知新入队项（对齐 connector enqueue）：追加在会话段尾部，其他
+        # 排队项位置不变，无须广播全会话（避免入队时的报文风暴）。
+        session_total = sum(
+            1
+            for queued in self._queued
+            if queued.session_id == item.session_id and queued.owner_key == item.owner_key
+        )
+        self._on_state_change(
+            item,
+            STATE_QUEUED,
+            {"queue_position": session_total, "queue_total": session_total},
+        )
         if self._config.queue_timeout_ms > 0:
             try:
                 loop = asyncio.get_running_loop()
@@ -287,6 +305,18 @@ class EventQueue:
                 self._queued[slot] = item
             self._notify_positions(session_id, owner_key)
         return [item.event_id for item in reordered]
+
+    def drain_all_queued(self) -> List[QueueItem]:
+        """静默撤出全部排队事件并返回（不发终态、不广播位置）。
+
+        用于关停路径：排队事件已 ack 给平台，调用方须逐条以终态收口后再
+        destroy，避免服务端 durable run 永远停留在 running（幽灵任务）。
+        """
+        drained = list(self._queued)
+        self._queued.clear()
+        for item in drained:
+            self._cancel_timeout(item.event_id)
+        return drained
 
     def destroy(self) -> None:
         for handle in self._timeout_handles.values():
