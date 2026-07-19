@@ -6,12 +6,22 @@ from typing import List, Optional, Tuple
 
 
 class SkillEntry:
-    __slots__ = ("name", "description", "source")
+    __slots__ = ("name", "description", "source", "managed", "file_path")
 
-    def __init__(self, name: str, description: str, source: str) -> None:
+    def __init__(
+        self,
+        name: str,
+        description: str,
+        source: str,
+        managed: bool = False,
+        file_path: Optional[Path] = None,
+    ) -> None:
         self.name = name
         self.description = description
         self.source = source
+        # 系统托管技能（package-bundled plugin_skills/）不可一键上传，见 docs/architecture/39。
+        self.managed = managed
+        self.file_path = file_path
 
 
 def parse_exec_command(text: str) -> Optional[Tuple[str, str]]:
@@ -51,7 +61,7 @@ def _parse_skill_frontmatter(content: str) -> dict:
     return result
 
 
-def _scan_skill_dir(base_dir: Path, source: str) -> List[SkillEntry]:
+def _scan_skill_dir(base_dir: Path, source: str, *, managed: bool = False) -> List[SkillEntry]:
     results: List[SkillEntry] = []
     if not base_dir.is_dir():
         return results
@@ -65,7 +75,15 @@ def _scan_skill_dir(base_dir: Path, source: str) -> List[SkillEntry]:
             try:
                 parsed = _parse_skill_frontmatter(skill_file.read_text(encoding="utf-8"))
                 if parsed["name"]:
-                    results.append(SkillEntry(name=parsed["name"], description=parsed["description"], source=source))
+                    results.append(
+                        SkillEntry(
+                            name=parsed["name"],
+                            description=parsed["description"],
+                            source=source,
+                            managed=managed,
+                            file_path=skill_file,
+                        )
+                    )
             except Exception:
                 pass
     except Exception:
@@ -77,13 +95,13 @@ def scan_hermes_skills() -> List[SkillEntry]:
     """Scan Hermes skill directories for SKILL.md files."""
     results: List[SkillEntry] = []
 
-    # Package-bundled plugin_skills/
+    # Package-bundled plugin_skills/：系统自带，不可一键上传。
     package_dir = Path(__file__).parent / "plugin_skills"
-    results.extend(_scan_skill_dir(package_dir, "plugin"))
+    results.extend(_scan_skill_dir(package_dir, "plugin", managed=True))
 
-    # User-level ~/.hermes/skills/
+    # User-level ~/.hermes/skills/：用户/agent 自建，可一键上传。
     home_skills = Path.home() / ".hermes" / "skills"
-    results.extend(_scan_skill_dir(home_skills, "global"))
+    results.extend(_scan_skill_dir(home_skills, "global", managed=False))
 
     return results
 

@@ -66,6 +66,7 @@ from .contract import (
     KICKED_REASON_AGENT_DELETED,
     LOCAL_ACTION_FILE_LIST,
     LOCAL_ACTION_GET_SESSION_USAGE,
+    LOCAL_ACTION_SKILL_UPLOAD,
     STATUS_ALREADY_FINISHED,
     STATUS_CANCELED,
     STATUS_FAILED,
@@ -961,15 +962,18 @@ class GrixAdapter(BasePlatformAdapter):
         用户新增/改名技能后无需整插件重启即可刷新工具栏清单。
         """
         try:
+            from pathlib import Path
             from .exec_command import scan_hermes_skills
+            from .skill_sync_state import annotate_sync_states
             entries = scan_hermes_skills()
-            skills = [
-                {"name": s.name, "description": s.description, "source": s.source}
-                for s in entries
-            ]
+            skills = annotate_sync_states(entries, Path.home() / ".hermes" / "skills")
             if not skills:
                 return
-            digest = json.dumps([f"{s['source']}:{s['name']}" for s in skills])
+            # 带上 sync_state：上传成功后即使 name/source 不变，状态翻转也要触发重报，
+            # 否则工具栏在下一次真正的清单变化前会一直显示旧状态。
+            digest = json.dumps(
+                [f"{s['source']}:{s['name']}:{s.get('sync_state')}" for s in skills]
+            )
             if not force and digest == self._last_skills_hash:
                 return
             self._last_skills_hash = digest
@@ -2207,6 +2211,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_get_session_usage(action)
             return
 
+        if action.action_type == LOCAL_ACTION_SKILL_UPLOAD:
+            await self._handle_skill_upload(action)
+            return
+
         if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
             await self._active_client().send_local_action_result(
                 action_id=action.action_id,
@@ -2323,6 +2331,49 @@ class GrixAdapter(BasePlatformAdapter):
             result=result.get("result"),
             error_code=result.get("error_code"),
             error_message=result.get("error_msg"),
+        )
+
+    async def _handle_skill_upload(self, action: GrixLocalAction) -> None:
+        """工具栏一键上传技能（docs/architecture/39 §4）。系统托管技能一律拒绝——
+        识别地基已在扫描阶段打好 managed 标记，这里直接复用（find_uploadable_skill）。
+        上传成功后依赖既有 skill_sync 广播 + SkillSyncer 更新本机台账，不重复维护。
+        """
+        if not self._active_client():
+            return
+        from .skill_upload import SkillUploadError, upload_skill
+
+        name = str((action.params or {}).get("name") or "").strip()
+        if not name:
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="MISSING_SKILL_NAME",
+                error_message="name is required",
+            )
+            return
+        try:
+            await upload_skill(name, self.connection.api_key, self.connection.endpoint)
+        except SkillUploadError as exc:
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="SKILL_UPLOAD_FAILED",
+                error_message=str(exc),
+            )
+            return
+        except Exception as exc:
+            logger.warning("[%s] skill_upload failed name=%s: %s", self.name, name, exc)
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="SKILL_UPLOAD_FAILED",
+                error_message=str(exc),
+            )
+            return
+        await self._active_client().send_local_action_result(
+            action_id=action.action_id,
+            status=STATUS_OK,
+            result={"name": name},
         )
 
     def _resolve_hermes_home(self) -> str:
