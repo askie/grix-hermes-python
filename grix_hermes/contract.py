@@ -46,6 +46,10 @@ CMD_QUEUE_CLEAR = "queue_clear"
 CMD_QUEUE_CLEAR_RESULT = "queue_clear_result"
 CMD_QUEUE_REORDER = "queue_reorder"
 CMD_QUEUE_REORDER_RESULT = "queue_reorder_result"
+CMD_EVENT_HOLD = "event_hold"
+CMD_EVENT_HOLD_RESULT = "event_hold_result"
+CMD_QUEUE_EDIT = "queue_edit"
+CMD_QUEUE_EDIT_RESULT = "queue_edit_result"
 CMD_EVENT_STATE = "event_state"
 CMD_QUEUE_SNAPSHOT = "queue_snapshot"
 CMD_QUEUE_SNAPSHOT_QUERY = "queue_snapshot_query"
@@ -86,6 +90,10 @@ STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_QUEUE_CLEAR_RESULT, "direction": "client_to_server", "purpose": "clear_event_queue_result"},
     {"cmd": CMD_QUEUE_REORDER, "direction": "server_to_client", "purpose": "reorder_event_queue_request"},
     {"cmd": CMD_QUEUE_REORDER_RESULT, "direction": "client_to_server", "purpose": "reorder_event_queue_result"},
+    {"cmd": CMD_EVENT_HOLD, "direction": "server_to_client", "purpose": "hold_or_release_queued_event_request"},
+    {"cmd": CMD_EVENT_HOLD_RESULT, "direction": "client_to_server", "purpose": "hold_or_release_queued_event_result"},
+    {"cmd": CMD_QUEUE_EDIT, "direction": "server_to_client", "purpose": "edit_queued_event_request"},
+    {"cmd": CMD_QUEUE_EDIT_RESULT, "direction": "client_to_server", "purpose": "edit_queued_event_result"},
     {"cmd": CMD_EVENT_STATE, "direction": "client_to_server", "purpose": "report_event_state"},
     {"cmd": CMD_QUEUE_SNAPSHOT, "direction": "client_to_server", "purpose": "report_event_queue_snapshot"},
     {"cmd": CMD_QUEUE_SNAPSHOT_QUERY, "direction": "server_to_client", "purpose": "query_event_queue_snapshot"},

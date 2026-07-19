@@ -35,6 +35,11 @@ STATE_FAILED = "failed"
 
 _PREVIEW_MAX_CHARS = 64
 
+# hold TTL（毫秒）：缺省 10 分钟，clamp 到 [1 分钟, 30 分钟]（对齐 connector）。
+HOLD_TTL_DEFAULT_MS = 600_000
+HOLD_TTL_MIN_MS = 60_000
+HOLD_TTL_MAX_MS = 1_800_000
+
 
 def build_preview(text: Optional[str]) -> str:
     """压缩空白并截断，生成队列项的内容预览（对齐 connector buildQueueItemTitle）。"""
@@ -61,6 +66,13 @@ class QueueItem:
     owner_key: str = ""
     preview: str = ""
     payload: Any = None
+    # 任务全文（入队时 = 消息全文；queue_edit 就地改写）。快照/event_state
+    # 透出给前端做编辑回填，preview 仍是 64 字截断供老前端展示。
+    content: str = ""
+    # hold（按 event_id 粒度的暂停）：held=True 时该项排到组队头队列原地
+    # 等待（不跳过、不变序），与会话级 pause 闸门相互独立、叠加生效。
+    held: bool = False
+    held_reason: str = ""
 
 
 @dataclass
@@ -93,6 +105,7 @@ class EventQueue:
         self._running: Dict[str, QueueItem] = {}
         self._queued: List[QueueItem] = []
         self._timeout_handles: Dict[str, asyncio.TimerHandle] = {}
+        self._hold_handles: Dict[str, asyncio.TimerHandle] = {}
         self._pause_reasons: set[str] = set()
         self._drain_scheduled = False
 
@@ -153,6 +166,9 @@ class EventQueue:
                     "event_id": item.event_id,
                     "position": position,
                     "content_preview": item.preview,
+                    "content": item.content,
+                    "held": item.held,
+                    "held_reason": item.held_reason,
                 }
                 for position, item in enumerate(queued_items, start=1)
             ],
@@ -175,6 +191,78 @@ class EventQueue:
         self._pause_reasons.discard(reason)
         if self._ready:
             self._drain()
+
+    # ── hold / release / edit（按 event_id 粒度，与全局 pause 闸门叠加） ──
+
+    def hold(self, event_id: str, *, reason: str = "", ttl_ms: int = 0) -> bool:
+        """暂停一个排队中的事件：排到组队头时整组原地等待（不跳过、不变序）。
+
+        - 仅命中 queued[]；运行中/不存在返回 False（协议层回 not_found）；
+        - 施加 hold 即豁免排队超时（否则 queue_timeout_ms 会把编辑中的任务
+          超时丢弃），release 时重挂；
+        - 挂 TTL 定时器，到期自动 release（App 被杀最多卡队列 TTL 时长）；
+          重复调用重置 TTL（续期语义）。
+        """
+        item = self._find_queued(event_id)
+        if item is None:
+            return False
+        item.held = True
+        item.held_reason = str(reason or "")
+        self._cancel_timeout(event_id)
+        self._cancel_hold(event_id)
+        ttl = ttl_ms if ttl_ms and ttl_ms > 0 else HOLD_TTL_DEFAULT_MS
+        ttl = max(HOLD_TTL_MIN_MS, min(HOLD_TTL_MAX_MS, ttl))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None:
+            self._hold_handles[event_id] = loop.call_later(
+                ttl / 1000,
+                self._hold_expired,
+                event_id,
+            )
+        self._notify_item(item)
+        return True
+
+    def release(self, event_id: str) -> bool:
+        """解除一个排队事件的 hold。命中 queued[] 即返回 True（未 held 幂等）。"""
+        item = self._find_queued(event_id)
+        if item is None:
+            return False
+        self._cancel_hold(event_id)
+        if not item.held:
+            return True
+        item.held = False
+        item.held_reason = ""
+        self._arm_timeout(item)
+        self._notify_item(item)
+        self._schedule_drain()
+        return True
+
+    def edit(self, event_id: str, new_text: str) -> Optional[QueueItem]:
+        """就地改写一个排队事件的文本并自动解除 hold。
+
+        返回被改写的 QueueItem 供上层同步 payload 里冻结的入站消息；
+        未命中 queued[]（运行中/不存在）返回 None。
+        """
+        item = self._find_queued(event_id)
+        if item is None:
+            return None
+        item.content = new_text
+        item.preview = build_preview(new_text)
+        self.release(event_id)
+        return item
+
+    def _hold_expired(self, event_id: str) -> None:
+        self._hold_handles.pop(event_id, None)
+        logger.info("event queue hold ttl expired, auto releasing event_id=%s", event_id)
+        self.release(event_id)
+
+    def _cancel_hold(self, event_id: str) -> None:
+        handle = self._hold_handles.pop(event_id, None)
+        if handle is not None:
+            handle.cancel()
 
     # ── 提交 / 完成 ───────────────────────────────────────────────────
 
@@ -206,17 +294,7 @@ class EventQueue:
             STATE_QUEUED,
             {"queue_position": session_total, "queue_total": session_total},
         )
-        if self._config.queue_timeout_ms > 0:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop is not None:
-                self._timeout_handles[item.event_id] = loop.call_later(
-                    self._config.queue_timeout_ms / 1000,
-                    self._timeout_event,
-                    item.event_id,
-                )
+        self._arm_timeout(item)
         return SUBMIT_QUEUED
 
     def complete(self, event_id: str) -> None:
@@ -266,6 +344,7 @@ class EventQueue:
         self._queued = remaining
         for item in cleared:
             self._cancel_timeout(item.event_id)
+            self._cancel_hold(item.event_id)
             self._on_state_change(item, STATE_CANCELED, {"reason": reason})
         if cleared:
             self._schedule_drain()
@@ -316,12 +395,16 @@ class EventQueue:
         self._queued.clear()
         for item in drained:
             self._cancel_timeout(item.event_id)
+            self._cancel_hold(item.event_id)
         return drained
 
     def destroy(self) -> None:
         for handle in self._timeout_handles.values():
             handle.cancel()
         self._timeout_handles.clear()
+        for handle in self._hold_handles.values():
+            handle.cancel()
+        self._hold_handles.clear()
         self._queued.clear()
         self._running.clear()
         self._pause_reasons.clear()
@@ -333,13 +416,35 @@ class EventQueue:
         self._on_state_change(item, STATE_RUNNING, {})
         self._on_deliver(item)
 
+    def _find_queued(self, event_id: str) -> Optional[QueueItem]:
+        for item in self._queued:
+            if item.event_id == event_id:
+                return item
+        return None
+
     def _take_queued(self, event_id: str) -> Optional[QueueItem]:
         for index, item in enumerate(self._queued):
             if item.event_id == event_id:
                 del self._queued[index]
                 self._cancel_timeout(event_id)
+                self._cancel_hold(event_id)
                 return item
         return None
+
+    def _arm_timeout(self, item: QueueItem) -> None:
+        """为排队项挂（重挂）排队超时定时器；queue_timeout_ms<=0 时为空操作。"""
+        if self._config.queue_timeout_ms <= 0:
+            return
+        self._cancel_timeout(item.event_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._timeout_handles[item.event_id] = loop.call_later(
+            self._config.queue_timeout_ms / 1000,
+            self._timeout_event,
+            item.event_id,
+        )
 
     def _timeout_event(self, event_id: str) -> None:
         self._timeout_handles.pop(event_id, None)
@@ -387,11 +492,35 @@ class EventQueue:
             if item.group_key in busy_groups:
                 index += 1
                 continue
+            if item.held:
+                # 组队首项被 hold：整组在队头原地等待（不跳过、不变序），
+                # 只阻塞该会话组，其他组照常出队。
+                busy_groups.add(item.group_key)
+                index += 1
+                continue
             del self._queued[index]
             self._cancel_timeout(item.event_id)
+            self._cancel_hold(item.event_id)
             busy_groups.add(item.group_key)
             self._start(item)
             self._notify_positions(item.session_id, item.owner_key)
+
+    def _notify_item(self, item: QueueItem) -> None:
+        """只向单个排队项广播当前 queued 状态（hold/release 后刷新前端展示）。"""
+        session_items = [
+            entry
+            for entry in self._queued
+            if entry.session_id == item.session_id and entry.owner_key == item.owner_key
+        ]
+        total = len(session_items)
+        for position, entry in enumerate(session_items, start=1):
+            if entry is item:
+                self._on_state_change(
+                    item,
+                    STATE_QUEUED,
+                    {"queue_position": position, "queue_total": total},
+                )
+                return
 
     def _notify_positions(self, session_id: str, owner_key: str) -> None:
         """向某会话的全部排队事件广播当前位置（1 起）与总数。"""

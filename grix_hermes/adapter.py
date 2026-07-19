@@ -44,12 +44,14 @@ from .contract import (
     CMD_CONTROL_SHARE_SET,
     CMD_EVENT_CANCEL,
     CMD_EVENT_EDIT,
+    CMD_EVENT_HOLD,
     CMD_EVENT_MSG,
     CMD_EVENT_REVOKE,
     CMD_EVENT_STOP,
     CMD_KICKED,
     CMD_LOCAL_ACTION,
     CMD_QUEUE_CLEAR,
+    CMD_QUEUE_EDIT,
     CMD_QUEUE_REORDER,
     CMD_QUEUE_SNAPSHOT_QUERY,
     CMD_SKILL_SYNC,
@@ -86,9 +88,11 @@ from .protocol import (
     build_connection_config,
     normalize_edit_event,
     normalize_event_cancel,
+    normalize_event_hold,
     normalize_inbound_message,
     normalize_local_action,
     normalize_queue_clear,
+    normalize_queue_edit,
     normalize_queue_reorder,
     normalize_queue_snapshot_query,
     normalize_revoke_event,
@@ -2034,6 +2038,10 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._handle_queue_clear_packet(payload)
             elif cmd == CMD_QUEUE_REORDER:
                 await self._handle_queue_reorder_packet(payload)
+            elif cmd == CMD_EVENT_HOLD:
+                await self._handle_event_hold_packet(payload)
+            elif cmd == CMD_QUEUE_EDIT:
+                await self._handle_queue_edit_packet(payload)
             elif cmd == CMD_QUEUE_SNAPSHOT_QUERY:
                 await self._handle_queue_snapshot_query_packet(payload)
             elif cmd == CMD_KICKED:
@@ -2651,6 +2659,7 @@ class GrixAdapter(BasePlatformAdapter):
             owner_key=self._active_owner_key(),
             preview=build_preview(message.text),
             payload=(message, source, session_key),
+            content=message.text or "",
         )
         verdict = self._event_queue.submit(item)
         logger.debug(
@@ -3166,6 +3175,189 @@ class GrixAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
 
+    def _find_owned_queued_item(
+        self, event_id: str, session_id: str, owner_key: str
+    ) -> Optional[QueueItem]:
+        """按 (event_id, session_id, owner_key) 精确命中一个「排队中」的事件。
+
+        运行中/不存在/会话不符/owner 不符（共享场景防串 owner）都视为未命中，
+        协议层统一回 not_found。
+        """
+        item = self._event_queue.find(event_id)
+        if item is None or self._event_queue.is_running(event_id):
+            return None
+        if item.session_id != session_id or item.owner_key != owner_key:
+            return None
+        return item
+
+    async def _handle_event_hold_packet(self, payload: Dict[str, Any]) -> None:
+        """处理后端下发的 event_hold：暂停/恢复单个排队事件（对齐 connector）。
+
+        仅命中 queued[]；hold=True 施加持有（重复调用重置 TTL），hold=False
+        解除。运行中/不存在 → ok=False error=not_found。
+        """
+        client = self._active_client()
+        if not client:
+            return
+
+        try:
+            hold_ev = normalize_event_hold(payload)
+        except ValueError as exc:
+            logger.warning("[%s] invalid event_hold payload: %s", self.name, exc)
+            try:
+                await client.send_event_hold_result(
+                    session_id=str(payload.get("session_id") or ""),
+                    event_id=str(payload.get("event_id") or ""),
+                    ok=False,
+                    held=False,
+                    error="bad_request",
+                )
+            except Exception:
+                pass
+            return
+
+        owner_key = self._active_owner_key()
+        try:
+            item = self._find_owned_queued_item(
+                hold_ev.event_id, hold_ev.session_id, owner_key
+            )
+            if item is None:
+                await client.send_event_hold_result(
+                    session_id=hold_ev.session_id,
+                    event_id=hold_ev.event_id,
+                    ok=False,
+                    held=False,
+                    error="not_found",
+                )
+                return
+
+            if hold_ev.hold:
+                self._event_queue.hold(
+                    hold_ev.event_id,
+                    reason=hold_ev.reason or "manual",
+                    ttl_ms=hold_ev.ttl_ms,
+                )
+            else:
+                self._event_queue.release(hold_ev.event_id)
+            await client.send_event_hold_result(
+                session_id=hold_ev.session_id,
+                event_id=hold_ev.event_id,
+                ok=True,
+                held=item.held,
+            )
+            await self._push_queue_snapshot(hold_ev.session_id, owner_key)
+        except Exception as exc:
+            logger.error(
+                "[%s] event_hold handler failed for %s: %s",
+                self.name,
+                hold_ev.event_id,
+                exc,
+                exc_info=True,
+            )
+            try:
+                await client.send_event_hold_result(
+                    session_id=hold_ev.session_id,
+                    event_id=hold_ev.event_id,
+                    ok=False,
+                    held=False,
+                    error="bad_request",
+                )
+            except Exception:
+                pass
+
+    async def _handle_queue_edit_packet(self, payload: Dict[str, Any]) -> None:
+        """处理后端下发的 queue_edit：改写单个排队事件的文本（对齐 connector）。
+
+        仅命中 queued[]；成功后自动解除该事件的 hold，并把 QueueItem.payload
+        里冻结的入站消息同步为新文本（否则轮到执行时用的还是旧文）。
+        """
+        client = self._active_client()
+        if not client:
+            return
+
+        try:
+            edit_ev = normalize_queue_edit(payload)
+        except ValueError as exc:
+            logger.warning("[%s] invalid queue_edit payload: %s", self.name, exc)
+            try:
+                await client.send_queue_edit_result(
+                    session_id=str(payload.get("session_id") or ""),
+                    event_id=str(payload.get("event_id") or ""),
+                    ok=False,
+                    error="bad_request",
+                )
+            except Exception:
+                pass
+            return
+
+        owner_key = self._active_owner_key()
+        try:
+            if not edit_ev.text.strip():
+                await client.send_queue_edit_result(
+                    session_id=edit_ev.session_id,
+                    event_id=edit_ev.event_id,
+                    ok=False,
+                    error="empty_content",
+                )
+                return
+
+            item = self._find_owned_queued_item(
+                edit_ev.event_id, edit_ev.session_id, owner_key
+            )
+            if item is None:
+                await client.send_queue_edit_result(
+                    session_id=edit_ev.session_id,
+                    event_id=edit_ev.event_id,
+                    ok=False,
+                    error="not_found",
+                )
+                return
+
+            updated = self._event_queue.edit(edit_ev.event_id, edit_ev.text)
+            if updated is None:
+                # 竞态兜底：find 与 edit 之间事件出队（理论上单线程不会发生）。
+                await client.send_queue_edit_result(
+                    session_id=edit_ev.session_id,
+                    event_id=edit_ev.event_id,
+                    ok=False,
+                    error="not_found",
+                )
+                return
+
+            # 同步 payload 里冻结的入站消息（与 _handle_edit_packet 同款）：
+            # 投递时用的是 payload[0].text，只改 content 不改 payload 会白编辑。
+            q_payload = updated.payload if isinstance(updated.payload, tuple) else None
+            q_message = q_payload[0] if q_payload else None
+            if q_message is not None and dataclasses.is_dataclass(q_message):
+                new_message = dataclasses.replace(q_message, text=edit_ev.text)
+                updated.payload = (new_message, q_payload[1], q_payload[2])
+            elif q_message is not None and hasattr(q_message, "text"):
+                q_message.text = edit_ev.text
+
+            await client.send_queue_edit_result(
+                session_id=edit_ev.session_id,
+                event_id=edit_ev.event_id,
+                ok=True,
+            )
+            await self._push_queue_snapshot(edit_ev.session_id, owner_key)
+        except Exception as exc:
+            logger.error(
+                "[%s] queue_edit handler failed for %s: %s",
+                self.name,
+                edit_ev.event_id,
+                exc,
+                exc_info=True,
+            )
+            try:
+                await client.send_queue_edit_result(
+                    session_id=edit_ev.session_id,
+                    event_id=edit_ev.event_id,
+                    ok=False,
+                    error="bad_request",
+                )
+            except Exception:
+                pass
+
     async def _handle_queue_snapshot_query_packet(self, payload: Dict[str, Any]) -> None:
         """处理后端下发的 queue_snapshot_query：立即回一条该会话的队列快照。
 
@@ -3277,7 +3469,12 @@ class GrixAdapter(BasePlatformAdapter):
         token = _CURRENT_CLIENT_CTX.set(client) if client is not None else None
         try:
             if client is not None:
-                extra: Dict[str, Any] = {"content_preview": item.preview}
+                extra: Dict[str, Any] = {
+                    "content_preview": item.preview,
+                    "content": item.content,
+                    "held": item.held,
+                    "held_reason": item.held_reason,
+                }
                 if state == QUEUE_STATE_QUEUED:
                     extra["queue_position"] = meta.get("queue_position")
                     extra["queue_total"] = meta.get("queue_total")
@@ -3340,6 +3537,9 @@ class GrixAdapter(BasePlatformAdapter):
                 "event_id": entry["event_id"],
                 "position": entry["position"],
                 "content_preview": entry["content_preview"],
+                "content": entry["content"],
+                "held": entry["held"],
+                "held_reason": entry["held_reason"],
                 "title": entry["content_preview"],
                 "summary": entry["content_preview"],
                 "actions": [{"type": "cancel"}],
