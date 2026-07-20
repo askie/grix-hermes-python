@@ -849,7 +849,9 @@ def normalize_event_hold(payload: Dict[str, Any]) -> GrixEventHoldEvent:
     return GrixEventHoldEvent(
         event_id=event_id,
         session_id=session_id,
-        hold=bool(payload.get("hold")),
+        # 缺省 true（与 connector 的 `payload.hold !== false` 对齐）：
+        # 前端总是显式传 hold，此缺省仅在字段缺失时兜底。
+        hold=payload.get("hold") is not False,
         reason=normalize_text(payload.get("reason")),
         ttl_ms=clamp_int(payload.get("ttl_ms"), 0, 0, 86_400_000),
         raw=dict(payload),

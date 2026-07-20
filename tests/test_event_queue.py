@@ -307,6 +307,20 @@ def test_hold_blocks_group_head_until_release():
     assert item.held is False and item.held_reason == ""
 
 
+def test_reorder_away_held_head_unblocks_queue():
+    queue, rec = _make_queue()
+    queue.submit(_item("e0"))
+    queue.submit(_item("e1"))
+    queue.submit(_item("e2"))
+    assert queue.hold("e1", reason="editing") is True
+    queue.complete("e0")  # drain 遇 held 组队首 e1 停住
+    assert rec.delivered == ["e0"]
+    # 用户把 held 的 e1 拖到队尾，e2 成为可执行的新队首：reorder 必须补 drain
+    queue.reorder("s1", ["e2", "e1"])
+    assert rec.delivered == ["e0", "e2"]
+    assert queue.is_queued("e1")
+
+
 def test_held_group_does_not_block_other_groups():
     queue, rec = _make_queue()
     queue.pause("setup")

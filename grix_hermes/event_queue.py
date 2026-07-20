@@ -383,6 +383,9 @@ class EventQueue:
             for slot, item in zip(slots, reordered):
                 self._queued[slot] = item
             self._notify_positions(session_id, owner_key)
+            # 重排可能把 held 的组队首移走、换上可执行的新队首（hold 引入的
+            # 新阻塞条件），必须补一次出队，否则该组停摆到下一次任意队列事件。
+            self._schedule_drain()
         return [item.event_id for item in reordered]
 
     def drain_all_queued(self) -> List[QueueItem]:
