@@ -49,7 +49,7 @@ def _make_queue(max_queued=5, queue_timeout_ms=0):
     return queue, rec
 
 
-def _item(event_id, session_id="s1", group_key="g1", owner_key="", preview=""):
+def _item(event_id, session_id="s1", group_key="g1", owner_key="", preview="", content=""):
     return QueueItem(
         event_id=event_id,
         session_id=session_id,
@@ -57,6 +57,7 @@ def _item(event_id, session_id="s1", group_key="g1", owner_key="", preview=""):
         owner_key=owner_key,
         preview=preview or event_id,
         payload=None,
+        content=content,
     )
 
 
@@ -218,7 +219,14 @@ def test_snapshot_shape():
     assert snap["running"] == ["e1"]
     assert snap["running_items"] == [{"event_id": "e1", "content_preview": "first"}]
     assert snap["queued"] == [
-        {"event_id": "e2", "position": 1, "content_preview": "second"}
+        {
+            "event_id": "e2",
+            "position": 1,
+            "content_preview": "second",
+            "content": "",
+            "held": False,
+            "held_reason": "",
+        }
     ]
     empty = queue.snapshot("unknown", "")
     assert empty == {"running": [], "running_items": [], "queued": []}
@@ -278,3 +286,223 @@ def test_build_preview():
     assert build_preview(None) == "Message"
     long = "x" * 100
     assert build_preview(long) == "x" * 64 + "..."
+
+
+# ── hold / release / edit ───────────────────────────────────────────────
+
+
+def test_hold_blocks_group_head_until_release():
+    queue, rec = _make_queue()
+    queue.submit(_item("e1"))
+    queue.submit(_item("e2"))
+    queue.submit(_item("e3"))
+    assert queue.hold("e2", reason="manual") is True
+    queue.complete("e1")  # 无运行 loop → 同步续投
+    # held 项排到组队头：整组原地等待，e3 不跳过、不变序
+    assert rec.delivered == ["e1"]
+    assert queue.is_queued("e2") and queue.is_queued("e3")
+    assert queue.release("e2") is True
+    assert rec.delivered == ["e1", "e2"]
+    item = queue.find("e2")
+    assert item.held is False and item.held_reason == ""
+
+
+def test_reorder_away_held_head_unblocks_queue():
+    queue, rec = _make_queue()
+    queue.submit(_item("e0"))
+    queue.submit(_item("e1"))
+    queue.submit(_item("e2"))
+    assert queue.hold("e1", reason="editing") is True
+    queue.complete("e0")  # drain 遇 held 组队首 e1 停住
+    assert rec.delivered == ["e0"]
+    # 用户把 held 的 e1 拖到队尾，e2 成为可执行的新队首：reorder 必须补 drain
+    queue.reorder("s1", ["e2", "e1"])
+    assert rec.delivered == ["e0", "e2"]
+    assert queue.is_queued("e1")
+
+
+def test_held_group_does_not_block_other_groups():
+    queue, rec = _make_queue()
+    queue.pause("setup")
+    queue.submit(_item("a1", group_key="ga"))
+    queue.submit(_item("b1", group_key="gb"))
+    assert queue.hold("a1", reason="manual") is True
+    queue.resume("setup")
+    # ga 队首被 hold 只阻塞 ga，gb 照常出队
+    assert rec.delivered == ["b1"]
+    assert queue.is_queued("a1")
+    queue.release("a1")
+    assert rec.delivered == ["b1", "a1"]
+
+
+def test_hold_release_edit_only_hit_queued():
+    queue, _rec = _make_queue()
+    queue.submit(_item("e1"))
+    assert queue.hold("e1", reason="manual") is False  # 运行中不可 hold
+    assert queue.hold("missing", reason="manual") is False
+    assert queue.release("e1") is False
+    assert queue.edit("e1", "x") is None
+    assert queue.edit("missing", "x") is None
+
+
+def test_release_on_unheld_queued_item_is_idempotent_ok():
+    queue, _rec = _make_queue()
+    queue.submit(_item("e1"))
+    queue.submit(_item("e2"))
+    assert queue.release("e2") is True
+    assert queue.find("e2").held is False
+
+
+def test_edit_rewrites_content_preview_and_auto_releases():
+    queue, rec = _make_queue()
+    queue.submit(_item("e1"))
+    queue.submit(_item("e2", content="旧内容"))
+    assert queue.hold("e2", reason="editing") is True
+    item = queue.edit("e2", "改后的  全文内容")
+    assert item is not None and item.event_id == "e2"
+    assert item.content == "改后的  全文内容"
+    assert item.preview == build_preview("改后的  全文内容")
+    assert item.held is False and item.held_reason == ""
+    # 编辑自动解除 hold：e1 完成后 e2 正常出队
+    queue.complete("e1")
+    assert rec.delivered == ["e1", "e2"]
+
+
+def test_snapshot_carries_content_and_held():
+    queue, _rec = _make_queue()
+    queue.submit(_item("e1"))
+    queue.submit(_item("e2", content="task full text"))
+    assert queue.hold("e2", reason="manual") is True
+    entry = queue.snapshot("s1", "")["queued"][0]
+    assert entry["content"] == "task full text"
+    assert entry["held"] is True
+    assert entry["held_reason"] == "manual"
+
+
+def test_hold_ttl_auto_release(monkeypatch):
+    import grix_hermes.event_queue as eq_mod
+
+    monkeypatch.setattr(eq_mod, "HOLD_TTL_MIN_MS", 1)
+
+    async def _run():
+        queue, rec = _make_queue()
+        queue.submit(_item("e1"))
+        queue.submit(_item("e2"))
+        assert queue.hold("e2", reason="editing", ttl_ms=30) is True
+        queue.complete("e1")
+        await asyncio.sleep(0.01)
+        assert rec.delivered == ["e1"]  # TTL 未到，仍被 hold 挡住
+        await asyncio.sleep(0.2)
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    # TTL 到期自动放行：e2 被续投，定时器无残留
+    assert rec.delivered == ["e1", "e2"]
+    assert queue.is_running("e2")
+    assert not queue._hold_handles
+
+
+def test_hold_ttl_clamped_to_minimum():
+    """ttl_ms 低于下限被 clamp 到 60s：短 sleep 后不会被放行。"""
+
+    async def _run():
+        queue, rec = _make_queue()
+        queue.submit(_item("e1"))
+        queue.submit(_item("e2"))
+        assert queue.hold("e2", reason="editing", ttl_ms=10) is True
+        handle = queue._hold_handles["e2"]
+        loop = asyncio.get_running_loop()
+        # 定时器至少挂在 60s 之后（clamp 生效），而不是 10ms
+        assert handle.when() - loop.time() > 50
+        queue.destroy()
+
+    asyncio.run(_run())
+
+
+def test_repeat_hold_resets_ttl_timer():
+    async def _run():
+        queue, _rec = _make_queue()
+        queue.submit(_item("e1"))
+        queue.submit(_item("e2"))
+        assert queue.hold("e2", reason="editing") is True
+        h1 = queue._hold_handles["e2"]
+        assert queue.hold("e2", reason="editing") is True  # 续期不报错
+        h2 = queue._hold_handles["e2"]
+        assert h1 is not h2 and h1.cancelled()
+        assert queue.find("e2").held is True
+        queue.destroy()
+        assert not queue._hold_handles and h2.cancelled()
+
+    asyncio.run(_run())
+
+
+def test_hold_exempts_queue_timeout_and_release_rearms():
+    async def _run():
+        queue, rec = _make_queue(queue_timeout_ms=50)
+        queue.submit(_item("e1"))
+        queue.submit(_item("e2"))
+        assert queue.hold("e2", reason="editing") is True
+        await asyncio.sleep(0.12)
+        # 排队超时被豁免：e2 仍在队列里
+        assert queue.is_queued("e2")
+        assert not any(state == STATE_FAILED for _, state, _ in rec.states)
+        assert queue.release("e2") is True
+        await asyncio.sleep(0.12)
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    # release 重挂超时：到期后按老语义 fail
+    assert ("e2", STATE_FAILED, {"reason": "queue timeout"}) in rec.states
+    assert not queue.is_queued("e2")
+
+
+def test_cancel_held_item_clears_hold_timer_and_queue_flows():
+    async def _run():
+        queue, rec = _make_queue()
+        queue.submit(_item("e1"))
+        queue.submit(_item("e2"))
+        queue.submit(_item("e3"))
+        assert queue.hold("e2", reason="manual") is True
+        handle = queue._hold_handles["e2"]
+        assert queue.cancel_queued("e2") is True
+        assert "e2" not in queue._hold_handles and handle.cancelled()
+        queue.complete("e1")
+        for _ in range(4):
+            await asyncio.sleep(0)
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    assert ("e2", STATE_CANCELED, {"reason": "canceled by user"}) in rec.states
+    # held 项被取消后队列继续流转
+    assert rec.delivered == ["e1", "e3"]
+
+
+def test_clear_and_drain_all_clear_hold_timers():
+    async def _run():
+        queue, _rec = _make_queue()
+        queue.submit(_item("e1"))
+        queue.submit(_item("e2"))
+        queue.submit(_item("e3"))
+        assert queue.hold("e2", reason="manual") is True
+        assert queue.hold("e3", reason="editing") is True
+        h2 = queue._hold_handles["e2"]
+        h3 = queue._hold_handles["e3"]
+        queue.clear("s1", "")
+        assert not queue._hold_handles
+        assert h2.cancelled() and h3.cancelled()
+
+    asyncio.run(_run())
+
+
+def test_drain_all_queued_clears_hold_timers():
+    async def _run():
+        queue, _rec = _make_queue()
+        queue.submit(_item("e1"))
+        queue.submit(_item("e2"))
+        assert queue.hold("e2", reason="manual") is True
+        handle = queue._hold_handles["e2"]
+        drained = queue.drain_all_queued()
+        assert [item.event_id for item in drained] == ["e2"]
+        assert not queue._hold_handles and handle.cancelled()
+
+    asyncio.run(_run())

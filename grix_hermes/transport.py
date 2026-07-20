@@ -20,6 +20,7 @@ from .contract import (
     CMD_ERROR,
     CMD_EVENT_ACK,
     CMD_EVENT_CANCEL_RESULT,
+    CMD_EVENT_HOLD_RESULT,
     CMD_EVENT_RESULT,
     CMD_EVENT_STATE,
     CMD_EVENT_STOP_ACK,
@@ -28,6 +29,7 @@ from .contract import (
     CMD_PING,
     CMD_PONG,
     CMD_QUEUE_CLEAR_RESULT,
+    CMD_QUEUE_EDIT_RESULT,
     CMD_QUEUE_REORDER_RESULT,
     CMD_QUEUE_SNAPSHOT,
     CMD_SEND_ACK,
@@ -649,6 +651,49 @@ class GrixTransportClient:
         if message:
             payload["msg"] = message.strip()
         await self.send_packet(CMD_QUEUE_CLEAR_RESULT, payload)
+
+    async def send_event_hold_result(
+        self,
+        *,
+        session_id: str,
+        event_id: str,
+        ok: bool,
+        held: bool = False,
+        error: Optional[str] = None,
+    ) -> None:
+        """对服务端 event_hold 请求的回应。
+
+        ok=True 表示 hold/release 已生效，held 为该事件当前的持有态；
+        失败时 error 为枚举（not_found / bad_request）。
+        """
+        payload: Dict[str, Any] = {
+            "session_id": session_id.strip(),
+            "event_id": event_id.strip(),
+            "ok": ok,
+            "held": held,
+            "error": (error or "").strip(),
+        }
+        await self.send_packet(CMD_EVENT_HOLD_RESULT, payload)
+
+    async def send_queue_edit_result(
+        self,
+        *,
+        session_id: str,
+        event_id: str,
+        ok: bool,
+        error: Optional[str] = None,
+    ) -> None:
+        """对服务端 queue_edit 请求的回应。
+
+        失败时 error 为枚举（not_found / bad_request / empty_content）。
+        """
+        payload: Dict[str, Any] = {
+            "session_id": session_id.strip(),
+            "event_id": event_id.strip(),
+            "ok": ok,
+            "error": (error or "").strip(),
+        }
+        await self.send_packet(CMD_QUEUE_EDIT_RESULT, payload)
 
     async def send_queue_reorder_result(
         self,

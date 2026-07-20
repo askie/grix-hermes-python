@@ -820,6 +820,62 @@ def normalize_queue_clear(payload: Dict[str, Any]) -> GrixQueueClearEvent:
 
 
 @dataclass(frozen=True)
+class GrixEventHoldEvent:
+    event_id: str
+    session_id: str
+    hold: bool
+    reason: str = ""
+    ttl_ms: int = 0
+    raw: Dict[str, Any] = None
+
+
+@dataclass(frozen=True)
+class GrixQueueEditEvent:
+    event_id: str
+    session_id: str
+    text: str = ""
+    raw: Dict[str, Any] = None
+
+
+def normalize_event_hold(payload: Dict[str, Any]) -> GrixEventHoldEvent:
+    event_id = normalize_id(payload.get("event_id"))
+    if not event_id:
+        raise ValueError("event_hold requires event_id")
+
+    session_id = normalize_id(payload.get("session_id"))
+    if not session_id:
+        raise ValueError("event_hold requires session_id")
+
+    return GrixEventHoldEvent(
+        event_id=event_id,
+        session_id=session_id,
+        # 缺省 true（与 connector 的 `payload.hold !== false` 对齐）：
+        # 前端总是显式传 hold，此缺省仅在字段缺失时兜底。
+        hold=payload.get("hold") is not False,
+        reason=normalize_text(payload.get("reason")),
+        ttl_ms=clamp_int(payload.get("ttl_ms"), 0, 0, 86_400_000),
+        raw=dict(payload),
+    )
+
+
+def normalize_queue_edit(payload: Dict[str, Any]) -> GrixQueueEditEvent:
+    event_id = normalize_id(payload.get("event_id"))
+    if not event_id:
+        raise ValueError("queue_edit requires event_id")
+
+    session_id = normalize_id(payload.get("session_id"))
+    if not session_id:
+        raise ValueError("queue_edit requires session_id")
+
+    return GrixQueueEditEvent(
+        event_id=event_id,
+        session_id=session_id,
+        text=normalize_message_text(payload.get("content")),
+        raw=dict(payload),
+    )
+
+
+@dataclass(frozen=True)
 class GrixQueueReorderEvent:
     session_id: str
     ordered_event_ids: tuple[str, ...]

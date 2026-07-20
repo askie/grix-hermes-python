@@ -91,6 +91,8 @@ class FakeTransportClient:
         self.reorder_results = []
         self.clear_results = []
         self.cancel_results = []
+        self.hold_results = []
+        self.edit_results = []
         self.stop_acks = []
         self.stop_results = []
 
@@ -124,6 +126,16 @@ class FakeTransportClient:
     async def send_event_cancel_result(self, *, event_id, accepted, reason=None, final_state=None):
         self.cancel_results.append(
             {"event_id": event_id, "accepted": accepted, "final_state": final_state, "reason": reason}
+        )
+
+    async def send_event_hold_result(self, *, session_id, event_id, ok, held=False, error=None):
+        self.hold_results.append(
+            {"session_id": session_id, "event_id": event_id, "ok": ok, "held": held, "error": error}
+        )
+
+    async def send_queue_edit_result(self, *, session_id, event_id, ok, error=None):
+        self.edit_results.append(
+            {"session_id": session_id, "event_id": event_id, "ok": ok, "error": error}
         )
 
     async def acknowledge_stop(self, *, event_id, accepted, stop_id=None, updated_at=None):
@@ -586,3 +598,191 @@ def test_complete_event_releases_slot_and_drains_next():
     # e2 进入 running 的状态已上报
     running_states = [s for s in client.event_states if s["state"] == "running"]
     assert any(s["event_id"] == "e2" for s in running_states)
+
+
+# ── event_hold 暂停/恢复 ────────────────────────────────────────────────
+
+
+def test_event_hold_holds_then_releases_queued_item():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1"))
+        inst._event_queue.submit(_item(inst, "e2"))
+        await _settle()
+        await inst._handle_event_hold_packet(
+            {"session_id": "s1", "event_id": "e2", "hold": True, "reason": "manual"}
+        )
+        item = inst._event_queue.find("e2")
+        assert item.held is True and item.held_reason == "manual"
+        # 槽位释放后 held 项挡住本组出队
+        await inst._complete_event_if_needed("e1", status="responded")
+        await _settle()
+        assert inst._delivered == ["e1"]
+        await inst._handle_event_hold_packet(
+            {"session_id": "s1", "event_id": "e2", "hold": False}
+        )
+        await _settle()
+
+    _run_with_ctx(inst, client, _flow())
+    assert client.hold_results[0] == {
+        "session_id": "s1", "event_id": "e2", "ok": True, "held": True, "error": None,
+    }
+    assert client.hold_results[1] == {
+        "session_id": "s1", "event_id": "e2", "ok": True, "held": False, "error": None,
+    }
+    # 解除后 e2 续投
+    assert inst._delivered == ["e1", "e2"]
+    # hold 期间推过带 held 标记的快照
+    assert any(
+        any(q.get("held") and q.get("held_reason") == "manual" for q in snap["queued"])
+        for snap in client.snapshots
+    )
+
+
+def test_event_hold_running_item_not_found():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1"))
+        await inst._handle_event_hold_packet(
+            {"session_id": "s1", "event_id": "e1", "hold": True, "reason": "manual"}
+        )
+
+    _run_with_ctx(inst, client, _flow())
+    assert client.hold_results == [
+        {"session_id": "s1", "event_id": "e1", "ok": False, "held": False, "error": "not_found"}
+    ]
+    assert inst._event_queue.is_running("e1")
+
+
+def test_event_hold_missing_event_id_bad_request():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _run_with_ctx(
+        inst, client, inst._handle_event_hold_packet({"session_id": "s1", "hold": True})
+    )
+    assert client.hold_results == [
+        {"session_id": "s1", "event_id": "", "ok": False, "held": False, "error": "bad_request"}
+    ]
+
+
+def test_event_hold_owner_isolation():
+    """共享场景：其他 owner 名下的排队事件对当前 owner 不可见（not_found）。"""
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1"))
+        inst._event_queue.submit(_item(inst, "e2", owner_key="other"))
+        await inst._handle_event_hold_packet(
+            {"session_id": "s1", "event_id": "e2", "hold": True, "reason": "manual"}
+        )
+
+    _run_with_ctx(inst, client, _flow())
+    assert client.hold_results[-1]["ok"] is False
+    assert client.hold_results[-1]["error"] == "not_found"
+    assert inst._event_queue.find("e2").held is False
+
+
+# ── queue_edit 改写排队任务文本 ─────────────────────────────────────────
+
+
+def test_queue_edit_rewrites_text_payload_and_releases(monkeypatch):
+    from grix_hermes.protocol import normalize_inbound_message
+
+    client = FakeTransportClient()
+    inst = _prepare_packet_adapter(monkeypatch, client)
+    message = normalize_inbound_message(_text_packet("e2", "旧任务内容"))
+    source = SimpleNamespace(chat_id="s1", thread_id=None)
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1"))
+        inst._event_queue.submit(
+            QueueItem(
+                event_id="e2",
+                session_id="s1",
+                group_key="g1",
+                owner_key="",
+                preview="旧任务内容",
+                payload=(message, source, "g1"),
+                content="旧任务内容",
+            )
+        )
+        # 编辑流程先 hold（前端点编辑自动发），再改文
+        await inst._handle_event_hold_packet(
+            {"session_id": "s1", "event_id": "e2", "hold": True, "reason": "editing"}
+        )
+        await inst._handle_queue_edit_packet(
+            {"session_id": "s1", "event_id": "e2", "content": "新任务全文"}
+        )
+        await _settle()
+
+    _run_with_ctx(inst, client, _flow())
+    assert client.edit_results == [
+        {"session_id": "s1", "event_id": "e2", "ok": True, "error": None}
+    ]
+    queued = inst._event_queue.find("e2")
+    assert queued.content == "新任务全文"
+    assert queued.preview == "新任务全文"
+    # payload 里冻结的入站消息同步改写：执行时用编辑后文本
+    assert queued.payload[0].text == "新任务全文"
+    # 编辑自动解除 hold
+    assert queued.held is False and queued.held_reason == ""
+    # 成功后推过带新全文的快照
+    assert any(
+        any(q.get("content") == "新任务全文" for q in snap["queued"])
+        for snap in client.snapshots
+    )
+
+
+def test_queue_edit_empty_content_rejected():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1"))
+        inst._event_queue.submit(_item(inst, "e2", text="原文"))
+        await inst._handle_queue_edit_packet(
+            {"session_id": "s1", "event_id": "e2", "content": "   "}
+        )
+
+    _run_with_ctx(inst, client, _flow())
+    assert client.edit_results == [
+        {"session_id": "s1", "event_id": "e2", "ok": False, "error": "empty_content"}
+    ]
+    assert inst._event_queue.find("e2").preview == "原文"
+
+
+def test_queue_edit_running_item_not_found():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1"))
+        await inst._handle_queue_edit_packet(
+            {"session_id": "s1", "event_id": "e1", "content": "新文"}
+        )
+
+    _run_with_ctx(inst, client, _flow())
+    assert client.edit_results == [
+        {"session_id": "s1", "event_id": "e1", "ok": False, "error": "not_found"}
+    ]
+
+
+def test_queue_edit_owner_isolation():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1"))
+        inst._event_queue.submit(_item(inst, "e2", owner_key="other", text="别人的任务"))
+        await inst._handle_queue_edit_packet(
+            {"session_id": "s1", "event_id": "e2", "content": "越权改写"}
+        )
+
+    _run_with_ctx(inst, client, _flow())
+    assert client.edit_results[-1]["error"] == "not_found"
+    assert inst._event_queue.find("e2").preview == "别人的任务"
