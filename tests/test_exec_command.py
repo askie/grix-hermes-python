@@ -64,3 +64,34 @@ def test_scan_skill_dir_skips_hidden_dirs():
         _write_skill(base, ".hidden", "secret")
         entries = _scan_skill_dir(base, "global", managed=False)
         assert len(entries) == 0
+
+
+def test_scan_hermes_skills_builtin_shadows_synced_duplicate(monkeypatch):
+    """集成测试：锁定「plugin_skills 先扫 + 结尾去重」的修复语义。
+
+    若有人把 return _dedupe_skills(results) 改回 return results 或调换两个
+    extend 的顺序，本测试必须失败。
+    """
+    from grix_hermes import exec_command
+
+    def fake_scan(base: Path, source: str, *, managed: bool = False):
+        if base.name == "plugin_skills":
+            return [
+                SkillEntry(name="grix-admin", description="builtin", source=source, managed=True),
+            ]
+        return [
+            SkillEntry(name="grix-admin", description="synced", source=source, managed=False),
+            SkillEntry(name="my-custom", description="user", source=source, managed=False),
+        ]
+
+    monkeypatch.setattr(exec_command, "_scan_skill_dir", fake_scan)
+    entries = exec_command.scan_hermes_skills()
+
+    names = [e.name for e in entries]
+    assert names.count("grix-admin") == 1
+    assert "my-custom" in names
+
+    admin = next(e for e in entries if e.name == "grix-admin")
+    assert admin.source == "plugin"
+    assert admin.managed is True
+    assert admin.description == "builtin"
