@@ -91,8 +91,30 @@ def _scan_skill_dir(base_dir: Path, source: str, *, managed: bool = False) -> Li
     return results
 
 
+def _dedupe_skills(entries: List[SkillEntry]) -> List[SkillEntry]:
+    """按名去重，保留先出现者。
+
+    与 connector dedupeSkills 对齐：同名时先扫描到的条目优先。plugin_skills/
+    先于 ~/.hermes/skills/ 扫描，因此内置 Grix 技能会遮蔽用户目录里的同名项，
+    避免平台同步下来的同名技能被误当作用户自建技能参与上传/同步状态显示。
+    """
+    out: List[SkillEntry] = []
+    seen = set()
+    for entry in entries:
+        key = entry.name.strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(entry)
+    return out
+
+
 def scan_hermes_skills() -> List[SkillEntry]:
-    """Scan Hermes skill directories for SKILL.md files."""
+    """Scan Hermes skill directories for SKILL.md files.
+
+    内置 plugin_skills/ 优先于 ~/.hermes/skills/，同名时内置技能遮蔽用户目录项
+    （dedupe），防止平台同步下来的 Grix 内置技能被误标为非托管并显示同步状态。
+    """
     results: List[SkillEntry] = []
 
     # Package-bundled plugin_skills/：系统自带，不可一键上传。
@@ -103,7 +125,7 @@ def scan_hermes_skills() -> List[SkillEntry]:
     home_skills = Path.home() / ".hermes" / "skills"
     results.extend(_scan_skill_dir(home_skills, "global", managed=False))
 
-    return results
+    return _dedupe_skills(results)
 
 
 def handle_skills_command() -> str:
