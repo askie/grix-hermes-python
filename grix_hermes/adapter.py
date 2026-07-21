@@ -3244,8 +3244,8 @@ class GrixAdapter(BasePlatformAdapter):
     async def _handle_event_hold_packet(self, payload: Dict[str, Any]) -> None:
         """处理后端下发的 event_hold：暂停/恢复单个排队事件（对齐 connector）。
 
-        仅命中 queued[]；hold=True 施加持有（重复调用重置 TTL），hold=False
-        解除。运行中/不存在 → ok=False error=not_found。
+        仅命中 queued[]；hold=True 施加持有（缺省永久阻塞，显式 ttl_ms 时重复
+        调用重置 TTL），hold=False 解除。运行中/不存在 → ok=False error=not_found。
         """
         client = self._active_client()
         if not client:

@@ -35,8 +35,8 @@ STATE_FAILED = "failed"
 
 _PREVIEW_MAX_CHARS = 64
 
-# hold TTL（毫秒）：缺省 10 分钟，clamp 到 [1 分钟, 30 分钟]（对齐 connector）。
-HOLD_TTL_DEFAULT_MS = 600_000
+# 显式 ttl_ms 的 clamp 区间（毫秒）：[1 分钟, 30 分钟]（对齐 connector）；
+# 缺省不传 = 永久阻塞，无自动放行。
 HOLD_TTL_MIN_MS = 60_000
 HOLD_TTL_MAX_MS = 1_800_000
 
@@ -200,8 +200,9 @@ class EventQueue:
         - 仅命中 queued[]；运行中/不存在返回 False（协议层回 not_found）；
         - 施加 hold 即豁免排队超时（否则 queue_timeout_ms 会把编辑中的任务
           超时丢弃），release 时重挂；
-        - 挂 TTL 定时器，到期自动 release（App 被杀最多卡队列 TTL 时长）；
-          重复调用重置 TTL（续期语义）。
+        - 缺省永久阻塞：仅 release/编辑/取消可解除；显式传 ttl_ms 才挂 TTL
+          定时器（clamp 到 [60s, 30min]），到期自动 release，重复调用重置
+          TTL（续期语义）。
         """
         item = self._find_queued(event_id)
         if item is None:
@@ -210,18 +211,18 @@ class EventQueue:
         item.held_reason = str(reason or "")
         self._cancel_timeout(event_id)
         self._cancel_hold(event_id)
-        ttl = ttl_ms if ttl_ms and ttl_ms > 0 else HOLD_TTL_DEFAULT_MS
-        ttl = max(HOLD_TTL_MIN_MS, min(HOLD_TTL_MAX_MS, ttl))
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop is not None:
-            self._hold_handles[event_id] = loop.call_later(
-                ttl / 1000,
-                self._hold_expired,
-                event_id,
-            )
+        if ttl_ms and ttl_ms > 0:
+            ttl = max(HOLD_TTL_MIN_MS, min(HOLD_TTL_MAX_MS, ttl_ms))
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                self._hold_handles[event_id] = loop.call_later(
+                    ttl / 1000,
+                    self._hold_expired,
+                    event_id,
+                )
         self._notify_item(item)
         return True
 

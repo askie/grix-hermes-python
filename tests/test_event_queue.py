@@ -424,14 +424,35 @@ def test_repeat_hold_resets_ttl_timer():
         queue, _rec = _make_queue()
         queue.submit(_item("e1"))
         queue.submit(_item("e2"))
-        assert queue.hold("e2", reason="editing") is True
+        assert queue.hold("e2", reason="editing", ttl_ms=60_000) is True
         h1 = queue._hold_handles["e2"]
-        assert queue.hold("e2", reason="editing") is True  # 续期不报错
+        assert queue.hold("e2", reason="editing", ttl_ms=60_000) is True  # 续期不报错
         h2 = queue._hold_handles["e2"]
         assert h1 is not h2 and h1.cancelled()
         assert queue.find("e2").held is True
         queue.destroy()
         assert not queue._hold_handles and h2.cancelled()
+
+    asyncio.run(_run())
+
+
+def test_hold_default_is_permanent():
+    """缺省不传 ttl_ms：永久阻塞，不挂自动放行定时器，仅 release 解除。"""
+
+    async def _run():
+        queue, rec = _make_queue()
+        queue.submit(_item("e1"))
+        queue.submit(_item("e2"))
+        assert queue.hold("e2", reason="manual") is True
+        assert "e2" not in queue._hold_handles
+        queue.complete("e1")
+        await asyncio.sleep(0.05)
+        # 队头被永久 hold 挡住：不投递、不放行
+        assert rec.delivered == ["e1"]
+        assert queue.is_queued("e2")
+        assert queue.release("e2") is True
+        await asyncio.sleep(0.05)
+        assert rec.delivered == ["e1", "e2"]
 
     asyncio.run(_run())
 
@@ -462,7 +483,7 @@ def test_cancel_held_item_clears_hold_timer_and_queue_flows():
         queue.submit(_item("e1"))
         queue.submit(_item("e2"))
         queue.submit(_item("e3"))
-        assert queue.hold("e2", reason="manual") is True
+        assert queue.hold("e2", reason="manual", ttl_ms=60_000) is True
         handle = queue._hold_handles["e2"]
         assert queue.cancel_queued("e2") is True
         assert "e2" not in queue._hold_handles and handle.cancelled()
@@ -483,8 +504,8 @@ def test_clear_and_drain_all_clear_hold_timers():
         queue.submit(_item("e1"))
         queue.submit(_item("e2"))
         queue.submit(_item("e3"))
-        assert queue.hold("e2", reason="manual") is True
-        assert queue.hold("e3", reason="editing") is True
+        assert queue.hold("e2", reason="manual", ttl_ms=60_000) is True
+        assert queue.hold("e3", reason="editing", ttl_ms=60_000) is True
         h2 = queue._hold_handles["e2"]
         h3 = queue._hold_handles["e3"]
         queue.clear("s1", "")
@@ -499,7 +520,7 @@ def test_drain_all_queued_clears_hold_timers():
         queue, _rec = _make_queue()
         queue.submit(_item("e1"))
         queue.submit(_item("e2"))
-        assert queue.hold("e2", reason="manual") is True
+        assert queue.hold("e2", reason="manual", ttl_ms=60_000) is True
         handle = queue._hold_handles["e2"]
         drained = queue.drain_all_queued()
         assert [item.event_id for item in drained] == ["e2"]
