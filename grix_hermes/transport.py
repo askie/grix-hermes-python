@@ -38,6 +38,7 @@ from .contract import (
     CMD_SESSION_ACTIVITY_SET,
     CMD_SESSION_ROUTE_BIND,
     CMD_SESSION_ROUTE_RESOLVE,
+    CMD_UPDATE_BINDING_CARD,
 )
 from .protocol import (
     DEFAULT_REQUEST_TIMEOUT_MS,
@@ -748,6 +749,24 @@ class GrixTransportClient:
             "updated_at": _now_ms(),
         }
         await self.send_packet(CMD_QUEUE_SNAPSHOT, payload)
+
+    async def send_update_binding_card(
+        self,
+        *,
+        session_id: str,
+        worker_status: str,
+        cwd: str = "",
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist metadata used to build this session's toolbar snapshot."""
+        payload: Dict[str, Any] = {
+            "session_id": session_id.strip(),
+            "worker_status": worker_status.strip(),
+            "cwd": cwd.strip(),
+        }
+        if meta:
+            payload["meta"] = dict(meta)
+        await self.send_packet(CMD_UPDATE_BINDING_CARD, payload)
 
     async def bind_session_route(
         self,

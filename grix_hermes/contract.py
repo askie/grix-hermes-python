@@ -24,6 +24,7 @@ CMD_SEND_ACK = "send_ack"
 CMD_SEND_NACK = "send_nack"
 CMD_ERROR = "error"
 CMD_EDIT_MSG = "edit_msg"
+CMD_UPDATE_BINDING_CARD = "update_binding_card"
 CMD_SESSION_ACTIVITY_SET = "session_activity_set"
 CMD_LOCAL_ACTION = "local_action"
 CMD_LOCAL_ACTION_RESULT = "local_action_result"
@@ -123,6 +124,11 @@ STABLE_PUBLIC_COMMANDS = (
         "cmd": CMD_SESSION_ROUTE_RESOLVE,
         "direction": "client_to_server",
         "purpose": "resolve_session_route",
+    },
+    {
+        "cmd": CMD_UPDATE_BINDING_CARD,
+        "direction": "client_to_server",
+        "purpose": "update_toolbar_binding_metadata",
     },
     {"cmd": CMD_AGENT_INVOKE, "direction": "client_to_server", "purpose": "invoke_backend_action"},
     {"cmd": CMD_AGENT_INVOKE_RESULT, "direction": "server_to_client", "purpose": "invoke_backend_action_result"},

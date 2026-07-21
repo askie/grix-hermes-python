@@ -88,6 +88,7 @@ class FakeTransportClient:
         self.completed = []
         self.event_states = []
         self.snapshots = []
+        self.binding_cards = []
         self.reorder_results = []
         self.clear_results = []
         self.cancel_results = []
@@ -107,6 +108,16 @@ class FakeTransportClient:
     async def send_queue_snapshot(self, *, session_id, running, running_items, queued):
         self.snapshots.append(
             {"session_id": session_id, "running": running, "queued": queued}
+        )
+
+    async def send_update_binding_card(self, *, session_id, worker_status, cwd="", meta=None):
+        self.binding_cards.append(
+            {
+                "session_id": session_id,
+                "worker_status": worker_status,
+                "cwd": cwd,
+                "meta": meta,
+            }
         )
 
     async def send_queue_reorder_result(self, *, session_id, applied_event_ids):
@@ -216,6 +227,43 @@ def test_snapshot_query_returns_snapshot_even_when_empty():
         inst, client, inst._handle_queue_snapshot_query_packet({"session_id": "s1"})
     )
     assert client.snapshots[-1] == {"session_id": "s1", "running": [], "queued": []}
+
+
+def test_snapshot_reports_single_immutable_configured_model():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._toolbar_model_id = "anthropic/claude-sonnet-4"
+
+    _run_with_ctx(
+        inst, client, inst._handle_queue_snapshot_query_packet({"session_id": "s1"})
+    )
+
+    assert client.binding_cards[-1] == {
+        "session_id": "s1",
+        "worker_status": "ready",
+        "cwd": "",
+        "meta": {
+            "model_id": "anthropic/claude-sonnet-4",
+            "available_models": [
+                {
+                    "id": "anthropic/claude-sonnet-4",
+                    "displayName": "anthropic/claude-sonnet-4",
+                }
+            ],
+        },
+    }
+
+
+def test_resolve_configured_model_supports_current_and_legacy_shapes(tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("model:\n  default: openrouter/anthropic/claude-opus-4\n")
+    assert adapter_mod.resolve_configured_model(str(tmp_path)) == "openrouter/anthropic/claude-opus-4"
+
+    config_path.write_text("model: nous/hermes-4-70b\n")
+    assert adapter_mod.resolve_configured_model(str(tmp_path)) == "nous/hermes-4-70b"
+
+    config_path.write_text("model: [unterminated\n")
+    assert adapter_mod.resolve_configured_model(str(tmp_path)) == ""
 
 
 def test_snapshot_query_reports_running_and_queued():

@@ -19,6 +19,7 @@ from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from gateway.config import Platform, PlatformConfig
@@ -262,6 +263,32 @@ def build_grix_connection_config(config: PlatformConfig) -> GrixConnectionConfig
         api_key = os.environ.get("GRIX_API_KEY", "").strip()
 
     return build_connection_config(extra, api_key)
+
+
+def resolve_configured_model(hermes_home: Optional[str] = None) -> str:
+    """Read the immutable gateway model from the active Hermes profile."""
+    home = Path(hermes_home or os.environ.get("HERMES_HOME", "") or "~/.hermes").expanduser()
+    try:
+        import yaml
+    except ImportError:
+        return ""
+    try:
+        with (home / "config.yaml").open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError, ValueError, TypeError):
+        return ""
+
+    if not isinstance(config, dict):
+        return ""
+    raw_model = config.get("model")
+    if isinstance(raw_model, str):
+        return raw_model.strip()
+    if isinstance(raw_model, dict):
+        for key in ("default", "model", "name"):
+            value = raw_model.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
 
 
 # 明确指向永久失败的 HTTP 状态码（客户端错误）。注意 408(超时) / 429(限流)
@@ -533,6 +560,10 @@ class GrixAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(_PLATFORM_VALUE))
         self.connection = build_grix_connection_config(config)
+        # Hermes gateway sessions share one profile-level model. Freeze it at
+        # adapter construction: unlike switchable CLI adapters, Hermes exposes
+        # only this configured model in toolbar metadata.
+        self._toolbar_model_id = resolve_configured_model()
         self._client: Optional[GrixTransportClient] = None
         self._connector = None
         self._disconnect_requested = False
@@ -3677,6 +3708,27 @@ class GrixAdapter(BasePlatformAdapter):
             )
         except Exception as exc:
             logger.debug("[%s] send_queue_snapshot failed for %s: %s", self.name, session_id, exc)
+
+        model_id = getattr(self, "_toolbar_model_id", "")
+        if model_id:
+            try:
+                await client.send_update_binding_card(
+                    session_id=session_id,
+                    worker_status="busy" if running else "ready",
+                    meta={
+                        "model_id": model_id,
+                        "available_models": [
+                            {"id": model_id, "displayName": model_id}
+                        ],
+                    },
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[%s] send toolbar model metadata failed for %s: %s",
+                    self.name,
+                    session_id,
+                    exc,
+                )
 
     async def _handle_stop_packet(self, payload: Dict[str, Any]) -> None:
         stop = normalize_stop_event(payload)
