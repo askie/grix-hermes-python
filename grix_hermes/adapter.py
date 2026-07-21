@@ -1068,6 +1068,13 @@ class GrixAdapter(BasePlatformAdapter):
         # 纯文本过程/续写一律不投递。按调用入口判定，不依赖引用/force_quote——长回复
         # 分片仅首片带引用、第二次 grix_reply 也不带引用，那些信号都是有损的。
         _drop_text = _hints.get("text_events") == "drop"
+        # 框架整轮最终应答兜底：base.py "Sending response" 路径投递前会在 metadata
+        # 打 notify=True 标记（仅最终应答/语音应答打标，过程文本不带）。托管场景下
+        # 模型若未走 grix_reply 工具，最终应答也经普通 send() 到达这里——必须按最终
+        # 应答对待（跳过过程分类与 text drop），否则对端完全收不到回复，且静默
+        # success 会让框架误判已投递。
+        if _drop_text and not is_final_reply and (metadata or {}).get("notify") is True:
+            is_final_reply = True
 
         # Detect structured content and inject channel_data for card display.
         # Order matters: a gateway status line is checked first and short-circuits,
@@ -1127,6 +1134,12 @@ class GrixAdapter(BasePlatformAdapter):
                     # 纯文本过程消息/续写（非 status/tool/hook 卡片）：托管场景下非最终
                     # 应答一律不投递给对端。grix_reply 走 send_final_reply
                     # (is_final_reply=True)，不受影响。
+                    logger.warning(
+                        "[%s] Dropping intermediate text (%d chars) to %s: text_events=drop",
+                        self.name,
+                        len(content),
+                        chat_id,
+                    )
                     return SendResult(success=True, retryable=False)
 
         await self._enforce_send_rate()

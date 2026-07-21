@@ -109,6 +109,46 @@ def test_managed_final_reply_survives_status_lookalike(monkeypatch):
     assert client.sent[0]["reply_to_message_id"] == "t1"
 
 
+def test_managed_delivers_framework_final_text(monkeypatch):
+    """托管场景：模型未走 grix_reply 时，框架整轮最终应答（metadata notify=True）必须投递。
+
+    复现线上问题：base.py "Sending response" 路径经普通 send() 投递最终应答，
+    此前被 text_events=drop 静默吞掉，对端完全无响应。
+    """
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_hints(inst, "chat-1", MANAGED)
+
+    result = _with_ctx(
+        client,
+        inst.send("chat-1", "您好呀，有什么可以帮您的？", reply_to="t1",
+                  metadata={"notify": True}),
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "您好呀，有什么可以帮您的？"
+
+
+def test_managed_framework_final_survives_status_lookalike(monkeypatch):
+    """托管场景：框架最终应答即使长得像状态行，也按最终应答原样投递（跳过过程分类）。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_hints(inst, "chat-1", MANAGED)
+
+    lookalike = "⏳ Working 时段是 9:00-18:00，您方便时我随时对接。"
+    result = _with_ctx(
+        client,
+        inst.send("chat-1", lookalike, reply_to="t1", metadata={"notify": True}),
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert "9:00-18:00" in client.sent[0]["content"]
+
+
 def test_no_hint_delivers_plain_text(monkeypatch):
     """无托管 hint：纯文本进程消息正常投递（无回归）。"""
     monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
