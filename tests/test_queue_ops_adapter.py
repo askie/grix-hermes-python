@@ -241,6 +241,55 @@ def test_snapshot_query_reports_running_and_queued():
     assert queued_states[-1]["actions"] == [{"type": "cancel"}]
 
 
+def test_snapshot_query_reports_virtual_running_for_active_framework_work():
+    """显式队列为空时，Hermes 正在处理的轮次仍应让工具栏显示 1 个任务。"""
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._state_for("").toolbar_active_work["sk:s1"] = {
+        "session_id": "s1",
+        "title": "background job",
+    }
+
+    _run_with_ctx(
+        inst, client, inst._handle_queue_snapshot_query_packet({"session_id": "s1"})
+    )
+
+    assert client.snapshots[-1]["running"] == ["selfdrive_s1"]
+
+
+def test_real_running_item_takes_priority_over_virtual_framework_work():
+    """已有真实 running 事件时不重复合成虚拟任务，避免计数虚高。"""
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._state_for("").toolbar_active_work["sk:s1"] = {
+        "session_id": "s1",
+        "title": "background job",
+    }
+
+    async def _flow():
+        inst._event_queue.submit(_item(inst, "e1", text="first job"))
+        await _settle()
+        await inst._handle_queue_snapshot_query_packet({"session_id": "s1"})
+
+    _run_with_ctx(inst, client, _flow())
+
+    assert client.snapshots[-1]["running"] == ["e1"]
+
+
+def test_reconnect_replays_virtual_running_snapshot():
+    """重连补推不能只遍历显式队列，否则自驱任务会再次显示为 0。"""
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._state_for("").toolbar_active_work["sk:s1"] = {
+        "session_id": "s1",
+        "title": "background job",
+    }
+
+    _run_with_ctx(inst, client, inst._push_all_queue_snapshots())
+
+    assert client.snapshots[-1]["running"] == ["selfdrive_s1"]
+
+
 # ── 重排 ────────────────────────────────────────────────────────────────
 
 

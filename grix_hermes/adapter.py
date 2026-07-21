@@ -193,6 +193,11 @@ class _OwnerState:
     session_open_event_ids: Dict[str, List[str]] = field(default_factory=dict)
     session_next_run_event_ids: Dict[str, List[str]] = field(default_factory=dict)
     session_running_event_ids: Dict[str, List[str]] = field(default_factory=dict)
+    # Hermes 框架已进入处理轮次、但显式 EventQueue 里未必还有 running 项的
+    # 会话。连接器会把这类 self-driven activity 合成为一个虚拟 running 项，
+    # 避免工具栏队列数在 agent 仍工作时错误归零；这里保存同等的运行态。
+    # key=session_key，value={session_id, title}。按 owner 分桶由 _OwnerState 保证。
+    toolbar_active_work: Dict[str, Dict[str, str]] = field(default_factory=dict)
 
 
 class _PendingMessagesDict(dict):
@@ -1638,6 +1643,8 @@ class GrixAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
         )
         state = self._active_state()
+        owner_key = self._active_owner_key()
+        toolbar_work = state.toolbar_active_work.pop(session_key, None)
         message_id = str(event.message_id or "").strip()
         if message_id and state.processing_message_ids.get(session_key) == message_id:
             state.processing_message_ids.pop(session_key, None)
@@ -1696,6 +1703,11 @@ class GrixAdapter(BasePlatformAdapter):
                 if eid not in inflight and eid not in event_ids:
                     await self._complete_event_if_needed(eid, status=STATUS_RESPONDED)
 
+        # 显式队列事件的收口会自行推快照；旁路/自驱轮次不一定在 EventQueue
+        # 中，因此无条件再推一次最终权威快照，清掉虚拟 running 项。
+        if toolbar_work is not None:
+            await self._push_queue_snapshot(toolbar_work["session_id"], owner_key)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
         if raw_message.get("_grix_kind") not in ("message", "card_action"):
@@ -1710,6 +1722,7 @@ class GrixAdapter(BasePlatformAdapter):
         # 事件——它们可能属于未来轮次（刚入队/防抖中），提前认领会提前收口。
         # on_processing_complete 按任务真实结果统一发 event_result。
         state = self._active_state()
+        owner_key = self._active_owner_key()
         running = state.session_next_run_event_ids.pop(session_key, [])
         raw_event_id = str(raw_message.get("event_id") or "").strip()
         if raw_event_id and raw_event_id not in running:
@@ -1723,6 +1736,17 @@ class GrixAdapter(BasePlatformAdapter):
             for eid in running:
                 if eid not in existing:
                     existing.append(eid)
+
+        # 对齐 grix-connector 的 selfDrivenSessions：Hermes 的框架轮次可能由
+        # 斜杠命令、pending 合并或内部续跑触发，此时显式 EventQueue 未必能
+        # 提供 running 项。记录真实处理态，让队列快照合成一个虚拟任务兜底。
+        session_id = str(event.source.chat_id or "").strip()
+        if session_id:
+            state.toolbar_active_work[session_key] = {
+                "session_id": session_id,
+                "title": build_preview(getattr(event, "text", "")),
+            }
+            await self._push_queue_snapshot(session_id, owner_key)
 
         if raw_message.get("_grix_kind") != "message" or not event.message_id:
             return
@@ -3575,9 +3599,14 @@ class GrixAdapter(BasePlatformAdapter):
         测试用 __new__ 构造的裸 adapter 没有 _event_queue，getattr 兜底。
         """
         queue = getattr(self, "_event_queue", None)
-        if queue is None:
-            return
-        for session_id, owner_key in queue.session_refs():
+        refs = set(queue.session_refs()) if queue is not None else set()
+        for owner_key, state in self._owner_states.items():
+            refs.update(
+                (work["session_id"], owner_key)
+                for work in state.toolbar_active_work.values()
+                if work.get("session_id")
+            )
+        for session_id, owner_key in sorted(refs):
             await self._push_queue_snapshot(session_id, owner_key)
 
     async def _push_queue_snapshot(self, session_id: str, owner_key: str) -> None:
@@ -3585,7 +3614,12 @@ class GrixAdapter(BasePlatformAdapter):
         client = self._client_for_owner(owner_key)
         if client is None:
             return
-        snap = self._event_queue.snapshot(session_id, owner_key)
+        queue = getattr(self, "_event_queue", None)
+        snap = (
+            queue.snapshot(session_id, owner_key)
+            if queue is not None
+            else {"running": [], "running_items": [], "queued": []}
+        )
         running_items = [
             {
                 "event_id": entry["event_id"],
@@ -3596,6 +3630,30 @@ class GrixAdapter(BasePlatformAdapter):
             }
             for entry in snap["running_items"]
         ]
+        running = list(snap["running"])
+        if not running:
+            state = self._state_for(owner_key)
+            active_work = next(
+                (
+                    work
+                    for work in state.toolbar_active_work.values()
+                    if work.get("session_id") == session_id
+                ),
+                None,
+            )
+            if active_work is not None:
+                virtual_id = f"selfdrive_{session_id}"
+                title = active_work.get("title") or "Background task in progress"
+                running.append(virtual_id)
+                running_items.append(
+                    {
+                        "event_id": virtual_id,
+                        "content_preview": title,
+                        "title": title,
+                        "summary": title,
+                        "actions": [],
+                    }
+                )
         queued = [
             {
                 "event_id": entry["event_id"],
@@ -3613,7 +3671,7 @@ class GrixAdapter(BasePlatformAdapter):
         try:
             await client.send_queue_snapshot(
                 session_id=session_id,
-                running=snap["running"],
+                running=running,
                 running_items=running_items,
                 queued=queued,
             )
