@@ -202,6 +202,11 @@ def resolve_event_queue_settings(extra: Dict[str, Any]) -> Dict[str, Any]:
 
     与 connector 的 concurrency 描述符字段一一对应。每会话串行执行
     （max_concurrent=1），排队深度与超时可通过 ``event_queue`` 配置段覆盖。
+
+    ``run_timeout_ms`` 是本地运行看门狗（默认 30 分钟，0 关闭）：运行中
+    事件的收口钩子链路断裂时槽位会永久泄漏、队满后新事件全被拒，看门狗
+    到期按 failed 收口释放槽位。它只属于本地队列实现，不进 auth 握手的
+    concurrency 描述符（握手字段保持与 connector 一一对应）。
     """
     raw = extra.get("event_queue")
     settings = raw if isinstance(raw, dict) else {}
@@ -209,9 +214,21 @@ def resolve_event_queue_settings(extra: Dict[str, Any]) -> Dict[str, Any]:
         "max_concurrent": 1,
         "max_queued": clamp_int(settings.get("max_queued"), 5, 0, 100),
         "queue_timeout_ms": clamp_int(settings.get("queue_timeout_ms"), 0, 0, 86_400_000),
+        "run_timeout_ms": clamp_int(settings.get("run_timeout_ms"), 1_800_000, 0, 86_400_000),
         "cancelable_queued": True,
         "cancelable_running": True,
     }
+
+
+# auth 握手 concurrency 描述符字段（与 connector 一一对应）；本地扩展
+# 字段（如 run_timeout_ms）不进握手。
+_HANDSHAKE_CONCURRENCY_FIELDS = (
+    "max_concurrent",
+    "max_queued",
+    "queue_timeout_ms",
+    "cancelable_queued",
+    "cancelable_running",
+)
 
 
 @dataclass(frozen=True)
@@ -336,8 +353,13 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     if config.shared_owner_id:
         payload["shared_owner_id"] = config.shared_owner_id
     # 事件队列能力声明（对齐 connector）：后端/APP 据此启用队列 UI 与操作。
+    # 只带 connector 对齐的字段，本地扩展字段（run_timeout_ms）不下发。
     if config.concurrency:
-        payload["concurrency"] = dict(config.concurrency)
+        payload["concurrency"] = {
+            key: config.concurrency[key]
+            for key in _HANDSHAKE_CONCURRENCY_FIELDS
+            if key in config.concurrency
+        }
     host_meta = {
         "hostname": get_hostname(),
         "platform": platform.system().lower(),

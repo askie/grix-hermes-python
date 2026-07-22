@@ -609,6 +609,7 @@ class GrixAdapter(BasePlatformAdapter):
             EventQueueConfig(
                 max_queued=int(_queue_settings["max_queued"]),
                 queue_timeout_ms=int(_queue_settings["queue_timeout_ms"]),
+                run_timeout_ms=int(_queue_settings["run_timeout_ms"]),
             ),
             on_deliver=self._on_queue_deliver,
             on_state_change=self._on_queue_state_change,

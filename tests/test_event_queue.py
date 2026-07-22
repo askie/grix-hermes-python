@@ -2,7 +2,7 @@
 
 覆盖：提交/立即投递/排队、组内串行与跨组并行、完成续投、单删（取消 /
 静默摘除）、按会话清空、愿望清单重排、快照、队满拒绝、排队超时、
-暂停/恢复闸门。
+运行看门狗超时、暂停/恢复闸门。
 """
 
 import asyncio
@@ -39,10 +39,14 @@ class Recorder:
         self.states.append((item.event_id, state, dict(meta)))
 
 
-def _make_queue(max_queued=5, queue_timeout_ms=0):
+def _make_queue(max_queued=5, queue_timeout_ms=0, run_timeout_ms=0):
     rec = Recorder()
     queue = EventQueue(
-        EventQueueConfig(max_queued=max_queued, queue_timeout_ms=queue_timeout_ms),
+        EventQueueConfig(
+            max_queued=max_queued,
+            queue_timeout_ms=queue_timeout_ms,
+            run_timeout_ms=run_timeout_ms,
+        ),
         on_deliver=rec.on_deliver,
         on_state_change=rec.on_state_change,
     )
@@ -246,6 +250,47 @@ def test_queue_timeout_fails_event():
     queue, rec = asyncio.run(_run())
     assert ("e2", STATE_FAILED, {"reason": "queue timeout"}) in rec.states
     assert queue.queued_count == 0
+
+
+def test_run_timeout_fails_running_event_and_drains_queue():
+    async def _run():
+        queue, rec = _make_queue(run_timeout_ms=50)
+        queue.submit(_item("e1"))  # running（槽位卡死场景：永不 complete）
+        queue.submit(_item("e2"))  # queued
+        await asyncio.sleep(0.08)
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    assert ("e1", STATE_FAILED, {"reason": "run timeout"}) in rec.states
+    assert not queue.is_running("e1")
+    # 槽位释放后排队事件立即续投（e2 自己的看门狗 100ms 才到期，此刻仍在运行）
+    assert queue.is_running("e2")
+    assert rec.delivered == ["e1", "e2"]
+
+
+def test_run_timeout_cancelled_by_complete():
+    async def _run():
+        queue, rec = _make_queue(run_timeout_ms=30)
+        queue.submit(_item("e1"))
+        queue.complete("e1")
+        await asyncio.sleep(0.1)
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    assert not any(state == STATE_FAILED for _, state, _ in rec.states)
+    assert queue.running_count == 0
+
+
+def test_run_timeout_disabled_by_default():
+    async def _run():
+        queue, rec = _make_queue()
+        queue.submit(_item("e1"))
+        await asyncio.sleep(0.05)
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    assert queue.is_running("e1")
+    assert not any(state == STATE_FAILED for _, state, _ in rec.states)
 
 
 def test_pause_resume_gate():

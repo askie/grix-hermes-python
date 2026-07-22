@@ -7,6 +7,8 @@
 - 支持精确取消单个排队事件、静默摘除、按会话清空、按会话重排（愿望清单
   语义，绝不报错）、按会话快照；
 - 队列满拒绝新事件（上报 failed），可选排队超时；
+- 运行中事件可挂看门狗超时（run_timeout_ms）：收口钩子链路断裂导致
+  槽位永久泄漏时，到期按 failed 收口并释放槽位；
 - 出队闸门用"暂停原因集合"，多个暂停源可叠加互不踩踏。
 
 队列为纯内存态，进程重启即丢失（与 connector 一致）。本模块不做任何
@@ -79,6 +81,14 @@ class QueueItem:
 class EventQueueConfig:
     max_queued: int = 5
     queue_timeout_ms: int = 0
+    # 运行中事件的看门狗超时（毫秒）：<=0 关闭。此默认值仅供测试/独立
+    # 使用；生产环境由 protocol.resolve_event_queue_settings 显式传入
+    # （默认 30 分钟）。运行中事件的收口完全依赖使用方的完成钩子
+    # （on_processing_complete 等）；钩子链路一旦断裂（消息在框架
+    # pending 中丢失、轮次挂死不收口），槽位会永久泄漏，组内后续事件
+    # 全部排队直至队满拒绝。看门狗到期按 failed 收口并释放槽位，把
+    # 损害限制在超时窗口内。
+    run_timeout_ms: int = 0
     cancelable_queued: bool = True
     cancelable_running: bool = True
 
@@ -105,6 +115,7 @@ class EventQueue:
         self._running: Dict[str, QueueItem] = {}
         self._queued: List[QueueItem] = []
         self._timeout_handles: Dict[str, asyncio.TimerHandle] = {}
+        self._run_timeout_handles: Dict[str, asyncio.TimerHandle] = {}
         self._hold_handles: Dict[str, asyncio.TimerHandle] = {}
         self._pause_reasons: set[str] = set()
         self._drain_scheduled = False
@@ -308,6 +319,7 @@ class EventQueue:
         """
         self._running.pop(event_id, None)
         self._cancel_timeout(event_id)
+        self._cancel_run_timeout(event_id)
         self._schedule_drain()
 
     # ── 取消 / 移除 / 清空 / 重排 ─────────────────────────────────────
@@ -406,6 +418,9 @@ class EventQueue:
         for handle in self._timeout_handles.values():
             handle.cancel()
         self._timeout_handles.clear()
+        for handle in self._run_timeout_handles.values():
+            handle.cancel()
+        self._run_timeout_handles.clear()
         for handle in self._hold_handles.values():
             handle.cancel()
         self._hold_handles.clear()
@@ -418,6 +433,7 @@ class EventQueue:
     def _start(self, item: QueueItem) -> None:
         self._running[item.event_id] = item
         self._on_state_change(item, STATE_RUNNING, {})
+        self._arm_run_timeout(item)
         self._on_deliver(item)
 
     def _find_queued(self, event_id: str) -> Optional[QueueItem]:
@@ -461,6 +477,45 @@ class EventQueue:
 
     def _cancel_timeout(self, event_id: str) -> None:
         handle = self._timeout_handles.pop(event_id, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _arm_run_timeout(self, item: QueueItem) -> None:
+        """为运行中事件挂看门狗定时器；run_timeout_ms<=0 时为空操作。"""
+        if self._config.run_timeout_ms <= 0:
+            return
+        self._cancel_run_timeout(item.event_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._run_timeout_handles[item.event_id] = loop.call_later(
+            self._config.run_timeout_ms / 1000,
+            self._run_timeout_event,
+            item.event_id,
+        )
+
+    def _run_timeout_event(self, event_id: str) -> None:
+        """运行看门狗到期：按 failed 收口并释放槽位，让排队事件得以续投。
+
+        到期的 run 可能仍在真的执行（合法长任务）——槽位释放后其迟到
+        的 complete 是幂等空操作；也可能早已挂死（钩子链路断裂），此时
+        这是唯一的槽位回收通道。
+        """
+        self._run_timeout_handles.pop(event_id, None)
+        item = self._running.pop(event_id, None)
+        if item is None:
+            return
+        logger.warning(
+            "event queue run timeout, reaping stale running event event_id=%s session_id=%s",
+            event_id,
+            item.session_id,
+        )
+        self._on_state_change(item, STATE_FAILED, {"reason": "run timeout"})
+        self._schedule_drain()
+
+    def _cancel_run_timeout(self, event_id: str) -> None:
+        handle = self._run_timeout_handles.pop(event_id, None)
         if handle is not None:
             handle.cancel()
 
