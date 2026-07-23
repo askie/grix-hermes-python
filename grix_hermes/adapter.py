@@ -1784,6 +1784,8 @@ class GrixAdapter(BasePlatformAdapter):
                     await self._complete_event_if_needed(eid, status=STATUS_RESPONDED)
 
         if want_bg_hold and session_id:
+            # 强制再推一次：更新虚拟标题（进程 command），避免前端短暂停在 start 文案。
+            await self._push_queue_snapshot(session_id, owner_key)
             await self._refresh_bg_hold_activity(session_id, owner_key, active=True)
             self._ensure_bg_hold_sweep()
             return
@@ -3905,7 +3907,11 @@ class GrixAdapter(BasePlatformAdapter):
         try:
             while not getattr(self, "_shutting_down", False):
                 await asyncio.sleep(interval)
-                await self._sweep_bg_holds_once()
+                try:
+                    await self._sweep_bg_holds_once()
+                except Exception as exc:
+                    # 单次巡检失败不退出循环，避免僵尸虚拟 running 无人收。
+                    logger.debug("[%s] bg-hold sweep once error: %s", self.name, exc)
                 if not self._has_any_bg_hold():
                     return
         except asyncio.CancelledError:
