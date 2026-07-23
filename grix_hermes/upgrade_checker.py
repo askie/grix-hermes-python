@@ -34,6 +34,32 @@ PLUGIN_NAME = "grix-hermes"
 PLUGIN_GIT_REPO = "askie/grix-hermes-python"
 
 
+def _running_plugin_dir_name() -> str:
+    """Name of the directory the running plugin code was loaded from.
+
+    Hermes' plugin loader discovers **every** subdirectory of ``plugins/`` that
+    contains a ``plugin.yaml`` and lets later (sorted) entries override earlier
+    ones on name collision. A stray manual backup such as
+    ``grix-hermes.bak.vX.Y.Z/`` therefore *shadows* the real ``grix-hermes/``
+    directory: the gateway silently runs the stale backup code while
+    ``hermes plugins update`` keeps rewriting the real directory. When this
+    happens the running dir name differs from :data:`PLUGIN_NAME` and any
+    self-upgrade attempt is futile — the new code is never the code that loads.
+
+    Edge case (accepted): a plain pip/wheel install reports the site-packages
+    parent dir, which also differs from :data:`PLUGIN_NAME`. Harmless there —
+    self-upgrade only works under a Hermes plugin install anyway, so refusing
+    to upgrade remains the right behaviour; only the log wording assumes a
+    ``plugins/`` layout.
+    """
+    return Path(__file__).resolve().parent.parent.name
+
+
+def _is_shadowed_copy() -> bool:
+    """True when the running code does not live in the canonical plugin dir."""
+    return _running_plugin_dir_name() != PLUGIN_NAME
+
+
 def resolve_plugin_version() -> str:
     """Resolve the running grix-hermes version at runtime.
 
@@ -230,17 +256,47 @@ class UpgradeChecker:
                 "status": "success",
             })
         else:
-            logger.warning(
-                "[upgrade] startup version %s != target %s, rolled back",
-                current, target,
-            )
-            await self._report({
-                "from_version": from_ver,
-                "to_version": target,
-                "status": "rolled_back",
-                "error_code": "STARTUP_MISMATCH",
-                "error_msg": f"expected {target}, got {current}",
-            })
+            # 升级「成功」重启后版本仍不符 = 本次升级实际没生效，必须计入失败
+            # 限流。否则每轮 check 都会重复 update→restart→mismatch，形成
+            # 无限重启循环（成功路径原本从不记失败，限流完全失效）。
+            # 计失败写本地 state 文件，I/O 异常不得中断 gateway 启动流程。
+            try:
+                self._record_failure(target)
+            except Exception as exc:
+                logger.warning("[upgrade] failed to record startup mismatch: %s", exc)
+            if _is_shadowed_copy():
+                # 运行代码来自 plugins/ 下的散兵备份目录（如 grix-hermes.bak.vX/
+                # —— Hermes 加载器按序发现所有含 plugin.yaml 的子目录，同名后
+                # 者覆盖前者），plugins update 更新的正规目录永远不会被加载。
+                # 再升级再重启也没用，唯一出路是人工清掉备份目录。
+                logger.error(
+                    "[upgrade] startup version %s != target %s: plugin is shadowed by "
+                    "stray copy %r under plugins/ — remove the backup directory so the "
+                    "real %s/ plugin gets loaded; skipping further upgrade attempts",
+                    current, target, _running_plugin_dir_name(), PLUGIN_NAME,
+                )
+                await self._report({
+                    "from_version": from_ver,
+                    "to_version": target,
+                    "status": "failed",
+                    "error_code": "PLUGIN_SHADOWED",
+                    "error_msg": (
+                        f"loaded from stray dir {_running_plugin_dir_name()!r} "
+                        f"instead of {PLUGIN_NAME}/ (expected {target}, got {current})"
+                    ),
+                })
+            else:
+                logger.warning(
+                    "[upgrade] startup version %s != target %s, rolled back",
+                    current, target,
+                )
+                await self._report({
+                    "from_version": from_ver,
+                    "to_version": target,
+                    "status": "rolled_back",
+                    "error_code": "STARTUP_MISMATCH",
+                    "error_msg": f"expected {target}, got {current}",
+                })
         _remove_pending(self._agent_id)
 
     # ----- check / upgrade -----
@@ -258,6 +314,17 @@ class UpgradeChecker:
 
     async def _check(self) -> None:
         if _pending_exists(self._agent_id):
+            return
+
+        if _is_shadowed_copy():
+            # 运行的是遮蔽副本：plugins update 写的正规目录不会被加载，升级
+            # 注定无效，重启只会把 gateway 拖进无限重启循环。直接放弃，等人
+            # 工清理备份目录（每次周期检查重报一次，便于告警发现）。
+            logger.error(
+                "[upgrade] refusing to self-upgrade: running code is shadowed by stray "
+                "dir %r under plugins/ (expected %s/) — remove the backup directory",
+                _running_plugin_dir_name(), PLUGIN_NAME,
+            )
             return
 
         resp = await self._query_upgrade()
