@@ -556,6 +556,12 @@ class GrixAdapter(BasePlatformAdapter):
     # 编辑消息的瞬时失败重试参数（覆盖 ws 内部重连窗口，约 3×3s）。
     _EDIT_RETRY_ATTEMPTS = 4
     _EDIT_RETRY_DELAY_S = 3.0
+    # LLM 轮次已 event_result 收口后，若 Hermes 后台进程仍在跑，继续用虚拟
+    # running 保活工具栏队列（对齐 connector Claude selfDriven）。超过此年龄的
+    # 进程视为僵尸/常驻 daemon，不再挡队列收口。
+    _BG_HOLD_MAX_AGE_S = 6 * 3600
+    _BG_HOLD_SWEEP_INTERVAL_S = 15.0
+    _BG_HOLD_COMPOSING_TTL_MS = 90_000
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(_PLATFORM_VALUE))
@@ -619,6 +625,9 @@ class GrixAdapter(BasePlatformAdapter):
         # pending 孤儿 + EventQueue running 槽空挂到 run_timeout（见 de89f921
         # 2026-07-23 事故：追问被 interrupt 进 pending，30 分钟后才失败收口）。
         self._sync_deliver_bucket: Optional[List[Any]] = None
+        # 后台进程保活巡检：LLM 轮次结束后若 process_registry 仍有该会话进程，
+        # 继续推虚拟 running；进程退出后清掉。
+        self._bg_hold_sweep_task: Optional[asyncio.Task] = None
 
     @staticmethod
     def _owner_key_of(client: Optional[GrixTransportClient]) -> str:
@@ -1032,6 +1041,10 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._disconnect_requested = True
+        sweep = getattr(self, "_bg_hold_sweep_task", None)
+        if sweep is not None:
+            sweep.cancel()
+            self._bg_hold_sweep_task = None
         if self._upgrade_checker:
             self._upgrade_checker.stop()
             self._upgrade_checker = None
@@ -1739,6 +1752,37 @@ class GrixAdapter(BasePlatformAdapter):
             for eid in remaining:
                 if eid not in inflight and eid not in event_ids:
                     await self._complete_event_if_needed(eid, status=STATUS_RESPONDED)
+
+        session_id = str(
+            (toolbar_work or {}).get("session_id")
+            or getattr(event.source, "chat_id", "")
+            or ""
+        ).strip()
+        # LLM 轮次已 event_result 收口，但 Hermes 后台进程仍在跑时，保留虚拟
+        # running（对齐 connector selfDriven），避免「最终结果未到、队列已空」。
+        # 用户主动取消本轮则不保活——停止语义优先。
+        if (
+            not is_cancelled
+            and session_id
+            and self._session_has_bg_hold(session_key)
+        ):
+            title = (
+                self._bg_hold_label(session_key)
+                or (toolbar_work or {}).get("title")
+                or "Background task in progress"
+            )
+            state.toolbar_active_work[session_key] = {
+                "session_id": session_id,
+                "title": title,
+                "bg_hold": True,
+            }
+            await self._push_queue_snapshot(session_id, owner_key)
+            await self._refresh_bg_hold_activity(session_id, owner_key, active=True)
+            await self._set_chat_state_for_hold(
+                session_id, "running", "hermes background process still active", owner_key
+            )
+            self._ensure_bg_hold_sweep()
+            return
 
         # 显式队列事件的收口会自行推快照；旁路/自驱轮次不一定在 EventQueue
         # 中，因此无条件再推一次最终权威快照，清掉虚拟 running 项。
@@ -3753,6 +3797,169 @@ class GrixAdapter(BasePlatformAdapter):
         finally:
             if token is not None:
                 _CURRENT_CLIENT_CTX.reset(token)
+
+    def _session_has_bg_hold(self, session_key: str) -> bool:
+        """该 Hermes session_key 是否仍有未退出的后台进程需要保活队列。"""
+        key = str(session_key or "").strip()
+        if not key:
+            return False
+        try:
+            from tools.process_registry import process_registry
+        except Exception:
+            return False
+        try:
+            return bool(
+                process_registry.has_active_for_session(
+                    key, max_active_age=float(self._BG_HOLD_MAX_AGE_S)
+                )
+            )
+        except Exception as exc:
+            logger.debug("[%s] bg-hold process check failed: %s", self.name, exc)
+            return False
+
+    def _bg_hold_label(self, session_key: str) -> str:
+        """取该会话最新活跃后台进程的命令预览，作虚拟 running 标题。"""
+        key = str(session_key or "").strip()
+        if not key:
+            return ""
+        try:
+            from tools.process_registry import process_registry
+        except Exception:
+            return ""
+        try:
+            sessions = process_registry.list_sessions(session_key=key)
+        except Exception as exc:
+            logger.debug("[%s] bg-hold label lookup failed: %s", self.name, exc)
+            return ""
+        running = [
+            s for s in sessions
+            if isinstance(s, dict) and s.get("status") == "running"
+        ]
+        if not running:
+            return ""
+        # 最新启动的优先（started_at 为可读字符串时退回命令序）。
+        chosen = running[-1]
+        command = str(chosen.get("command") or "").strip()
+        return build_preview(command) if command else ""
+
+    async def _refresh_bg_hold_activity(
+        self, session_id: str, owner_key: str, *, active: bool
+    ) -> None:
+        """续期/关闭 composing，让前端在虚拟 running 期间仍显示忙碌。"""
+        client = self._client_for_owner(owner_key)
+        if client is None:
+            return
+        try:
+            await client.set_session_activity(
+                session_id=str(session_id),
+                kind="composing",
+                active=bool(active),
+                ttl_ms=self._BG_HOLD_COMPOSING_TTL_MS if active else None,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] bg-hold session_activity failed session=%s active=%s: %s",
+                self.name, session_id, active, exc,
+            )
+
+    async def _set_chat_state_for_hold(
+        self, session_id: str, state: str, reason: str, owner_key: str = ""
+    ) -> None:
+        """event_result 后 chat_state 会变 completed；有后台进程时拉回 running。"""
+        client = self._client_for_owner(owner_key) if owner_key else self._active_client()
+        if client is None:
+            client = self._client
+        if client is None:
+            return
+        try:
+            await client.agent_invoke(
+                action="chat_state_update",
+                params={
+                    "session_id": str(session_id),
+                    "state": str(state),
+                    "reason": str(reason),
+                },
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] bg-hold chat_state_update(%s) failed for %s: %s",
+                self.name, state, session_id, exc,
+            )
+
+    def _ensure_bg_hold_sweep(self) -> None:
+        """确保后台保活巡检任务在跑（幂等）。"""
+        if getattr(self, "_shutting_down", False) or getattr(self, "_disconnect_requested", False):
+            return
+        task = getattr(self, "_bg_hold_sweep_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._bg_hold_sweep_task = loop.create_task(self._bg_hold_sweep_loop())
+
+    async def _bg_hold_sweep_loop(self) -> None:
+        """巡检 bg_hold 会话：进程仍在则续 composing；已退出则清虚拟 running。"""
+        interval = float(getattr(self, "_BG_HOLD_SWEEP_INTERVAL_S", 15.0) or 15.0)
+        try:
+            while not getattr(self, "_shutting_down", False):
+                await asyncio.sleep(interval)
+                await self._sweep_bg_holds_once()
+                if not self._has_any_bg_hold():
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[%s] bg-hold sweep loop error: %s", self.name, exc)
+        finally:
+            if getattr(self, "_bg_hold_sweep_task", None) is asyncio.current_task():
+                self._bg_hold_sweep_task = None
+
+    def _has_any_bg_hold(self) -> bool:
+        for state in self._owner_states.values():
+            for work in state.toolbar_active_work.values():
+                if work.get("bg_hold"):
+                    return True
+        return False
+
+    async def _sweep_bg_holds_once(self) -> None:
+        for owner_key, state in list(self._owner_states.items()):
+            for session_key, work in list(state.toolbar_active_work.items()):
+                if not work.get("bg_hold"):
+                    continue
+                session_id = str(work.get("session_id") or "").strip()
+                if not session_id:
+                    state.toolbar_active_work.pop(session_key, None)
+                    continue
+                # 真实轮次已接管时，去掉 bg_hold 标记，避免与 turn 标题打架。
+                if state.session_running_event_ids.get(session_key):
+                    work.pop("bg_hold", None)
+                    continue
+                if self._session_has_bg_hold(session_key):
+                    title = self._bg_hold_label(session_key)
+                    if title and title != work.get("title"):
+                        work["title"] = title
+                        await self._push_queue_snapshot(session_id, owner_key)
+                    await self._refresh_bg_hold_activity(
+                        session_id, owner_key, active=True
+                    )
+                    continue
+                state.toolbar_active_work.pop(session_key, None)
+                await self._push_queue_snapshot(session_id, owner_key)
+                await self._refresh_bg_hold_activity(
+                    session_id, owner_key, active=False
+                )
+                await self._set_chat_state_for_hold(
+                    session_id,
+                    "completed",
+                    "hermes background process finished",
+                    owner_key,
+                )
+                logger.info(
+                    "[%s] Cleared bg-hold virtual running for session %s",
+                    self.name, session_id,
+                )
 
     async def _push_all_queue_snapshots(self) -> None:
         """补推全部持有事件会话的队列快照（重连成功后对齐 connector onReconnected）。

@@ -96,6 +96,8 @@ class FakeTransportClient:
         self.edit_results = []
         self.stop_acks = []
         self.stop_results = []
+        self.activities = []
+        self.invokes = []
 
     async def complete_event(self, *, event_id, status, code=None, message=None, updated_at=None):
         self.completed.append({"event_id": event_id, "status": status, "message": message})
@@ -155,6 +157,15 @@ class FakeTransportClient:
     async def complete_stop(self, *, event_id, status, stop_id=None, code=None, message=None, updated_at=None):
         self.stop_results.append({"event_id": event_id, "status": status, "stop_id": stop_id})
 
+    async def set_session_activity(self, *, session_id, kind, active, ttl_ms=None, **kwargs):
+        self.activities.append(
+            {"session_id": session_id, "kind": kind, "active": active, "ttl_ms": ttl_ms}
+        )
+
+    async def agent_invoke(self, *, action, params=None, timeout_ms=None):
+        self.invokes.append({"action": action, "params": params or {}})
+        return {"ok": True}
+
 
 def _make_adapter(client=None):
     inst = adapter_mod.GrixAdapter.__new__(adapter_mod.GrixAdapter)
@@ -183,6 +194,10 @@ def _make_adapter(client=None):
         inst._delivered.append(message.event_id)
 
     inst._dispatch_grix_event = _fake_dispatch
+    inst._bg_hold_sweep_task = None
+    inst._BG_HOLD_MAX_AGE_S = adapter_mod.GrixAdapter._BG_HOLD_MAX_AGE_S
+    inst._BG_HOLD_SWEEP_INTERVAL_S = adapter_mod.GrixAdapter._BG_HOLD_SWEEP_INTERVAL_S
+    inst._BG_HOLD_COMPOSING_TTL_MS = adapter_mod.GrixAdapter._BG_HOLD_COMPOSING_TTL_MS
     return inst
 
 
@@ -336,6 +351,87 @@ def test_reconnect_replays_virtual_running_snapshot():
     _run_with_ctx(inst, client, inst._push_all_queue_snapshots())
 
     assert client.snapshots[-1]["running"] == ["selfdrive_s1"]
+
+
+def test_processing_complete_keeps_virtual_running_while_bg_process_alive(monkeypatch):
+    """LLM 轮次收口后若 Hermes 后台进程仍在，工具栏虚拟 running 必须保留。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", lambda *a, **kw: "sk:s1")
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._session_has_bg_hold = lambda session_key: session_key == "sk:s1"
+    inst._bg_hold_label = lambda session_key: "release.sh server"
+    inst._ensure_bg_hold_sweep = lambda: None
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="s1", thread_id=None),
+        message_id="m1",
+        text="publish",
+        raw_message={"_grix_kind": "message", "event_id": "ev-1"},
+    )
+
+    async def _flow():
+        await inst.on_processing_start(event)
+        await inst.on_processing_complete(event, adapter_mod.ProcessingOutcome.SUCCESS)
+
+    _run_with_ctx(inst, client, _flow())
+
+    work = inst._state_for("").toolbar_active_work["sk:s1"]
+    assert work["bg_hold"] is True
+    assert work["title"] == "release.sh server"
+    assert client.snapshots[-1]["running"] == ["selfdrive_s1"]
+    assert client.completed[-1]["status"] == "responded"
+    assert any(a["active"] is True for a in client.activities)
+    assert any(
+        i["action"] == "chat_state_update" and i["params"].get("state") == "running"
+        for i in client.invokes
+    )
+
+
+def test_processing_complete_clears_virtual_running_without_bg_process(monkeypatch):
+    """无后台进程时 complete 仍清掉虚拟 running（旧行为）。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", lambda *a, **kw: "sk:s1")
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._session_has_bg_hold = lambda session_key: False
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="s1", thread_id=None),
+        message_id="m1",
+        text="hi",
+        raw_message={"_grix_kind": "message", "event_id": "ev-1"},
+    )
+
+    async def _flow():
+        await inst.on_processing_start(event)
+        await inst.on_processing_complete(event, adapter_mod.ProcessingOutcome.SUCCESS)
+
+    _run_with_ctx(inst, client, _flow())
+
+    assert "sk:s1" not in inst._state_for("").toolbar_active_work
+    assert client.snapshots[-1]["running"] == []
+
+
+def test_bg_hold_sweep_clears_when_process_exits(monkeypatch):
+    """巡检发现后台进程已退出后，清虚拟 running 并上报 completed。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", lambda *a, **kw: "sk:s1")
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._state_for("").toolbar_active_work["sk:s1"] = {
+        "session_id": "s1",
+        "title": "release.sh",
+        "bg_hold": True,
+    }
+    inst._session_has_bg_hold = lambda session_key: False
+
+    _run_with_ctx(inst, client, inst._sweep_bg_holds_once())
+
+    assert "sk:s1" not in inst._state_for("").toolbar_active_work
+    assert client.snapshots[-1]["running"] == []
+    assert any(a["active"] is False for a in client.activities)
+    assert any(
+        i["action"] == "chat_state_update" and i["params"].get("state") == "completed"
+        for i in client.invokes
+    )
 
 
 # ── 重排 ────────────────────────────────────────────────────────────────
