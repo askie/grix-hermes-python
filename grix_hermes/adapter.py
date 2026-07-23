@@ -614,6 +614,11 @@ class GrixAdapter(BasePlatformAdapter):
             on_deliver=self._on_queue_deliver,
             on_state_change=self._on_queue_state_change,
         )
+        # complete() → drain → deliver 的同步汇聚桶。收口钩子里 await 续投，
+        # 避免 create_task 把下一条投到「当前轮 late_pending 检查之后」，造成
+        # pending 孤儿 + EventQueue running 槽空挂到 run_timeout（见 de89f921
+        # 2026-07-23 事故：追问被 interrupt 进 pending，30 分钟后才失败收口）。
+        self._sync_deliver_bucket: Optional[List[Any]] = None
 
     @staticmethod
     def _owner_key_of(client: Optional[GrixTransportClient]) -> str:
@@ -2871,6 +2876,13 @@ class GrixAdapter(BasePlatformAdapter):
             await self._complete_event_if_needed(
                 message.event_id, status=STATUS_RESPONDED,
             )
+        elif (
+            self._event_still_open(session_key, message.event_id)
+            and session_key in self._pending_messages
+        ):
+            # 已占 EQ running 槽、却被 busy-handler 打进 pending：若当前轮
+            # 已过 late_pending 检查，pending 会永久悬挂。挂一个短恢复任务。
+            self._schedule_orphaned_pending_recovery(session_key, message.event_id)
 
     async def _handle_edit_packet(self, payload: Dict[str, Any]) -> None:
         edit: GrixEditEvent = normalize_edit_event(payload)
@@ -3515,7 +3527,14 @@ class GrixAdapter(BasePlatformAdapter):
             pass
 
     def _on_queue_deliver(self, item: QueueItem) -> None:
-        """队列回调：事件获得执行槽位。派后台任务真正投递（回调本身须同步返回）。"""
+        """队列回调：事件获得执行槽位。
+
+        回调本身须同步返回。默认 fire-and-forget 派后台任务；若正处于
+        ``_complete_event_if_needed`` 的同步汇聚窗口（``_sync_deliver_bucket``
+        非空），则把协程挂进桶里由收口方 await——保证续投在当前轮
+        ``on_processing_complete`` 返回前完成，从而能被 base 的 late_pending
+        检查捞到，避免 pending 孤儿。
+        """
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -3523,7 +3542,12 @@ class GrixAdapter(BasePlatformAdapter):
                 "[%s] queue deliver without running loop event_id=%s", self.name, item.event_id,
             )
             return
-        self._track_background_task(loop.create_task(self._deliver_queued_event(item)))
+        coro = self._deliver_queued_event(item)
+        bucket = getattr(self, "_sync_deliver_bucket", None)
+        if bucket is not None:
+            bucket.append(coro)
+            return
+        self._track_background_task(loop.create_task(coro))
 
     async def _deliver_queued_event(self, item: QueueItem) -> None:
         """投递一条队列事件：还原来源连接上下文后走正常派发链路。
@@ -3567,6 +3591,111 @@ class GrixAdapter(BasePlatformAdapter):
             # 这里只兜异常本身，避免炸掉投递任务。
         finally:
             _CURRENT_CLIENT_CTX.reset(token)
+
+    def _schedule_orphaned_pending_recovery(self, session_key: str, event_id: str) -> None:
+        """busy-pending 进队后挂短恢复：会话空闲仍未认领则强制 drain。
+
+        主路径靠 ``_complete_event_if_needed`` 同步 await 续投，让 base
+        late_pending 捞到；本恢复是兜底（例如续投不经 complete 汇聚桶、
+        或 late_pending 竞态仍漏掉）。
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._track_background_task(
+            loop.create_task(self._recover_orphaned_pending(session_key, event_id))
+        )
+
+    async def _recover_orphaned_pending(self, session_key: str, event_id: str) -> None:
+        # 先让出给当前轮的 late_pending / finally 清理。
+        await asyncio.sleep(0)
+        await asyncio.sleep(0.05)
+        if not self._event_still_open(session_key, event_id):
+            return
+
+        # 会话仍在跑且 owner task 未死：交给正常 drain。
+        if session_key in self._active_sessions:
+            stale = False
+            try:
+                stale = bool(self._session_task_is_stale(session_key))
+            except Exception:
+                stale = False
+            if not stale:
+                # 再等一会儿；长任务结束后应走 late_pending。若仍空闲悬挂则恢复。
+                for _ in range(40):  # ~2s
+                    await asyncio.sleep(0.05)
+                    if not self._event_still_open(session_key, event_id):
+                        return
+                    if session_key not in self._active_sessions:
+                        break
+                    try:
+                        if self._session_task_is_stale(session_key):
+                            break
+                    except Exception:
+                        break
+                else:
+                    return
+
+        if not self._event_still_open(session_key, event_id):
+            return
+        if session_key in self._active_sessions:
+            try:
+                if not self._session_task_is_stale(session_key):
+                    return
+                # 僵死锁：清掉再强制开跑（heal 会丢 pending，先取出）。
+                pending = self._pending_messages.get(session_key)
+                self._heal_stale_session_lock(session_key)
+                if pending is not None and session_key not in self._pending_messages:
+                    self._pending_messages[session_key] = pending
+            except Exception:
+                logger.debug(
+                    "[%s] orphaned-pending stale-heal failed session=%s event=%s",
+                    self.name, session_key, event_id, exc_info=True,
+                )
+                return
+
+        pending = self._pending_messages.get(session_key)
+        if pending is None:
+            queue = getattr(self, "_event_queue", None)
+            if queue is not None and queue.is_running(event_id):
+                logger.warning(
+                    "[%s] releasing ghost EventQueue running slot event=%s "
+                    "(open but no pending/active session)",
+                    self.name, event_id,
+                )
+                self._discard_open_event(session_key, event_id)
+                await self._complete_event_if_needed(
+                    event_id,
+                    status=STATUS_FAILED,
+                    message="orphaned running event",
+                )
+            return
+
+        logger.warning(
+            "[%s] recovering orphaned pending event=%s session=%s",
+            self.name, event_id, session_key,
+        )
+        event = self.get_pending_message(session_key)
+        if event is None:
+            return
+        if session_key in self._active_sessions:
+            # 恢复窗口内又有新轮次：塞回 pending 让它 drain。
+            self._pending_messages[session_key] = event
+            return
+        try:
+            await self.handle_message(event)
+        except Exception:
+            logger.exception(
+                "[%s] orphaned pending recovery failed event=%s", self.name, event_id,
+            )
+            if self._event_still_open(session_key, event_id):
+                self._discard_open_event(session_key, event_id)
+                await self._complete_event_if_needed(
+                    event_id,
+                    status=STATUS_FAILED,
+                    message="orphaned pending recovery failed",
+                )
 
     def _on_queue_state_change(self, item: QueueItem, state: str, meta: Dict[str, Any]) -> None:
         """队列回调：事件状态变化。派后台任务上报（回调本身须同步返回）。"""
@@ -4007,11 +4136,44 @@ class GrixAdapter(BasePlatformAdapter):
         # 无论后续能否上报，先释放该事件占用的队列槽位并触发续投（幂等）。
         # 测试用 __new__ 构造的裸 adapter 没有 _event_queue，getattr 兜底。
         queue = getattr(self, "_event_queue", None)
+        # 嵌套 complete（续投路径又失败收口）时复用外层桶，避免内层清空
+        # 导致外层丢协程。
+        own_bucket = getattr(self, "_sync_deliver_bucket", None) is None
         if queue is not None and event_id:
-            released = queue.find(event_id) if queue.is_running(event_id) else None
-            queue.complete(event_id)
-            if released is not None:
-                await self._push_queue_snapshot(released.session_id, released.owner_key)
+            if own_bucket:
+                self._sync_deliver_bucket = []
+            try:
+                released = queue.find(event_id) if queue.is_running(event_id) else None
+                queue.complete(event_id)
+                if released is not None:
+                    await self._push_queue_snapshot(released.session_id, released.owner_key)
+                if own_bucket:
+                    # complete() 用 call_soon 延迟 drain（对齐 connector
+                    # queueMicrotask）。先 sleep(0) 冲掉该 tick，让续投进桶，
+                    # 再 await 跑完——必须在 on_processing_complete 返回前
+                    # 结束，否则 late_pending 捞不到，pending 孤儿 + EQ
+                    # running 空挂到 30min run_timeout。
+                    await asyncio.sleep(0)
+                    while self._sync_deliver_bucket:
+                        delivers = list(self._sync_deliver_bucket)
+                        self._sync_deliver_bucket.clear()
+                        results = await asyncio.gather(*delivers, return_exceptions=True)
+                        for result in results:
+                            if isinstance(result, Exception):
+                                logger.error(
+                                    "[%s] sync queue deliver failed during complete "
+                                    "event=%s: %s",
+                                    self.name,
+                                    event_id,
+                                    result,
+                                    exc_info=result,
+                                )
+                        # 嵌套 complete 可能又 call_soon 了新的 drain
+                        if self._sync_deliver_bucket is not None:
+                            await asyncio.sleep(0)
+            finally:
+                if own_bucket:
+                    self._sync_deliver_bucket = None
 
         if not self._client or not event_id or event_id in self._active_state().completed_event_ids:
             return
