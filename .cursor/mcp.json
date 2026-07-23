@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "grix": {
+      "command": "/Users/gcf/.nvm/versions/node/v24.14.0/bin/node",
+      "args": [
+        "/Volumes/disk1/go/src/grix-connector/dist/mcp/acp-mcp-server.js",
+        "--api-url",
+        "http://127.0.0.1:65112?token=07c93e1ee7fb755b41c687b257ea49302bd95ecfce117571c886c74f12fe5a7e"
+      ]
+    }
+  }
+}
