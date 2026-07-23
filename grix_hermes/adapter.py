@@ -197,8 +197,8 @@ class _OwnerState:
     # Hermes 框架已进入处理轮次、但显式 EventQueue 里未必还有 running 项的
     # 会话。连接器会把这类 self-driven activity 合成为一个虚拟 running 项，
     # 避免工具栏队列数在 agent 仍工作时错误归零；这里保存同等的运行态。
-    # key=session_key，value={session_id, title}。按 owner 分桶由 _OwnerState 保证。
-    toolbar_active_work: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    # key=session_key，value={session_id, title, bg_hold?}。按 owner 分桶由 _OwnerState 保证。
+    toolbar_active_work: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 class _PendingMessagesDict(dict):
@@ -1694,7 +1694,7 @@ class GrixAdapter(BasePlatformAdapter):
         )
         state = self._active_state()
         owner_key = self._active_owner_key()
-        toolbar_work = state.toolbar_active_work.pop(session_key, None)
+        prior_toolbar = state.toolbar_active_work.get(session_key)
         message_id = str(event.message_id or "").strip()
         if message_id and state.processing_message_ids.get(session_key) == message_id:
             state.processing_message_ids.pop(session_key, None)
@@ -1709,6 +1709,38 @@ class GrixAdapter(BasePlatformAdapter):
         event_ids = state.session_running_event_ids.pop(session_key, [])
         if raw_event_id and raw_event_id not in event_ids:
             event_ids.append(raw_event_id)
+
+        is_success = outcome == ProcessingOutcome.SUCCESS or outcome is True
+        is_cancelled = outcome == ProcessingOutcome.CANCELLED
+        session_id = str(
+            (prior_toolbar or {}).get("session_id")
+            or getattr(event.source, "chat_id", "")
+            or ""
+        ).strip()
+        # 必须在任何会推 queue_snapshot 的 complete 之前决定保活：
+        # _complete_event_if_needed → queue.complete 会立刻推快照；若先 pop
+        # 虚拟项，会先发出 running=[]，正是本次要消灭的空窗。
+        # 用户主动取消不保活（停止语义优先）。对齐 connector：只保 queue
+        # 虚拟项 + composing，不碰 chat_state。
+        want_bg_hold = (
+            not is_cancelled
+            and bool(session_id)
+            and self._session_has_bg_hold(session_key)
+        )
+        if want_bg_hold:
+            title = (
+                self._bg_hold_label(session_key)
+                or (prior_toolbar or {}).get("title")
+                or "Background task in progress"
+            )
+            state.toolbar_active_work[session_key] = {
+                "session_id": session_id,
+                "title": title,
+                "bg_hold": True,
+            }
+            toolbar_work = None
+        else:
+            toolbar_work = state.toolbar_active_work.pop(session_key, None)
 
         # 触发消息被撤回：与 connector 对齐，以 canceled/revoked 终态收口
         # （不能静默不报——后端 durable run 需要终态），同轮其他事件正常收口。
@@ -1726,8 +1758,6 @@ class GrixAdapter(BasePlatformAdapter):
                 message_id,
             )
 
-        is_success = outcome == ProcessingOutcome.SUCCESS or outcome is True
-        is_cancelled = outcome == ProcessingOutcome.CANCELLED
         if is_success:
             status, message = STATUS_RESPONDED, None
         elif is_cancelled:
@@ -1753,34 +1783,8 @@ class GrixAdapter(BasePlatformAdapter):
                 if eid not in inflight and eid not in event_ids:
                     await self._complete_event_if_needed(eid, status=STATUS_RESPONDED)
 
-        session_id = str(
-            (toolbar_work or {}).get("session_id")
-            or getattr(event.source, "chat_id", "")
-            or ""
-        ).strip()
-        # LLM 轮次已 event_result 收口，但 Hermes 后台进程仍在跑时，保留虚拟
-        # running（对齐 connector selfDriven），避免「最终结果未到、队列已空」。
-        # 用户主动取消本轮则不保活——停止语义优先。
-        if (
-            not is_cancelled
-            and session_id
-            and self._session_has_bg_hold(session_key)
-        ):
-            title = (
-                self._bg_hold_label(session_key)
-                or (toolbar_work or {}).get("title")
-                or "Background task in progress"
-            )
-            state.toolbar_active_work[session_key] = {
-                "session_id": session_id,
-                "title": title,
-                "bg_hold": True,
-            }
-            await self._push_queue_snapshot(session_id, owner_key)
+        if want_bg_hold and session_id:
             await self._refresh_bg_hold_activity(session_id, owner_key, active=True)
-            await self._set_chat_state_for_hold(
-                session_id, "running", "hermes background process still active", owner_key
-            )
             self._ensure_bg_hold_sweep()
             return
 
@@ -3805,7 +3809,11 @@ class GrixAdapter(BasePlatformAdapter):
             return False
         try:
             from tools.process_registry import process_registry
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[%s] bg-hold unavailable (process_registry import failed): %s",
+                self.name, exc,
+            )
             return False
         try:
             return bool(
@@ -3813,8 +3821,20 @@ class GrixAdapter(BasePlatformAdapter):
                     key, max_active_age=float(self._BG_HOLD_MAX_AGE_S)
                 )
             )
+        except TypeError as exc:
+            # 旧 hermes 可能不接受 max_active_age；降级为无年龄过滤。
+            logger.warning(
+                "[%s] bg-hold has_active_for_session signature mismatch, "
+                "retrying without max_active_age: %s",
+                self.name, exc,
+            )
+            try:
+                return bool(process_registry.has_active_for_session(key))
+            except Exception as inner:
+                logger.warning("[%s] bg-hold process check failed: %s", self.name, inner)
+                return False
         except Exception as exc:
-            logger.debug("[%s] bg-hold process check failed: %s", self.name, exc)
+            logger.warning("[%s] bg-hold process check failed: %s", self.name, exc)
             return False
 
     def _bg_hold_label(self, session_key: str) -> str:
@@ -3824,12 +3844,16 @@ class GrixAdapter(BasePlatformAdapter):
             return ""
         try:
             from tools.process_registry import process_registry
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "[%s] bg-hold label unavailable (process_registry import failed): %s",
+                self.name, exc,
+            )
             return ""
         try:
             sessions = process_registry.list_sessions(session_key=key)
         except Exception as exc:
-            logger.debug("[%s] bg-hold label lookup failed: %s", self.name, exc)
+            logger.warning("[%s] bg-hold label lookup failed: %s", self.name, exc)
             return ""
         running = [
             s for s in sessions
@@ -3860,30 +3884,6 @@ class GrixAdapter(BasePlatformAdapter):
             logger.debug(
                 "[%s] bg-hold session_activity failed session=%s active=%s: %s",
                 self.name, session_id, active, exc,
-            )
-
-    async def _set_chat_state_for_hold(
-        self, session_id: str, state: str, reason: str, owner_key: str = ""
-    ) -> None:
-        """event_result 后 chat_state 会变 completed；有后台进程时拉回 running。"""
-        client = self._client_for_owner(owner_key) if owner_key else self._active_client()
-        if client is None:
-            client = self._client
-        if client is None:
-            return
-        try:
-            await client.agent_invoke(
-                action="chat_state_update",
-                params={
-                    "session_id": str(session_id),
-                    "state": str(state),
-                    "reason": str(reason),
-                },
-            )
-        except Exception as exc:
-            logger.debug(
-                "[%s] bg-hold chat_state_update(%s) failed for %s: %s",
-                self.name, state, session_id, exc,
             )
 
     def _ensure_bg_hold_sweep(self) -> None:
@@ -3949,12 +3949,6 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._push_queue_snapshot(session_id, owner_key)
                 await self._refresh_bg_hold_activity(
                     session_id, owner_key, active=False
-                )
-                await self._set_chat_state_for_hold(
-                    session_id,
-                    "completed",
-                    "hermes background process finished",
-                    owner_key,
                 )
                 logger.info(
                     "[%s] Cleared bg-hold virtual running for session %s",

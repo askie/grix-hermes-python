@@ -378,13 +378,12 @@ def test_processing_complete_keeps_virtual_running_while_bg_process_alive(monkey
     work = inst._state_for("").toolbar_active_work["sk:s1"]
     assert work["bg_hold"] is True
     assert work["title"] == "release.sh server"
-    assert client.snapshots[-1]["running"] == ["selfdrive_s1"]
     assert client.completed[-1]["status"] == "responded"
     assert any(a["active"] is True for a in client.activities)
-    assert any(
-        i["action"] == "chat_state_update" and i["params"].get("state") == "running"
-        for i in client.invokes
-    )
+    # 收口路径上不得出现空 running 快照（否则前端会先清队列）
+    assert all(snap["running"] for snap in client.snapshots), client.snapshots
+    assert client.snapshots[-1]["running"] == ["selfdrive_s1"]
+    assert not any(i["action"] == "chat_state_update" for i in client.invokes)
 
 
 def test_processing_complete_clears_virtual_running_without_bg_process(monkeypatch):
@@ -411,8 +410,34 @@ def test_processing_complete_clears_virtual_running_without_bg_process(monkeypat
     assert client.snapshots[-1]["running"] == []
 
 
+def test_processing_complete_cancel_does_not_bg_hold(monkeypatch):
+    """用户取消本轮时不保活后台虚拟项。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", lambda *a, **kw: "sk:s1")
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._session_has_bg_hold = lambda session_key: True
+    inst._bg_hold_label = lambda session_key: "should-not-hold"
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="s1", thread_id=None),
+        message_id="m1",
+        text="stop",
+        raw_message={"_grix_kind": "message", "event_id": "ev-1"},
+    )
+
+    async def _flow():
+        await inst.on_processing_start(event)
+        await inst.on_processing_complete(event, adapter_mod.ProcessingOutcome.CANCELLED)
+
+    _run_with_ctx(inst, client, _flow())
+
+    assert "sk:s1" not in inst._state_for("").toolbar_active_work
+    assert client.snapshots[-1]["running"] == []
+    assert client.completed[-1]["status"] == "canceled"
+
+
 def test_bg_hold_sweep_clears_when_process_exits(monkeypatch):
-    """巡检发现后台进程已退出后，清虚拟 running 并上报 completed。"""
+    """巡检发现后台进程已退出后，清虚拟 running。"""
     monkeypatch.setattr(adapter_mod, "build_session_key", lambda *a, **kw: "sk:s1")
     client = FakeTransportClient()
     inst = _make_adapter(client)
@@ -428,10 +453,40 @@ def test_bg_hold_sweep_clears_when_process_exits(monkeypatch):
     assert "sk:s1" not in inst._state_for("").toolbar_active_work
     assert client.snapshots[-1]["running"] == []
     assert any(a["active"] is False for a in client.activities)
-    assert any(
-        i["action"] == "chat_state_update" and i["params"].get("state") == "completed"
-        for i in client.invokes
+    assert not any(i["action"] == "chat_state_update" for i in client.invokes)
+
+
+def test_bg_hold_survives_queue_complete_mid_snapshot(monkeypatch):
+    """queue.complete 中途推快照时，bg_hold 已就位，不得发出空 running。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", lambda *a, **kw: "sk:s1")
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._session_has_bg_hold = lambda session_key: True
+    inst._bg_hold_label = lambda session_key: "release.sh"
+    inst._ensure_bg_hold_sweep = lambda: None
+
+    # 真实 running 项：complete 时会 push 一次快照
+    item = _item(inst, "ev-1", session_id="s1", text="publish")
+    inst._event_queue.submit(item)
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="s1", thread_id=None),
+        message_id="m1",
+        text="publish",
+        raw_message={"_grix_kind": "message", "event_id": "ev-1"},
     )
+
+    async def _flow():
+        await _settle()
+        await inst.on_processing_start(event)
+        client.snapshots.clear()
+        await inst.on_processing_complete(event, adapter_mod.ProcessingOutcome.SUCCESS)
+
+    _run_with_ctx(inst, client, _flow())
+
+    assert client.snapshots, "expected at least one snapshot during complete"
+    assert all(snap["running"] for snap in client.snapshots), client.snapshots
+    assert inst._state_for("").toolbar_active_work["sk:s1"]["bg_hold"] is True
 
 
 # ── 重排 ────────────────────────────────────────────────────────────────
