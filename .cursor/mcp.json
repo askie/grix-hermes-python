@@ -5,7 +5,7 @@
       "args": [
         "/Volumes/disk1/go/src/grix-connector/dist/mcp/acp-mcp-server.js",
         "--api-url",
-        "http://127.0.0.1:56389?token=fbd107d8ade6b41b90c0046252535d0183f18e5022ca0a3d27500a645bbe96fc"
+        "http://127.0.0.1:65112?token=07c93e1ee7fb755b41c687b257ea49302bd95ecfce117571c886c74f12fe5a7e"
       ]
     }
   }
