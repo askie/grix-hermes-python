@@ -2682,6 +2682,9 @@ class GrixAdapter(BasePlatformAdapter):
                 on_change=_on_sync_success,
             )
             await self._skill_syncer.start()
+            # migrate / 首轮 sync 无论成败都强制刷一次：升级后库台账迁完若平台不可达，
+            # on_change 不会触发，否则工具栏可能长时间看不到 library_skills。
+            await self._report_skills(force=True)
             logger.info("[%s] Skill syncer started", self.name)
         except Exception as exc:
             logger.warning("[%s] Failed to start skill syncer: %s", self.name, exc)

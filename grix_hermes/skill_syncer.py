@@ -169,7 +169,10 @@ class SkillSyncer:
             for s in remote:
                 local = manifest["skills"].get(s["name"])
                 owner_id = s.get("owner_id")
-                system = str(owner_id or "") == "0"
+                # 兼容 "0" / 0；勿用 `owner_id or ""`（数字 0 会被当成假值）。
+                system = str(owner_id if owner_id is not None else "") == "0"
+                if owner_id is not None:
+                    owner_id = str(owner_id)
                 if local and local.get("digest") == s.get("digest"):
                     manifest["skills"][s["name"]] = {
                         **local,

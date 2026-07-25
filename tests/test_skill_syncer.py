@@ -345,3 +345,16 @@ def test_digest_hit_backfills_owner_id_and_system():
         assert m2["skills"]["a"]["system"] is True
         # digest 命中不再拉 content
         assert all("/content" not in u for u in fetch2.calls[1:])
+
+
+def test_numeric_owner_id_zero_marks_system():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        fetch = make_fetch(
+            [{"id": "10", "name": "a", "version": "1", "digest": "d1", "owner_id": 0}],
+            {"10": "c1"},
+        )
+        asyncio.run(new_syncer(tmp, fetch).sync_once())
+        m = read_manifest(tmp)
+        assert m["skills"]["a"]["owner_id"] == "0"
+        assert m["skills"]["a"]["system"] is True

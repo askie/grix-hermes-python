@@ -36,7 +36,10 @@ def is_reserved_name(name: str) -> bool:
 def is_system_skill_entry(entry: Optional[dict]) -> bool:
     if not entry:
         return False
-    return entry.get("system") is True or str(entry.get("owner_id") or "") == "0"
+    if entry.get("system") is True:
+        return True
+    # 兼容字符串 "0" 与 JSON 数字 0（两端约定以字符串为主，防御性处理）。
+    return str(entry.get("owner_id") if entry.get("owner_id") is not None else "") == "0"
 
 
 def _read_manifest(skills_dir: Path) -> Dict[str, dict]:

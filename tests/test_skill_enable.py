@@ -189,3 +189,87 @@ def test_migrate_legacy_hermes_library():
         assert link.resolve() == (lib / "old").resolve()
         # 库已有台账 → 不再迁
         assert migrate_legacy_hermes_library(library_dir=lib, legacy_dir=legacy) is False
+
+
+def test_grix_prefix_blocked():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        lib = base / "lib"
+        home = base / "home"
+        lib.mkdir()
+        home.mkdir()
+        _write_lib(lib, "grix-demo")
+        try:
+            asyncio.run(
+                enable_skill(name="grix-demo", scope="global", skills_dir=lib, home=home)
+            )
+            raise AssertionError("expected BLOCKED")
+        except SkillEnableError as exc:
+            assert exc.code == "BLOCKED"
+
+
+def test_unmanaged_same_digest_needs_force_then_replaces():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        lib = base / "lib"
+        home = base / "home"
+        lib.mkdir()
+        home.mkdir()
+        content = _fm("demo")
+        digest = _write_lib(lib, "demo", content=content)
+        assert digest
+        slot = home / ".hermes" / "skills" / "demo"
+        slot.mkdir(parents=True)
+        (slot / "SKILL.md").write_text(content, encoding="utf-8")
+        try:
+            asyncio.run(
+                enable_skill(name="demo", scope="global", skills_dir=lib, home=home)
+            )
+            raise AssertionError("expected NEEDS_FORCE")
+        except SkillEnableError as exc:
+            assert exc.code == "NEEDS_FORCE"
+        result = asyncio.run(
+            enable_skill(
+                name="demo",
+                scope="global",
+                skills_dir=lib,
+                home=home,
+                force="replace_with_link",
+            )
+        )
+        assert result["changed"] is True
+        assert slot.is_symlink()
+
+
+def test_migrate_does_not_overwrite_user_skill_at_name_slot():
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        legacy = base / "hermes" / "skills"
+        lib = base / "grix" / "skills"
+        legacy.mkdir(parents=True)
+        # 台账 dir 与 name 不同：迁走 dir 后，name 槽位已有用户自建，不得覆盖。
+        synced = legacy / "synced-dir"
+        synced.mkdir()
+        (synced / "SKILL.md").write_text(_fm("mine"), encoding="utf-8")
+        user = legacy / "mine"
+        user.mkdir()
+        (user / "SKILL.md").write_text(_fm("mine", "user"), encoding="utf-8")
+        (legacy / ".grix-sync.json").write_text(
+            json.dumps(
+                {
+                    "skills": {
+                        "mine": {
+                            "id": "1",
+                            "version": "1",
+                            "digest": "x",
+                            "dir": "synced-dir",
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert migrate_legacy_hermes_library(library_dir=lib, legacy_dir=legacy)
+        assert (lib / "synced-dir" / "SKILL.md").exists()
+        assert user.is_dir() and not user.is_symlink()
+        assert (user / "SKILL.md").read_text(encoding="utf-8") == _fm("mine", "user")
