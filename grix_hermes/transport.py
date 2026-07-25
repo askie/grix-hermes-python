@@ -849,9 +849,17 @@ class GrixTransportClient:
             raise GrixPacketError(packet["cmd"], code, parse_message(result_payload))
         return result_payload
 
-    async def send_skills_update(self, skills: List[Dict[str, Any]]) -> None:
-        """主动上报最新的 skills 列表，后端整体覆盖 runtime profile.skills。"""
-        await self.send_packet("agent_skills_update", {"skills": skills})
+    async def send_skills_update(
+        self,
+        skills: List[Dict[str, Any]],
+        *,
+        library_skills: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """主动上报 skills（+ library_skills），后端整体覆盖 runtime profile。"""
+        payload: Dict[str, Any] = {"skills": skills}
+        if library_skills is not None:
+            payload["library_skills"] = library_skills
+        await self.send_packet("agent_skills_update", payload)
 
     async def _reader_loop(self) -> None:
         try:

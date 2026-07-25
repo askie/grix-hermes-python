@@ -306,7 +306,7 @@ def test_dir_rule_migration_cleans_old_dir():
         assert not old_dir.exists()
 
 
-def test_on_change_fires_only_when_changed():
+def test_on_change_fires_on_every_successful_sync():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         hits = []
@@ -320,6 +320,28 @@ def test_on_change_fires_only_when_changed():
         s = new_syncer(tmp, fetch, on_change=on_change)
         asyncio.run(s.sync_once())
         assert hits == [1]
-        # 第二轮无变化 → 不回调。
+        # 第二轮无内容变化也回调（对齐 connector onSyncSuccess / library_skills 刷新）。
         asyncio.run(s.sync_once())
-        assert hits == [1]
+        assert hits == [1, 1]
+
+
+def test_digest_hit_backfills_owner_id_and_system():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        fetch1 = make_fetch(
+            [{"id": "10", "name": "a", "version": "1", "digest": "d1"}], {"10": "c1"}
+        )
+        asyncio.run(new_syncer(tmp, fetch1).sync_once())
+        m = read_manifest(tmp)
+        assert "owner_id" not in m["skills"]["a"] or m["skills"]["a"].get("owner_id") is None
+
+        fetch2 = make_fetch(
+            [{"id": "10", "name": "a", "version": "1", "digest": "d1", "owner_id": "0"}],
+            {"10": "c1"},
+        )
+        asyncio.run(new_syncer(tmp, fetch2).sync_once())
+        m2 = read_manifest(tmp)
+        assert m2["skills"]["a"]["owner_id"] == "0"
+        assert m2["skills"]["a"]["system"] is True
+        # digest 命中不再拉 content
+        assert all("/content" not in u for u in fetch2.calls[1:])

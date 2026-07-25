@@ -23,6 +23,9 @@ def test_build_auth_payload_includes_tailnet_file_server_meta(monkeypatch):
     )
 
     assert "create_folder" in payload["local_actions"]
+    assert "skill_upload" in payload["local_actions"]
+    assert "skill_enable" in payload["local_actions"]
+    assert "skill_disable" in payload["local_actions"]
     assert payload["host_meta"]["tailnet_ip"] == "100.64.0.5"
     assert payload["host_meta"]["file_server_port"] == 34567
 

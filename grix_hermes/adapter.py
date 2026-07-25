@@ -69,6 +69,8 @@ from .contract import (
     KICKED_REASON_AGENT_DELETED,
     LOCAL_ACTION_FILE_LIST,
     LOCAL_ACTION_GET_SESSION_USAGE,
+    LOCAL_ACTION_SKILL_DISABLE,
+    LOCAL_ACTION_SKILL_ENABLE,
     LOCAL_ACTION_SKILL_UPLOAD,
     STATUS_ALREADY_FINISHED,
     STATUS_CANCELED,
@@ -1009,33 +1011,49 @@ class GrixAdapter(BasePlatformAdapter):
         await self._start_skill_syncer()
         return True
 
-    async def _report_skills(self, *, force: bool = True) -> None:
-        """扫描本地 skills 并通过 agent_skills_update 上报给后端。
+    async def _report_skills(self, *, force: bool = True, cwd: Optional[str] = None) -> None:
+        """扫描本地 skills + library_skills 并通过 agent_skills_update 上报。
 
-        force=True（连接/重连）：无条件上报，重连后后端 profile 需要重建。
-        force=False（会话活动触发）：仅当清单相对上次上报发生变化时才推，避免刷屏——
-        用户新增/改名技能后无需整插件重启即可刷新工具栏清单。
+        force=True（连接/重连/同步成功/enable-disable）：无条件上报。
+        force=False（会话活动触发）：仅当清单相对上次上报发生变化时才推，避免刷屏。
+        cwd：会话绑定工作目录；project scope 完全依赖它，禁止 os.getcwd 兜底。
         """
         try:
-            from pathlib import Path
             from .exec_command import scan_hermes_skills
+            from .library_skills import list_library_skills
+            from .skill_paths import resolve_library_skills_dir
             from .skill_sync_state import annotate_sync_states
+
             entries = scan_hermes_skills()
-            skills = annotate_sync_states(entries, Path.home() / ".hermes" / "skills")
-            if not skills:
+            # sync_state 对照库台账（~/.grix/skills），不是启用根。
+            skills = annotate_sync_states(entries, resolve_library_skills_dir())
+            library = list_library_skills(cwd=cwd)
+            if not skills and not library:
                 return
-            # 带上 sync_state：上传成功后即使 name/source 不变，状态翻转也要触发重报，
-            # 否则工具栏在下一次真正的清单变化前会一直显示旧状态。
             digest = json.dumps(
-                [f"{s['source']}:{s['name']}:{s.get('sync_state')}" for s in skills]
+                {
+                    "skills": [
+                        f"{s['source']}:{s['name']}:{s.get('sync_state')}" for s in skills
+                    ],
+                    "library": [
+                        f"{s['name']}:{s.get('enable_scopes')}" for s in library
+                    ],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
             )
             if not force and digest == self._last_skills_hash:
                 return
             self._last_skills_hash = digest
             if self._client:
                 # 启动时主连接的管理性主动调用,不在 packet handler 上下文,显式走主连接。
-                await self._client.send_skills_update(skills)
-                logger.info("[%s] Reported %d skill(s)", self.name, len(skills))
+                await self._client.send_skills_update(skills, library_skills=library)
+                logger.info(
+                    "[%s] Reported %d skill(s), %d library skill(s)",
+                    self.name,
+                    len(skills),
+                    len(library),
+                )
         except Exception as exc:
             logger.debug("[%s] Skills report failed: %s", self.name, exc)
 
@@ -2347,6 +2365,14 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_skill_upload(action)
             return
 
+        if action.action_type == LOCAL_ACTION_SKILL_ENABLE:
+            await self._handle_skill_enable(action)
+            return
+
+        if action.action_type == LOCAL_ACTION_SKILL_DISABLE:
+            await self._handle_skill_disable(action)
+            return
+
         if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
             await self._active_client().send_local_action_result(
                 action_id=action.action_id,
@@ -2508,6 +2534,107 @@ class GrixAdapter(BasePlatformAdapter):
             result={"name": name},
         )
 
+    async def _handle_skill_enable(self, action: GrixLocalAction) -> None:
+        """把库技能软链到 Hermes 启用主根（对齐 connector skill_enable）。"""
+        if not self._active_client():
+            return
+        from .skill_enable import SkillEnableError, enable_skill
+
+        params = action.params or {}
+        name = str(params.get("name") or "").strip()
+        scope = str(params.get("scope") or "").strip()
+        force_raw = params.get("force")
+        force = (
+            force_raw
+            if force_raw in ("replace_link", "replace_with_link")
+            else None
+        )
+        # project scope 只认会话绑定 cwd；Hermes 当前 resolve_cwd 常为 None → unavailable。
+        cwd = None
+        try:
+            result = await enable_skill(name=name, scope=scope, cwd=cwd, force=force)
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_OK,
+                result={
+                    "name": result["name"],
+                    "scope": result["scope"],
+                    "path": result["path"],
+                    "changed": result["changed"],
+                    "enable_state": result["status"],
+                    "uninstallable": True,
+                },
+            )
+        except SkillEnableError as exc:
+            conflict = (
+                exc.code.lower()
+                if exc.code in ("CONFLICT", "NEEDS_FORCE", "BLOCKED")
+                else None
+            )
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code=exc.code,
+                error_message=str(exc),
+                result={"conflict_kind": conflict} if conflict else None,
+            )
+        except Exception as exc:
+            logger.warning("[%s] skill_enable failed name=%s: %s", self.name, name, exc)
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="SKILL_ENABLE_FAILED",
+                error_message=str(exc),
+            )
+        await self._report_skills(force=True, cwd=cwd)
+
+    async def _handle_skill_disable(self, action: GrixLocalAction) -> None:
+        """摘掉 enable 建的软链（对齐 connector skill_disable）。"""
+        if not self._active_client():
+            return
+        from .skill_enable import SkillEnableError, disable_skill
+
+        params = action.params or {}
+        name = str(params.get("name") or "").strip()
+        scope = str(params.get("scope") or "").strip()
+        cwd = None
+        try:
+            result = await disable_skill(name=name, scope=scope, cwd=cwd)
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_OK,
+                result={
+                    "name": result["name"],
+                    "scope": result["scope"],
+                    "path": result["path"],
+                    "removed": result["removed"],
+                    "enable_state": "none",
+                    "uninstallable": False,
+                },
+            )
+        except SkillEnableError as exc:
+            conflict = (
+                exc.code.lower()
+                if exc.code in ("CONFLICT", "BLOCKED")
+                else None
+            )
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code=exc.code,
+                error_message=str(exc),
+                result={"conflict_kind": conflict} if conflict else None,
+            )
+        except Exception as exc:
+            logger.warning("[%s] skill_disable failed name=%s: %s", self.name, name, exc)
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="SKILL_DISABLE_FAILED",
+                error_message=str(exc),
+            )
+        await self._report_skills(force=True, cwd=cwd)
+
     def _resolve_hermes_home(self) -> str:
         try:
             from hermes_constants import get_hermes_home
@@ -2534,8 +2661,8 @@ class GrixAdapter(BasePlatformAdapter):
     async def _start_skill_syncer(self) -> None:
         """启动自定义技能下拉同步器（docs/architecture/38）。
 
-        落盘 ~/.hermes/skills（scan_hermes_skills 的既有扫描目录），同步有变化时
-        经 _report_skills(force=False) 刷新工具栏清单。启动失败不影响主链路。
+        落盘 ~/.grix/skills（与 connector 共用库目录）；同步成功后强制刷新
+        skills + library_skills 上报。启动失败不影响主链路。
         """
         try:
             from .skill_syncer import SkillSyncer
@@ -2545,13 +2672,14 @@ class GrixAdapter(BasePlatformAdapter):
                 self._skill_syncer.stop()
                 self._skill_syncer = None
 
-            async def _on_change() -> None:
-                await self._report_skills(force=False)
+            async def _on_sync_success() -> None:
+                # 对齐 connector forceRefreshSkills：不看 fingerprint。
+                await self._report_skills(force=True)
 
             self._skill_syncer = SkillSyncer(
                 endpoint=self.connection.endpoint,
                 api_key=self.connection.api_key,
-                on_change=_on_change,
+                on_change=_on_sync_success,
             )
             await self._skill_syncer.start()
             logger.info("[%s] Skill syncer started", self.name)

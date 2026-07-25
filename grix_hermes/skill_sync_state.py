@@ -2,7 +2,7 @@
 
 Mirrors grix-connector's ``src/core/skill-sync/sync-state.ts``. Compares a skill's
 local content digest against the ``.grix-sync.json`` manifest that
-``skill_syncer.py`` maintains under ``~/.hermes/skills`` to classify each
+``skill_syncer.py`` maintains under ``~/.grix/skills`` to classify each
 non-managed skill as synced / modified / unsynced. Digest algorithm matches the
 backend's ``skillDigest`` exactly: sha256 over the raw SKILL.md text, no
 normalization — so a byte-identical local copy always compares equal.

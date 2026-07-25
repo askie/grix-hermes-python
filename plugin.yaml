@@ -1,7 +1,7 @@
 manifest_version: 1
 name: grix-hermes
 kind: platform
-version: "1.9.3"
+version: "1.9.4"
 description: Grix/aibot protocol platform adapter plugin for Hermes Agent
 requires_env:
 - GRIX_ENDPOINT
