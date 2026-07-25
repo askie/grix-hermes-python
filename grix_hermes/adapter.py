@@ -36,6 +36,14 @@ from .tool_progress_cards import (
     detect_tool_progress,
 )
 from .progress_cards import build_queue_progress_card
+from .provider_quota import (
+    ProviderQuotaSource,
+    detect_provider,
+    detect_provider_from_model,
+    normalize_provider_id,
+    provider_quota_to_rate_limits,
+)
+from .provider_quota_service import shared_provider_quota_service
 from .agent_status_cards import (
     build_agent_status_channel_data,
     detect_agent_status,
@@ -291,6 +299,77 @@ def resolve_configured_model(hermes_home: Optional[str] = None) -> str:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return ""
+
+
+def resolve_provider_quota_source(
+    hermes_home: Optional[str] = None,
+    environ: Optional[Dict[str, str]] = None,
+) -> Optional[ProviderQuotaSource]:
+    """解析当前生效 provider 的配额查询凭据（对齐 connector resolveProviderQuotaSource）。
+
+    hermes 的 provider 凭据在 config.yaml（不在 grix agent config）：
+    - base_url：model.base_url → providers[model.provider].api → GRIX_HERMES_BASE_URL
+    - api_key：model.api_key → providers[model.provider].key_env 指向的 env → GRIX_PROVIDER_API_KEY
+      （后两项正是 connector spawn hermes 时注入 grix 中转 provider 的通道）
+    凭据缺一即返回 None（不发起查询），与 connector 一致。
+    """
+    env = os.environ if environ is None else environ
+    home = Path(hermes_home or env.get("HERMES_HOME", "") or "~/.hermes").expanduser()
+    try:
+        import yaml
+    except ImportError:
+        return None
+    try:
+        with (home / "config.yaml").open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError, ValueError, TypeError):
+        return None
+    if not isinstance(config, dict):
+        return None
+
+    raw_model = config.get("model")
+    model = raw_model if isinstance(raw_model, dict) else {}
+    model_name = ""
+    if isinstance(raw_model, str):
+        model_name = raw_model.strip()
+    elif isinstance(raw_model, dict):
+        for key in ("default", "model", "name"):
+            value = raw_model.get(key)
+            if isinstance(value, str) and value.strip():
+                model_name = value.strip()
+                break
+
+    base_url = str(model.get("base_url") or "").strip()
+    api_key = str(model.get("api_key") or "").strip()
+    provider_name = str(model.get("provider") or "").strip()
+
+    providers = config.get("providers")
+    entry = providers.get(provider_name) if isinstance(providers, dict) else None
+    if not isinstance(entry, dict):
+        entry = {}
+    if not base_url:
+        base_url = str(entry.get("api") or "").strip()
+    if not api_key:
+        key_env = str(entry.get("key_env") or "").strip()
+        if key_env:
+            api_key = env.get(key_env, "").strip()
+
+    if not base_url:
+        base_url = env.get("GRIX_HERMES_BASE_URL", "").strip()
+    if not api_key:
+        api_key = env.get("GRIX_PROVIDER_API_KEY", "").strip()
+    if not base_url or not api_key:
+        return None
+
+    provider_id = (
+        normalize_provider_id(provider_name)
+        or (detect_provider(base_url) or (None,))[0]
+        or (detect_provider_from_model(model_name) or (None,))[0]
+    )
+    source: ProviderQuotaSource = {"baseUrl": base_url, "apiKey": api_key}
+    if provider_id:
+        source["providerId"] = provider_id
+    return source
 
 
 # 明确指向永久失败的 HTTP 状态码（客户端错误）。注意 408(超时) / 429(限流)
@@ -564,6 +643,8 @@ class GrixAdapter(BasePlatformAdapter):
     _BG_HOLD_MAX_AGE_S = 6 * 3600
     _BG_HOLD_SWEEP_INTERVAL_S = 15.0
     _BG_HOLD_COMPOSING_TTL_MS = 90_000
+    # 对齐 connector PROVIDER_QUOTA_REFRESH_INTERVAL_MS = 30s
+    _PROVIDER_QUOTA_REFRESH_INTERVAL_S = 30.0
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(_PLATFORM_VALUE))
@@ -572,6 +653,11 @@ class GrixAdapter(BasePlatformAdapter):
         # adapter construction: unlike switchable CLI adapters, Hermes exposes
         # only this configured model in toolbar metadata.
         self._toolbar_model_id = resolve_configured_model()
+        # 厂商用量限额缓存（对齐 connector provider-quota）：后台 30s 巡检刷新，
+        # 随 _push_queue_snapshot 的工具栏绑定卡下发 provider_quota/rate_limits。
+        self._provider_quota: Optional[Dict[str, Any]] = None
+        self._provider_quota_sampled_at_ms: int = 0
+        self._provider_quota_task: Optional[asyncio.Task] = None
         self._client: Optional[GrixTransportClient] = None
         self._connector = None
         self._disconnect_requested = False
@@ -1009,6 +1095,7 @@ class GrixAdapter(BasePlatformAdapter):
         await self._report_skills()
         await self._start_upgrade_checker()
         await self._start_skill_syncer()
+        self._ensure_provider_quota_refresh()
         return True
 
     async def _report_skills(self, *, force: bool = True, cwd: Optional[str] = None) -> None:
@@ -4019,6 +4106,86 @@ class GrixAdapter(BasePlatformAdapter):
                 self.name, session_id, active, exc,
             )
 
+    def _ensure_provider_quota_refresh(self) -> None:
+        """确保厂商配额巡检任务在跑（幂等，对齐 connector startProviderQuotaTimer）。"""
+        if getattr(self, "_shutting_down", False) or getattr(self, "_disconnect_requested", False):
+            return
+        task = getattr(self, "_provider_quota_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._provider_quota_task = loop.create_task(self._provider_quota_refresh_loop())
+
+    async def _provider_quota_refresh_loop(self) -> None:
+        """30s 巡检：查询当前生效 provider 配额，成功后补推工具栏快照。"""
+        interval = float(getattr(self, "_PROVIDER_QUOTA_REFRESH_INTERVAL_S", 30.0) or 30.0)
+        try:
+            while not getattr(self, "_shutting_down", False):
+                try:
+                    refreshed = await self._refresh_provider_quota_once()
+                    if refreshed:
+                        await self._push_all_queue_snapshots()
+                except Exception as exc:
+                    # 单次巡检失败不退出循环（对齐 bg-hold sweep 的容错策略）。
+                    logger.debug("[%s] provider-quota refresh error: %s", self.name, exc)
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+    async def _refresh_provider_quota_once(self) -> bool:
+        """查询一次配额并更新缓存；成功（拿到可用配额）返回 True。"""
+        source = resolve_provider_quota_source()
+        if source is None:
+            return False
+        try:
+            snapshot = await shared_provider_quota_service.query(source)
+        except Exception as exc:
+            logger.debug("[%s] provider-quota query failed: %s", self.name, exc)
+            return False
+        quota = snapshot["quota"]
+        if not quota.get("success"):
+            logger.debug(
+                "[%s] provider-quota query unsuccessful: provider=%s error=%s",
+                self.name,
+                quota.get("provider"),
+                quota.get("error"),
+            )
+            return False
+        self._provider_quota = quota
+        self._provider_quota_sampled_at_ms = int(snapshot["sampledAt"])
+        logger.info(
+            "[%s] provider-quota refreshed: provider=%s tiers=%s%s",
+            self.name,
+            quota.get("provider"),
+            ",".join(
+                f"{t.get('name')}={t.get('usedPercent')}%" for t in quota.get("tiers") or []
+            ),
+            (
+                f" balance={quota['balance'].get('remaining')} {quota['balance'].get('unit')}"
+                if quota.get("balance")
+                else ""
+            ),
+        )
+        return True
+
+    def _provider_quota_toolbar_meta(self) -> Dict[str, Any]:
+        """把缓存的配额转成工具栏 meta 字段（provider_quota + rate_limits）。
+
+        测试用 __new__ 构造的裸 adapter 没有 _provider_quota，getattr 兜底。
+        """
+        quota = getattr(self, "_provider_quota", None)
+        if not quota or not quota.get("success"):
+            return {}
+        meta: Dict[str, Any] = {"provider_quota": quota}
+        sampled_at = int(getattr(self, "_provider_quota_sampled_at_ms", 0) or 0)
+        rate_limits = provider_quota_to_rate_limits(quota, sampled_at)
+        if rate_limits:
+            meta["rate_limits"] = rate_limits
+        return meta
+
     def _ensure_bg_hold_sweep(self) -> None:
         """确保后台保活巡检任务在跑（幂等）。"""
         if getattr(self, "_shutting_down", False) or getattr(self, "_disconnect_requested", False):
@@ -4188,6 +4355,7 @@ class GrixAdapter(BasePlatformAdapter):
                         "available_models": [
                             {"id": model_id, "displayName": model_id}
                         ],
+                        **self._provider_quota_toolbar_meta(),
                     },
                 )
             except Exception as exc:

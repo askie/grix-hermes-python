@@ -269,6 +269,38 @@ def test_snapshot_reports_single_immutable_configured_model():
     }
 
 
+# 回归锚：provider-quota 平移后，缓存的厂商配额必须随工具栏绑定卡下发
+# （provider_quota + rate_limits），否则服务端工具栏拿不到 5h/周限额。
+def test_snapshot_binding_card_enriches_provider_quota():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._toolbar_model_id = "deepseek-v4-flash"
+    inst._provider_quota = {
+        "provider": "kimi",
+        "providerLabel": "Kimi",
+        "planName": None,
+        "tiers": [
+            {"name": "five_hour", "label": "5h", "usedPercent": 12.5, "resetsAt": None},
+            {"name": "weekly_limit", "label": "W", "usedPercent": 30.0, "resetsAt": None},
+        ],
+        "balance": None,
+        "success": True,
+        "error": None,
+    }
+    inst._provider_quota_sampled_at_ms = 1700000000000
+
+    _run_with_ctx(
+        inst, client, inst._handle_queue_snapshot_query_packet({"session_id": "s1"})
+    )
+
+    meta = client.binding_cards[-1]["meta"]
+    assert meta["model_id"] == "deepseek-v4-flash"
+    assert meta["provider_quota"]["provider"] == "kimi"
+    assert meta["rate_limits"]["fiveHour"]["usedPercentage"] == 12.5
+    assert meta["rate_limits"]["sevenDay"]["usedPercentage"] == 30.0
+    assert meta["rate_limits"]["sampledAt"] == 1700000000000
+
+
 def test_resolve_configured_model_supports_current_and_legacy_shapes(tmp_path):
     config_path = tmp_path / "config.yaml"
     config_path.write_text("model:\n  default: openrouter/anthropic/claude-opus-4\n")
