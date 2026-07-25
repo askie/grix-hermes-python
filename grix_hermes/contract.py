@@ -164,6 +164,7 @@ LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH = "connector_upgrade_push"
 LOCAL_ACTION_SKILL_UPLOAD = "skill_upload"  # docs/architecture/39，工具栏一键上传技能
 LOCAL_ACTION_SKILL_ENABLE = "skill_enable"  # 技能库启用到 Agent v2
 LOCAL_ACTION_SKILL_DISABLE = "skill_disable"
+LOCAL_ACTION_SKILL_REFRESH = "skill_refresh"  # 技能弹窗下拉刷新：重扫并重新上报 skills + library_skills
 STABLE_LOCAL_ACTIONS = (
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
@@ -174,6 +175,7 @@ STABLE_LOCAL_ACTIONS = (
     LOCAL_ACTION_SKILL_UPLOAD,
     LOCAL_ACTION_SKILL_ENABLE,
     LOCAL_ACTION_SKILL_DISABLE,
+    LOCAL_ACTION_SKILL_REFRESH,
 )
 
 # 状态值

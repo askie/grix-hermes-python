@@ -79,6 +79,7 @@ from .contract import (
     LOCAL_ACTION_GET_SESSION_USAGE,
     LOCAL_ACTION_SKILL_DISABLE,
     LOCAL_ACTION_SKILL_ENABLE,
+    LOCAL_ACTION_SKILL_REFRESH,
     LOCAL_ACTION_SKILL_UPLOAD,
     STATUS_ALREADY_FINISHED,
     STATUS_CANCELED,
@@ -1098,13 +1099,21 @@ class GrixAdapter(BasePlatformAdapter):
         self._ensure_provider_quota_refresh()
         return True
 
-    async def _report_skills(self, *, force: bool = True, cwd: Optional[str] = None) -> None:
+    async def _report_skills(
+        self,
+        *,
+        force: bool = True,
+        cwd: Optional[str] = None,
+        raise_on_error: bool = False,
+    ) -> bool:
         """扫描本地 skills + library_skills 并通过 agent_skills_update 上报。
 
         force=True（连接/重连/同步成功/enable-disable）：无条件上报。
         force=False（会话活动触发）：仅当清单相对上次上报发生变化时才推，避免刷屏。
         cwd：会话绑定工作目录；project scope 完全依赖它，禁止 os.getcwd 兜底。
-        """
+        raise_on_error：扫描异常时透传给调用方（默认吞掉保 best-effort）；下拉刷新
+        （skill_refresh）必须置 True——错误路径不能对用户谎报刷新成功。
+        返回是否真正推出了 agent_skills_update。"""
         try:
             from .exec_command import scan_hermes_skills
             from .library_skills import list_library_skills
@@ -1116,7 +1125,7 @@ class GrixAdapter(BasePlatformAdapter):
             skills = annotate_sync_states(entries, resolve_library_skills_dir())
             library = list_library_skills(cwd=cwd)
             if not skills and not library:
-                return
+                return False
             digest = json.dumps(
                 {
                     "skills": [
@@ -1130,7 +1139,7 @@ class GrixAdapter(BasePlatformAdapter):
                 sort_keys=True,
             )
             if not force and digest == self._last_skills_hash:
-                return
+                return False
             self._last_skills_hash = digest
             if self._client:
                 # 启动时主连接的管理性主动调用,不在 packet handler 上下文,显式走主连接。
@@ -1141,8 +1150,13 @@ class GrixAdapter(BasePlatformAdapter):
                     len(skills),
                     len(library),
                 )
+                return True
+            return False
         except Exception as exc:
             logger.debug("[%s] Skills report failed: %s", self.name, exc)
+            if raise_on_error:
+                raise
+            return False
 
     async def disconnect(self) -> None:
         self._disconnect_requested = True
@@ -2464,6 +2478,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_skill_disable(action)
             return
 
+        if action.action_type == LOCAL_ACTION_SKILL_REFRESH:
+            await self._handle_skill_refresh(action)
+            return
+
         if action.action_type not in {LOCAL_ACTION_EXEC_APPROVE, LOCAL_ACTION_EXEC_REJECT}:
             await self._active_client().send_local_action_result(
                 action_id=action.action_id,
@@ -2725,6 +2743,47 @@ class GrixAdapter(BasePlatformAdapter):
                 error_message=str(exc),
             )
         await self._report_skills(force=True, cwd=cwd)
+
+    async def _handle_skill_refresh(self, action: GrixLocalAction) -> None:
+        """技能弹窗「下拉刷新」（对齐 connector skill_refresh）：force 重扫本地
+        skills + library_skills 并先推 agent_skills_update、后回 local_action_result
+        ——后端收到结果即基于最新 profile 重建工具栏快照，顺序不能反。
+        hermes 会话无工作区绑定概念，cwd 恒为 None（与 skill_enable/disable 一致），
+        project scope 由 list_library_skills 判为 unavailable。"""
+        if not self._active_client():
+            return
+        params = action.params or {}
+        session_id = str(params.get("session_id") or "").strip()
+        try:
+            pushed = await self._report_skills(force=True, raise_on_error=True)
+            if not pushed:
+                # 未推出 agent_skills_update（空集/无连接）：如实回 failed，不能让
+                # 用户看到「刷新成功」的旧数据（对齐 connector 同路径）。
+                logger.warning(
+                    "[%s] skill_refresh produced no report session=%s",
+                    self.name,
+                    session_id or "-",
+                )
+                await self._active_client().send_local_action_result(
+                    action_id=action.action_id,
+                    status=STATUS_FAILED,
+                    error_code="SKILL_REFRESH_FAILED",
+                    error_message="skill rescan produced no report (scan error or empty skill set)",
+                )
+                return
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_OK,
+                result={"session_id": session_id} if session_id else None,
+            )
+        except Exception as exc:
+            logger.warning("[%s] skill_refresh failed: %s", self.name, exc)
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="SKILL_REFRESH_FAILED",
+                error_message=str(exc),
+            )
 
     def _resolve_hermes_home(self) -> str:
         try:
