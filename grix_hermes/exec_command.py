@@ -1,8 +1,33 @@
 """Handle /grix exec sub-commands for Hermes adapter."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+# 与 Hermes ``agent.skill_utils`` / connector ``scanSkillTree`` 对齐：Hermes 技能
+# 官方布局是 ``category/skill/SKILL.md``，必须递归发现；同时跳过归档、依赖与
+# progressive-disclosure 支持目录，避免把 references/ 里的归档包当成独立技能。
+_EXCLUDED_SKILL_DIRS = frozenset(
+    {
+        ".git",
+        ".github",
+        ".hub",
+        ".archive",
+        ".venv",
+        "venv",
+        "node_modules",
+        "site-packages",
+        "__pycache__",
+        ".tox",
+        ".nox",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    }
+)
+_SKILL_SUPPORT_DIRS = frozenset({"references", "templates", "assets", "scripts"})
+_MAX_SKILL_DEPTH = 6
 
 
 class SkillEntry:
@@ -62,16 +87,35 @@ def _parse_skill_frontmatter(content: str) -> dict:
 
 
 def _scan_skill_dir(base_dir: Path, source: str, *, managed: bool = False) -> List[SkillEntry]:
+    """递归扫描 ``base_dir`` 下所有含 SKILL.md 的技能包。
+
+    支持 Hermes 分类布局（如 ``software-development/camoufox/SKILL.md``），
+    深度上限与 connector ``scanSkillTree`` 一致（默认 6）。
+    """
     results: List[SkillEntry] = []
     if not base_dir.is_dir():
         return results
+    base_str = str(base_dir)
     try:
-        for entry in sorted(base_dir.iterdir()):
-            if not entry.is_dir() or entry.name.startswith("."):
+        for root, dirs, files in os.walk(base_str, followlinks=True):
+            rel = os.path.relpath(root, base_str)
+            depth = 0 if rel == "." else rel.count(os.sep) + 1
+            has_skill_md = "SKILL.md" in files
+            # 就地剪枝：隐藏目录、Hermes 排除集、技能包内 support 目录、深度上限。
+            dirs[:] = sorted(
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d not in _EXCLUDED_SKILL_DIRS
+                and not (has_skill_md and d in _SKILL_SUPPORT_DIRS)
+                and depth < _MAX_SKILL_DEPTH
+            )
+            if not has_skill_md:
                 continue
-            skill_file = entry / "SKILL.md"
-            if not skill_file.is_file():
+            # 技能根本身不作为技能包（与旧版「只看子目录」一致）。
+            if rel == ".":
                 continue
+            skill_file = Path(root) / "SKILL.md"
             try:
                 parsed = _parse_skill_frontmatter(skill_file.read_text(encoding="utf-8"))
                 if parsed["name"]:
@@ -112,7 +156,8 @@ def _dedupe_skills(entries: List[SkillEntry]) -> List[SkillEntry]:
 def scan_hermes_skills() -> List[SkillEntry]:
     """Scan Hermes skill directories for SKILL.md files.
 
-    内置 plugin_skills/ 优先于 ~/.hermes/skills/，同名时内置技能遮蔽用户目录项
+    递归扫描以覆盖 Hermes 官方 ``category/skill/SKILL.md`` 布局。内置
+    plugin_skills/ 优先于 ~/.hermes/skills/，同名时内置技能遮蔽用户目录项
     （dedupe），防止平台同步下来的 Grix 内置技能被误标为非托管并显示同步状态。
     """
     results: List[SkillEntry] = []

@@ -66,6 +66,39 @@ def test_scan_skill_dir_skips_hidden_dirs():
         assert len(entries) == 0
 
 
+def test_scan_skill_dir_finds_category_nested_skills():
+    """Hermes 官方布局 category/skill/SKILL.md 必须被发现（camoufox 回归）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        _write_skill(base / "software-development", "camoufox", "anti-detect browser")
+        _write_skill(base, "flat-skill", "top-level")
+        entries = _scan_skill_dir(base, "global", managed=False)
+        names = {e.name for e in entries}
+        assert names == {"camoufox", "flat-skill"}
+        nested = next(e for e in entries if e.name == "camoufox")
+        assert nested.file_path == base / "software-development" / "camoufox" / "SKILL.md"
+
+
+def test_scan_skill_dir_skips_archive_and_support_nested_skills():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        _write_skill(base / ".archive" / "software-development", "old-skill", "archived")
+        skill = base / "demo"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: live\n---\n", encoding="utf-8"
+        )
+        archived_under_refs = skill / "references" / "old-pkg"
+        archived_under_refs.mkdir(parents=True)
+        (archived_under_refs / "SKILL.md").write_text(
+            "---\nname: old-pkg\ndescription: support archive\n---\n",
+            encoding="utf-8",
+        )
+        entries = _scan_skill_dir(base, "global", managed=False)
+        names = {e.name for e in entries}
+        assert names == {"demo"}
+
+
 def test_scan_hermes_skills_builtin_shadows_synced_duplicate(monkeypatch):
     """集成测试：锁定「plugin_skills 先扫 + 结尾去重」的修复语义。
 
