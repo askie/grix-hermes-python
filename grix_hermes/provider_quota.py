@@ -858,8 +858,10 @@ async def query_provider_quota(
         return await _query_native_provider(info[0], api_key)
 
     # Explicit hints: try relay first (shared gateway may proxy quota paths),
-    # then fall back to the vendor's first-party domain. Local inference relays
-    # (Antigravity etc.) almost never expose quota endpoints.
+    # then fall back to the vendor's first-party domain. This diverges from
+    # grix-connector (which stops at the relay to avoid sending credentials to
+    # unrelated vendor domains); hermes local relays like Antigravity almost
+    # never expose quota endpoints, so native fallback is required for toolbar.
     if hinted_provider:
         hinted_result = await _query_via_base_url(hinted_provider, base_url, api_key)
         if hinted_result:

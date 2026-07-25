@@ -146,6 +146,31 @@ providers:
     assert source["providerId"] == "deepseek"
 
 
+def test_resolve_source_keeps_relay_when_model_key_is_real(tmp_path):
+    """非占位 model.api_key 可能是本地中转 token，不得改写到厂商域名。"""
+    _write_config(
+        tmp_path,
+        """
+model:
+  provider: deepseek-api
+  base_url: http://127.0.0.1:8045/v1
+  api_key: sk-local-relay-token
+  default: deepseek-v4-flash
+providers:
+  deepseek-api:
+    api: https://api.deepseek.com
+    key_env: DEEPSEEK_API_KEY
+""",
+    )
+    source = adapter_mod.resolve_provider_quota_source(
+        str(tmp_path), {"DEEPSEEK_API_KEY": "sk-from-env"}
+    )
+    assert source is not None
+    assert source["baseUrl"] == "http://127.0.0.1:8045/v1"
+    assert source["apiKey"] == "sk-local-relay-token"
+    assert source["providerId"] == "deepseek"
+
+
 def test_resolve_source_model_without_key_uses_key_env(tmp_path):
     _write_config(
         tmp_path,

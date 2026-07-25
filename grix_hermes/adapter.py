@@ -387,16 +387,26 @@ def resolve_provider_quota_source(
         inference_base = env.get("GRIX_HERMES_BASE_URL", "").strip()
 
     api_key = "" if _looks_like_placeholder_api_key(model_api_key) else model_api_key
+    key_from_env = False
     if not api_key:
         api_key = env_key
+        key_from_env = bool(api_key)
     if not api_key:
         api_key = env.get("GRIX_PROVIDER_API_KEY", "").strip()
+        key_from_env = bool(api_key)
     if not inference_base or not api_key:
         return None
 
-    # Opaque inference relays (localhost / shared gateway) → prefer vendor API URL.
+    # Opaque inference relays → prefer vendor API URL only when the key also
+    # came from key_env / GRIX_PROVIDER_API_KEY. A non-placeholder model.api_key
+    # may be a local-relay token that must not be sent to the vendor domain.
     base_url = inference_base
-    if detect_provider(inference_base) is None and entry_api and detect_provider(entry_api):
+    if (
+        key_from_env
+        and detect_provider(inference_base) is None
+        and entry_api
+        and detect_provider(entry_api)
+    ):
         base_url = entry_api
 
     provider_id = (
@@ -2646,10 +2656,50 @@ class GrixAdapter(BasePlatformAdapter):
         """工具栏点击刷新厂商限额：强制拉一次配额并回写 binding meta。"""
         if not self._active_client():
             return
-        refreshed = await self._refresh_provider_quota_once()
-        quota = getattr(self, "_provider_quota", None)
-        sampled_at = int(getattr(self, "_provider_quota_sampled_at_ms", 0) or 0)
-        if refreshed and quota and quota.get("success"):
+        source = resolve_provider_quota_source()
+        if source is None:
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_OK,
+                result={
+                    "adapterType": "hermes",
+                    "available": False,
+                    "cached": False,
+                    "sampledAt": None,
+                    "rateLimits": None,
+                    "contextWindow": None,
+                    "tokenUsage": None,
+                    "providerQuota": None,
+                    "error": "provider quota source unavailable",
+                },
+            )
+            return
+        try:
+            snapshot = await shared_provider_quota_service.query(source, fresh=True)
+        except Exception as exc:
+            logger.debug("[%s] get_rate_limits query failed: %s", self.name, exc)
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_OK,
+                result={
+                    "adapterType": "hermes",
+                    "available": False,
+                    "cached": False,
+                    "sampledAt": None,
+                    "rateLimits": None,
+                    "contextWindow": None,
+                    "tokenUsage": None,
+                    "providerQuota": None,
+                    "error": str(exc),
+                },
+            )
+            return
+        quota = snapshot["quota"]
+        sampled_at = int(snapshot["sampledAt"])
+        cached = bool(snapshot.get("cached"))
+        if quota.get("success"):
+            self._provider_quota = quota
+            self._provider_quota_sampled_at_ms = sampled_at
             await self._push_all_queue_snapshots()
             rate_limits = provider_quota_to_rate_limits(quota, sampled_at)
             await self._active_client().send_local_action_result(
@@ -2658,7 +2708,7 @@ class GrixAdapter(BasePlatformAdapter):
                 result={
                     "adapterType": "hermes",
                     "available": True,
-                    "cached": False,
+                    "cached": cached,
                     "sampledAt": sampled_at or None,
                     "rateLimits": rate_limits,
                     "contextWindow": None,
@@ -2673,13 +2723,13 @@ class GrixAdapter(BasePlatformAdapter):
             result={
                 "adapterType": "hermes",
                 "available": False,
-                "cached": False,
+                "cached": cached,
                 "sampledAt": sampled_at or None,
                 "rateLimits": None,
                 "contextWindow": None,
                 "tokenUsage": None,
                 "providerQuota": quota,
-                "error": (quota or {}).get("error") if isinstance(quota, dict) else None,
+                "error": quota.get("error"),
             },
         )
 
