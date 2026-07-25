@@ -1150,6 +1150,10 @@ class GrixAdapter(BasePlatformAdapter):
         if sweep is not None:
             sweep.cancel()
             self._bg_hold_sweep_task = None
+        quota_task = getattr(self, "_provider_quota_task", None)
+        if quota_task is not None:
+            quota_task.cancel()
+            self._provider_quota_task = None
         if self._upgrade_checker:
             self._upgrade_checker.stop()
             self._upgrade_checker = None

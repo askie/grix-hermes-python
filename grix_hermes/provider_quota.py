@@ -245,10 +245,12 @@ def _parse_zhipu_tiers(data: Dict[str, Any]) -> List[QuotaTier]:
 
 
 def _zhipu_result_from_body(body: Any) -> Optional[ProviderQuotaResult]:
+    """成功返回 result；厂商明确报错（success:false）返回带 msg 的失败 result；
+    结构不符返回 None（调用方按不可用处理）。"""
     if not isinstance(body, dict):
         return None
     if body.get("success") is False:
-        return None
+        return _make_error("zhipu", "Zhipu GLM", f"API error: {body.get('msg') or 'Unknown error'}")
     data = body.get("data")
     if not isinstance(data, dict):
         return None
@@ -368,8 +370,11 @@ def _minimax_tiers_from_body(body: Any, *, include_weekly: bool) -> Optional[Lis
     if not isinstance(body, dict):
         return None
     base_resp = body.get("base_resp")
-    if isinstance(base_resp, dict) and base_resp.get("status_code") not in (None, 0):
-        return None
+    if isinstance(base_resp, dict):
+        status_code = base_resp.get("status_code")
+        # 对齐 connector：仅 number 且非 0 才判业务错误（字符串 "0" 不误伤）
+        if isinstance(status_code, (int, float)) and not isinstance(status_code, bool) and status_code != 0:
+            return None
     model_remains = body.get("model_remains")
     if not isinstance(model_remains, list) or not model_remains:
         return None
@@ -668,7 +673,9 @@ async def _query_via_base_url(
             )
             if status != 200:
                 return None
-            return _zhipu_result_from_body(body)
+            # 探测语义：只接受成功结果；厂商明确报错视同本 provider 不可用
+            result = _zhipu_result_from_body(body)
+            return result if result and result.get("success") else None
 
         if provider_id == "deepseek":
             status, body = await _http_get_json(f"{origin}/user/balance", headers)

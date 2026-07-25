@@ -314,6 +314,89 @@ def test_network_error_normalized(monkeypatch):
     assert "Network error" in result["error"]
 
 
+def test_query_zhipu_surfaces_vendor_error_msg(monkeypatch):
+    """success:false 时必须透传厂商给出的原因（曾为统一的 Missing data field）。"""
+    _patch_http(
+        monkeypatch,
+        {"api.z.ai": (200, {"success": False, "msg": "quota query forbidden"})},
+    )
+    result = run(pq.query_provider_quota("https://api.z.ai/v4", "key"))
+    assert result["success"] is False
+    assert result["error"] == "API error: quota query forbidden"
+
+
+def test_query_siliconflow_en(monkeypatch):
+    _patch_http(monkeypatch, {"api.siliconflow.com": (200, {"data": {"totalBalance": 3.5}})})
+    result = run(pq.query_provider_quota("https://api.siliconflow.com/v1", "key"))
+    assert result["providerLabel"] == "SiliconFlow (EN)"
+    assert result["balance"]["unit"] == "USD"
+    assert result["balance"]["remaining"] == 3.5
+
+
+def test_query_minimax_en(monkeypatch):
+    _patch_http(
+        monkeypatch,
+        {
+            "api.minimax.io": (
+                200,
+                {
+                    "base_resp": {"status_code": 0},
+                    "model_remains": [
+                        {"current_interval_total_count": 100, "current_interval_usage_count": 10}
+                    ],
+                },
+            )
+        },
+    )
+    result = run(pq.query_provider_quota("https://api.minimax.io/v1", "key"))
+    assert result["provider"] == "minimax_en"
+    assert result["tiers"][0]["usedPercent"] == 10.0
+
+
+def test_minimax_status_code_string_zero_not_business_error(monkeypatch):
+    """status_code 为字符串 "0" 时不得误判为业务错误（对齐 connector 仅 number 判定）。"""
+    tiers = pq._minimax_tiers_from_body(
+        {
+            "base_resp": {"status_code": "0"},
+            "model_remains": [
+                {"current_interval_total_count": 100, "current_interval_usage_count": 5}
+            ],
+        },
+        include_weekly=False,
+    )
+    assert tiers is not None
+    assert tiers[0]["usedPercent"] == 5.0
+
+
+def test_via_base_url_minimax_carries_end_time(monkeypatch):
+    """via-base_url minimax 与直连一致带 five_hour resetsAt（connector 已同步补齐）。"""
+    _patch_http(
+        monkeypatch,
+        {
+            "/v1/api/openplatform/coding_plan/remains": (
+                200,
+                {
+                    "base_resp": {"status_code": 0},
+                    "model_remains": [
+                        {
+                            "current_interval_total_count": 100,
+                            "current_interval_usage_count": 30,
+                            "end_time": 1_800_000_000_000,
+                        }
+                    ],
+                },
+            )
+        },
+    )
+    result = run(
+        pq.query_provider_quota("https://relay.example.com/v1", "key", "minimax")
+    )
+    assert result["success"] is True
+    tier = result["tiers"][0]
+    assert tier["name"] == "five_hour"
+    assert tier["resetsAt"] is not None
+
+
 # ── 展示格式（对齐 providerQuotaToRateLimits） ──
 
 
@@ -437,6 +520,32 @@ def test_service_cache_key_isolates_credentials():
     key_b = service.cache_key(_source(apiKey="key-b"))
     assert key_a != key_b
     assert "key-a" not in key_a  # 只存指纹，不留原始凭据
+
+
+def test_service_in_flight_dedup(monkeypatch):
+    """同 key 并发调用共享一次 HTTP 查询（本系统唯一的并发逻辑，回归错）。"""
+    calls = []
+
+    async def fake_query(base_url, api_key, hint=None):
+        calls.append(1)
+        await asyncio.sleep(0.05)
+        return _ok_quota()
+
+    monkeypatch.setattr(
+        "grix_hermes.provider_quota_service.query_provider_quota", fake_query
+    )
+
+    async def _flow():
+        service = ProviderQuotaService()
+        first, second = await asyncio.gather(
+            service.query(_source()), service.query(_source())
+        )
+        return first, second
+
+    first, second = run(_flow())
+    assert len(calls) == 1
+    assert first["quota"]["provider"] == "kimi"
+    assert second["quota"]["provider"] == "kimi"
 
 
 def test_resolve_quota_base_url():
