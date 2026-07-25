@@ -65,6 +65,7 @@ def test_detect_provider_unknown_and_case_insensitive():
         ("minimax", "minimax_cn"),
         ("siliconflow", "siliconflow_cn"),
         ("deepseek", "deepseek"),
+        ("deepseek-api", "deepseek"),
         ("unknown", None),
         ("", None),
         (None, None),
@@ -267,12 +268,39 @@ def test_query_hint_routes_through_base_url(monkeypatch):
 
 
 def test_query_hint_unavailable_returns_error(monkeypatch):
-    _patch_http(monkeypatch, {})  # 全部 404
+    _patch_http(monkeypatch, {})  # 全部 404（含原生域名回退）
     result = run(
         pq.query_provider_quota("https://relay.example.com/v1", "key", "deepseek")
     )
     assert result["success"] is False
-    assert "unavailable through base URL" in result["error"]
+    assert result["provider"] == "deepseek"
+    assert "API error" in result["error"] or "unavailable" in result["error"]
+
+
+def test_query_hint_falls_back_to_native_when_relay_misses(monkeypatch):
+    """Opaque relay 无配额路径时，用 hint 回退到厂商原生域名。"""
+    calls = []
+
+    async def fake_get(url, headers):
+        calls.append(url)
+        if url.startswith("https://api.deepseek.com/"):
+            return (
+                200,
+                {
+                    "is_available": True,
+                    "balance_infos": [{"currency": "CNY", "total_balance": "12.5"}],
+                },
+            )
+        return (404, None)
+
+    monkeypatch.setattr(pq, "_http_get_json", fake_get)
+    result = run(
+        pq.query_provider_quota("https://relay.example.com/v1", "key", "deepseek")
+    )
+    assert result["success"] is True
+    assert result["provider"] == "deepseek"
+    assert result["balance"]["remaining"] == 12.5
+    assert any(u.startswith("https://api.deepseek.com/") for u in calls)
 
 
 def test_probe_identifies_provider_through_relay(monkeypatch):

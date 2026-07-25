@@ -154,12 +154,13 @@ STABLE_AUTH_CAPABILITIES = (
 )
 
 # 本地动作（exec_approve/exec_reject/file_list 与后端 hermesSupportedLocalActions
-# 对齐；get_session_usage 是插件向前声明，等后端把它纳入白名单后即可生效）
+# 对齐；get_session_usage / get_rate_limits 由插件声明，后端白名单同步纳入后生效）
 LOCAL_ACTION_EXEC_APPROVE = "exec_approve"
 LOCAL_ACTION_EXEC_REJECT = "exec_reject"
 LOCAL_ACTION_FILE_LIST = "file_list"
 LOCAL_ACTION_CREATE_FOLDER = "create_folder"
 LOCAL_ACTION_GET_SESSION_USAGE = "get_session_usage"
+LOCAL_ACTION_GET_RATE_LIMITS = "get_rate_limits"
 LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH = "connector_upgrade_push"
 LOCAL_ACTION_SKILL_UPLOAD = "skill_upload"  # docs/architecture/39，工具栏一键上传技能
 LOCAL_ACTION_SKILL_ENABLE = "skill_enable"  # 技能库启用到 Agent v2
@@ -171,6 +172,7 @@ STABLE_LOCAL_ACTIONS = (
     LOCAL_ACTION_FILE_LIST,
     LOCAL_ACTION_CREATE_FOLDER,
     LOCAL_ACTION_GET_SESSION_USAGE,
+    LOCAL_ACTION_GET_RATE_LIMITS,
     LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH,
     LOCAL_ACTION_SKILL_UPLOAD,
     LOCAL_ACTION_SKILL_ENABLE,

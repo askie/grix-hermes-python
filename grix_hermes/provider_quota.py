@@ -85,6 +85,7 @@ _PROVIDER_ALIASES = {
     "moonshot": "kimi",
     "minimax": "minimax_cn",
     "siliconflow": "siliconflow_cn",
+    "deepseek-api": "deepseek",
 }
 
 
@@ -817,6 +818,31 @@ async def _probe_provider_via_base_url(
 # ── Public entry point ──
 
 
+async def _query_native_provider(provider_id: ProviderId, api_key: str) -> ProviderQuotaResult:
+    """Hit the vendor's first-party quota API (hardcoded domain), not the relay."""
+    if provider_id == "zhipu":
+        return await _query_zhipu(api_key)
+    if provider_id == "kimi":
+        return await _query_kimi(api_key)
+    if provider_id == "minimax_cn":
+        return await _query_minimax(api_key, True)
+    if provider_id == "minimax_en":
+        return await _query_minimax(api_key, False)
+    if provider_id == "deepseek":
+        return await _query_deepseek(api_key)
+    if provider_id == "stepfun":
+        return await _query_stepfun(api_key)
+    if provider_id == "siliconflow_cn":
+        return await _query_siliconflow(api_key, True)
+    if provider_id == "siliconflow_en":
+        return await _query_siliconflow(api_key, False)
+    if provider_id == "openrouter":
+        return await _query_openrouter(api_key)
+    if provider_id == "novita":
+        return await _query_novita(api_key)
+    return _make_error(provider_id, provider_id, f"Unsupported provider: {provider_id}")
+
+
 async def query_provider_quota(
     base_url: str,
     api_key: str,
@@ -825,39 +851,23 @@ async def query_provider_quota(
     if not api_key.strip():
         return _make_error("unknown", "Unknown", "API key is empty")
 
-    # 1. Fast path: URL-based detection
+    # 1. Fast path: URL-based detection → native vendor API
     hinted_provider = normalize_provider_id(provider_hint)
     info = detect_provider(base_url)
     if info:
-        provider_id = info[0]
-        if provider_id == "zhipu":
-            return await _query_zhipu(api_key)
-        if provider_id == "kimi":
-            return await _query_kimi(api_key)
-        if provider_id == "minimax_cn":
-            return await _query_minimax(api_key, True)
-        if provider_id == "minimax_en":
-            return await _query_minimax(api_key, False)
-        if provider_id == "deepseek":
-            return await _query_deepseek(api_key)
-        if provider_id == "stepfun":
-            return await _query_stepfun(api_key)
-        if provider_id == "siliconflow_cn":
-            return await _query_siliconflow(api_key, True)
-        if provider_id == "siliconflow_en":
-            return await _query_siliconflow(api_key, False)
-        if provider_id == "openrouter":
-            return await _query_openrouter(api_key)
-        if provider_id == "novita":
-            return await _query_novita(api_key)
+        return await _query_native_provider(info[0], api_key)
 
-    # Explicit hints let adapters use opaque relay URLs without exposing the
-    # credential to unrelated provider domains.
+    # Explicit hints: try relay first (shared gateway may proxy quota paths),
+    # then fall back to the vendor's first-party domain. Local inference relays
+    # (Antigravity etc.) almost never expose quota endpoints.
     if hinted_provider:
         hinted_result = await _query_via_base_url(hinted_provider, base_url, api_key)
         if hinted_result:
             return hinted_result
-        return _make_error(
+        native = await _query_native_provider(hinted_provider, api_key)
+        if native.get("success"):
+            return native
+        return native if native.get("error") else _make_error(
             hinted_provider,
             hinted_provider,
             f"Quota API unavailable through base URL: {base_url}",

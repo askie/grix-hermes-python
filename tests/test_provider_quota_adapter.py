@@ -112,14 +112,37 @@ providers:
     key_env: DEEPSEEK_API_KEY
 """,
     )
-    # model.api_key 有值时优先（与 hermes 推理行为一致），缺 base_url 才回落 providers.api
+    # 本地中转 + 占位 api_key：配额必须回落到 providers.api + key_env
     source = adapter_mod.resolve_provider_quota_source(
         str(tmp_path), {"DEEPSEEK_API_KEY": "sk-from-env"}
     )
     assert source is not None
-    assert source["baseUrl"] == "http://127.0.0.1:8045/v1"
-    assert source["apiKey"] == "your-api-key-1"
-    # relay URL 无特征，provider 名也不是已知厂商 → 由模型名嗅探出 deepseek
+    assert source["baseUrl"] == "https://api.deepseek.com"
+    assert source["apiKey"] == "sk-from-env"
+    assert source["providerId"] == "deepseek"
+
+
+def test_resolve_source_keeps_direct_model_credentials(tmp_path):
+    _write_config(
+        tmp_path,
+        """
+model:
+  provider: deepseek-api
+  base_url: https://api.deepseek.com
+  api_key: sk-direct
+  default: deepseek-v4-flash
+providers:
+  deepseek-api:
+    api: https://api.deepseek.com
+    key_env: DEEPSEEK_API_KEY
+""",
+    )
+    source = adapter_mod.resolve_provider_quota_source(
+        str(tmp_path), {"DEEPSEEK_API_KEY": "sk-from-env"}
+    )
+    assert source is not None
+    assert source["baseUrl"] == "https://api.deepseek.com"
+    assert source["apiKey"] == "sk-direct"
     assert source["providerId"] == "deepseek"
 
 

@@ -76,6 +76,7 @@ from .contract import (
     LOCAL_ACTION_EXEC_REJECT,
     KICKED_REASON_AGENT_DELETED,
     LOCAL_ACTION_FILE_LIST,
+    LOCAL_ACTION_GET_RATE_LIMITS,
     LOCAL_ACTION_GET_SESSION_USAGE,
     LOCAL_ACTION_SKILL_DISABLE,
     LOCAL_ACTION_SKILL_ENABLE,
@@ -302,17 +303,45 @@ def resolve_configured_model(hermes_home: Optional[str] = None) -> str:
     return ""
 
 
+_PLACEHOLDER_API_KEYS = frozenset(
+    {
+        "your-api-key",
+        "your-api-key-1",
+        "change_me",
+        "changeme",
+        "placeholder",
+        "xxx",
+        "sk-xxx",
+    }
+)
+
+
+def _looks_like_placeholder_api_key(value: str) -> bool:
+    """Inference relays often put a dummy model.api_key; quota needs the real key_env."""
+    normalized = (value or "").strip()
+    if not normalized:
+        return True
+    low = normalized.lower()
+    if low in _PLACEHOLDER_API_KEYS:
+        return True
+    return low.startswith("your-")
+
+
 def resolve_provider_quota_source(
     hermes_home: Optional[str] = None,
     environ: Optional[Dict[str, str]] = None,
 ) -> Optional[ProviderQuotaSource]:
-    """解析当前生效 provider 的配额查询凭据（对齐 connector resolveProviderQuotaSource）。
+    """解析当前生效 provider 的配额查询凭据。
 
     hermes 的 provider 凭据在 config.yaml（不在 grix agent config）：
-    - base_url：model.base_url → providers[model.provider].api → GRIX_HERMES_BASE_URL
-    - api_key：model.api_key → providers[model.provider].key_env 指向的 env → GRIX_PROVIDER_API_KEY
-      （后两项正是 connector spawn hermes 时注入 grix 中转 provider 的通道）
-    凭据缺一即返回 None（不发起查询），与 connector 一致。
+    - 推理 base_url：model.base_url → providers[model.provider].api → GRIX_HERMES_BASE_URL
+    - 推理 api_key：model.api_key → providers[model.provider].key_env → GRIX_PROVIDER_API_KEY
+
+    配额查询与推理不同：本地中转（如 Antigravity 127.0.0.1）通常不暴露厂商
+    配额 API，占位 api_key 也不能鉴权。因此：
+    - model.api_key 若是占位符，回落到 key_env / GRIX_PROVIDER_API_KEY；
+    - model.base_url 若无法识别厂商，而 providers[].api 可识别，则用后者查配额。
+    凭据缺一即返回 None（不发起查询）。
     """
     env = os.environ if environ is None else environ
     home = Path(hermes_home or env.get("HERMES_HOME", "") or "~/.hermes").expanduser()
@@ -340,31 +369,40 @@ def resolve_provider_quota_source(
                 model_name = value.strip()
                 break
 
-    base_url = str(model.get("base_url") or "").strip()
-    api_key = str(model.get("api_key") or "").strip()
+    inference_base = str(model.get("base_url") or "").strip()
+    model_api_key = str(model.get("api_key") or "").strip()
     provider_name = str(model.get("provider") or "").strip()
 
     providers = config.get("providers")
     entry = providers.get(provider_name) if isinstance(providers, dict) else None
     if not isinstance(entry, dict):
         entry = {}
-    if not base_url:
-        base_url = str(entry.get("api") or "").strip()
-    if not api_key:
-        key_env = str(entry.get("key_env") or "").strip()
-        if key_env:
-            api_key = env.get(key_env, "").strip()
+    entry_api = str(entry.get("api") or "").strip()
+    key_env = str(entry.get("key_env") or "").strip()
+    env_key = env.get(key_env, "").strip() if key_env else ""
 
-    if not base_url:
-        base_url = env.get("GRIX_HERMES_BASE_URL", "").strip()
+    if not inference_base:
+        inference_base = entry_api
+    if not inference_base:
+        inference_base = env.get("GRIX_HERMES_BASE_URL", "").strip()
+
+    api_key = "" if _looks_like_placeholder_api_key(model_api_key) else model_api_key
+    if not api_key:
+        api_key = env_key
     if not api_key:
         api_key = env.get("GRIX_PROVIDER_API_KEY", "").strip()
-    if not base_url or not api_key:
+    if not inference_base or not api_key:
         return None
+
+    # Opaque inference relays (localhost / shared gateway) → prefer vendor API URL.
+    base_url = inference_base
+    if detect_provider(inference_base) is None and entry_api and detect_provider(entry_api):
+        base_url = entry_api
 
     provider_id = (
         normalize_provider_id(provider_name)
         or (detect_provider(base_url) or (None,))[0]
+        or (detect_provider(inference_base) or (None,))[0]
         or (detect_provider_from_model(model_name) or (None,))[0]
     )
     source: ProviderQuotaSource = {"baseUrl": base_url, "apiKey": api_key}
@@ -2466,6 +2504,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_get_session_usage(action)
             return
 
+        if action.action_type == LOCAL_ACTION_GET_RATE_LIMITS:
+            await self._handle_get_rate_limits(action)
+            return
+
         if action.action_type == LOCAL_ACTION_SKILL_UPLOAD:
             await self._handle_skill_upload(action)
             return
@@ -2598,6 +2640,47 @@ class GrixAdapter(BasePlatformAdapter):
             result=result.get("result"),
             error_code=result.get("error_code"),
             error_message=result.get("error_msg"),
+        )
+
+    async def _handle_get_rate_limits(self, action: GrixLocalAction) -> None:
+        """工具栏点击刷新厂商限额：强制拉一次配额并回写 binding meta。"""
+        if not self._active_client():
+            return
+        refreshed = await self._refresh_provider_quota_once()
+        quota = getattr(self, "_provider_quota", None)
+        sampled_at = int(getattr(self, "_provider_quota_sampled_at_ms", 0) or 0)
+        if refreshed and quota and quota.get("success"):
+            await self._push_all_queue_snapshots()
+            rate_limits = provider_quota_to_rate_limits(quota, sampled_at)
+            await self._active_client().send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_OK,
+                result={
+                    "adapterType": "hermes",
+                    "available": True,
+                    "cached": False,
+                    "sampledAt": sampled_at or None,
+                    "rateLimits": rate_limits,
+                    "contextWindow": None,
+                    "tokenUsage": None,
+                    "providerQuota": quota,
+                },
+            )
+            return
+        await self._active_client().send_local_action_result(
+            action_id=action.action_id,
+            status=STATUS_OK,
+            result={
+                "adapterType": "hermes",
+                "available": False,
+                "cached": False,
+                "sampledAt": sampled_at or None,
+                "rateLimits": None,
+                "contextWindow": None,
+                "tokenUsage": None,
+                "providerQuota": quota,
+                "error": (quota or {}).get("error") if isinstance(quota, dict) else None,
+            },
         )
 
     async def _handle_skill_upload(self, action: GrixLocalAction) -> None:
