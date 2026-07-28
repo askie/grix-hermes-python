@@ -140,6 +140,72 @@ def test_toolbar_stop_leaves_other_sessions_alone(monkeypatch):
     assert foreign_key in inst._active_sessions
 
 
+def test_toolbar_stop_clears_bg_hold_when_no_active_turn(monkeypatch):
+    """回归：轮次已结束但 bg-hold 仍虚拟 running 时，/stop 必须清掉并给确认。"""
+    client = FakeTransportClient()
+    # 无活跃轮次 —— 复现「点停止等于没点」
+    inst = _prepare_stop_adapter(monkeypatch, client, [])
+    inst._state_for("").toolbar_active_work[DM_KEY] = {
+        "session_id": SESSION_ID,
+        "title": "node dist/grix.js",
+        "bg_hold": True,
+    }
+    inst.killed_keys = []
+
+    def _kill(session_key):
+        inst.killed_keys.append(session_key)
+        return 1
+
+    inst._kill_session_bg_processes = _kill
+
+    _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
+
+    assert inst.stopped_keys == []
+    assert DM_KEY in inst.killed_keys
+    assert DM_KEY not in inst._state_for("").toolbar_active_work
+    assert inst.confirmations == ["⚡ Stopped. You can continue this session."]
+    assert client.completed == [
+        {"event_id": "toolbar_cmd_1784293963630321971", "status": "responded", "message": None}
+    ]
+
+
+def test_toolbar_stop_kills_bg_even_with_active_turn(monkeypatch):
+    """有活跃轮次时 /stop 既停轮次，也杀同会话后台进程。"""
+    client = FakeTransportClient()
+    inst = _prepare_stop_adapter(monkeypatch, client, [DM_KEY])
+    inst._state_for("").toolbar_active_work[DM_KEY] = {
+        "session_id": SESSION_ID,
+        "title": "long job",
+        "bg_hold": True,
+    }
+    inst.killed_keys = []
+    inst._kill_session_bg_processes = lambda session_key: (
+        inst.killed_keys.append(session_key) or 1
+    )
+
+    _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
+
+    assert inst.stopped_keys == [DM_KEY]
+    assert DM_KEY in inst.killed_keys
+    assert DM_KEY not in inst._state_for("").toolbar_active_work
+    assert inst.confirmations == ["⚡ Stopped. You can continue this session."]
+
+
+def test_toolbar_stop_does_not_confirm_when_nothing_to_clear(monkeypatch):
+    """无活跃轮次、无 bg-hold、无后台进程：不发停止确认。"""
+    client = FakeTransportClient()
+    inst = _prepare_stop_adapter(monkeypatch, client, [])
+    inst._kill_session_bg_processes = lambda session_key: 0
+
+    _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
+
+    assert inst.stopped_keys == []
+    assert inst.confirmations == []
+    assert client.completed == [
+        {"event_id": "toolbar_cmd_1784293963630321971", "status": "responded", "message": None}
+    ]
+
+
 # ── 2. session_key 归属判定 ─────────────────────────────────────────────────
 
 

@@ -3914,28 +3914,43 @@ class GrixAdapter(BasePlatformAdapter):
         # 该事件只带 session_id + sender，没有会话类型，按它拼出的 session_key 一律是
         # dm 形态，在群会话（<ns>:grix:group:<session_id>:<user_id>）里永远对不上。
         # 停止的语义是"停这个会话里该 agent 的活"，所以按 session_id 找出该会话下所有
-        # 正在跑的任务逐个停。
+        # 正在跑的任务逐个停。同时必须清理 process_registry 后台进程与 bg-hold
+        # 虚拟 running：LLM 轮次已结束但 daemon 仍被 notify_on_complete 盯着时，
+        # active_sessions 为空，旧逻辑会空操作，前端一直转圈。
         if message.text and message.text.strip().lower() == "/stop":
             stop_keys = self._active_session_keys_for_session(message.session_id)
+            cleanup_keys = self._stop_cleanup_session_keys(
+                message.session_id, source=source, active_keys=stop_keys,
+            )
             logger.info(
-                "[%s] GRIX /stop command received event_id=%s session_id=%s stop_keys=%s active_sessions=%s",
+                "[%s] GRIX /stop command received event_id=%s session_id=%s "
+                "stop_keys=%s cleanup_keys=%s active_sessions=%s",
                 self.name, message.event_id, message.session_id, stop_keys,
-                list(self._active_sessions.keys()),
+                cleanup_keys, list(self._active_sessions.keys()),
             )
             stopped_any = False
             for stop_key in stop_keys:
                 # 多路并发时全停，但只给用户一条停止确认。
                 if await self._force_stop_session(
                     source, stop_key, reply_to=message.message_id, notify=not stopped_any,
+                    cleanup_background=False,
                 ):
                     stopped_any = True
+            cleared_bg = await self._cleanup_session_background(
+                message.session_id, cleanup_keys,
+            )
+            if cleared_bg and not stopped_any:
+                await self._notify_session_stopped(
+                    source, reply_to=message.message_id,
+                )
+                stopped_any = True
             if self._client:
                 await self._complete_event_if_needed(
                     message.event_id, status=STATUS_RESPONDED,
                 )
             logger.info(
-                "[%s] GRIX /stop command handled event_id=%s stopped=%s",
-                self.name, message.event_id, stopped_any,
+                "[%s] GRIX /stop command handled event_id=%s stopped=%s cleared_bg=%s",
+                self.name, message.event_id, stopped_any, cleared_bg,
             )
             return
 
@@ -5511,6 +5526,7 @@ class GrixAdapter(BasePlatformAdapter):
         *,
         reply_to: Optional[str] = None,
         notify: bool = True,
+        cleanup_background: bool = True,
     ) -> bool:
         was_active = session_key in self._active_sessions
         if not was_active:
@@ -5518,6 +5534,12 @@ class GrixAdapter(BasePlatformAdapter):
                 "[%s] _force_stop_session skip (not active) session_key=%s active_sessions=%s",
                 self.name, session_key, list(self._active_sessions.keys()),
             )
+            if cleanup_background:
+                session_id = str(getattr(source, "chat_id", "") or "").strip()
+                if session_id:
+                    return await self._cleanup_session_background(
+                        session_id, [session_key],
+                    )
             return False
 
         await self.cancel_session_processing(
@@ -5548,21 +5570,190 @@ class GrixAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+        if cleanup_background:
+            session_id = str(getattr(source, "chat_id", "") or "").strip()
+            if session_id:
+                await self._cleanup_session_background(session_id, [session_key])
+
         if notify:
-            thread_id = getattr(source, "thread_id", None)
-            thread_meta = {"thread_id": thread_id} if thread_id else None
-            try:
-                await self._send_with_retry(
-                    chat_id=source.chat_id,
-                    content="⚡ Stopped. You can continue this session.",
-                    reply_to=reply_to,
-                    metadata=thread_meta,
-                )
-            except Exception as exc:
-                logger.debug("[%s] Failed sending local stop confirmation for %s: %s", self.name, session_key, exc)
+            await self._notify_session_stopped(source, reply_to=reply_to)
 
         logger.info("[%s] Locally stopped active GRIX session %s", self.name, session_key)
         return True
+
+    async def _notify_session_stopped(
+        self, source: Any, *, reply_to: Optional[str] = None,
+    ) -> None:
+        thread_id = getattr(source, "thread_id", None)
+        thread_meta = {"thread_id": thread_id} if thread_id else None
+        try:
+            await self._send_with_retry(
+                chat_id=source.chat_id,
+                content="⚡ Stopped. You can continue this session.",
+                reply_to=reply_to,
+                metadata=thread_meta,
+            )
+        except Exception as exc:
+            logger.debug(
+                "[%s] Failed sending local stop confirmation for %s: %s",
+                self.name, getattr(source, "chat_id", None), exc,
+            )
+
+    def _stop_cleanup_session_keys(
+        self,
+        session_id: str,
+        *,
+        source: Any,
+        active_keys: Optional[List[str]] = None,
+    ) -> List[str]:
+        """收集 /stop 需要清理后台进程与 bg-hold 的 session_key。
+
+        含：活跃轮次 key、工具栏 bg-hold key、以及 /stop 事件自身拼出的
+        key（通常是 dm 形态，正好对应 process_registry 登记键）。
+        """
+        keys: List[str] = []
+        seen: set[str] = set()
+
+        def _add(key: str) -> None:
+            k = str(key or "").strip()
+            if not k or k in seen:
+                return
+            if not self._session_key_belongs_to_session(k, session_id):
+                return
+            seen.add(k)
+            keys.append(k)
+
+        for key in active_keys or []:
+            _add(key)
+        try:
+            built = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=self.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+            )
+        except Exception:
+            built = ""
+        _add(built)
+        state = self._active_state()
+        for key, work in list(state.toolbar_active_work.items()):
+            if work.get("bg_hold") or work.get("session_id") == session_id:
+                _add(key)
+        for registry in (
+            state.session_running_event_ids,
+            state.session_next_run_event_ids,
+            state.session_open_event_ids,
+            state.processing_message_ids,
+        ):
+            for key in list(registry.keys()):
+                _add(key)
+        return keys
+
+    def _kill_session_bg_processes(self, session_key: str) -> int:
+        """杀掉 process_registry 中挂在该 Hermes session_key 下的后台进程。"""
+        key = str(session_key or "").strip()
+        if not key:
+            return 0
+        try:
+            from tools.process_registry import process_registry
+        except Exception as exc:
+            logger.warning(
+                "[%s] stop bg-kill unavailable (process_registry import failed): %s",
+                self.name, exc,
+            )
+            return 0
+        try:
+            sessions = process_registry.list_sessions(session_key=key)
+        except Exception as exc:
+            logger.warning(
+                "[%s] stop bg-kill list_sessions failed session_key=%s: %s",
+                self.name, key, exc,
+            )
+            return 0
+        killed = 0
+        for entry in sessions:
+            if not isinstance(entry, dict) or entry.get("status") != "running":
+                continue
+            proc_id = str(entry.get("session_id") or "").strip()
+            if not proc_id:
+                continue
+            try:
+                result = process_registry.kill_process(proc_id, source="grix_stop")
+            except TypeError:
+                # 旧 hermes 可能不接受 source=
+                try:
+                    result = process_registry.kill_process(proc_id)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] stop bg-kill failed proc=%s session_key=%s: %s",
+                        self.name, proc_id, key, exc,
+                    )
+                    continue
+            except Exception as exc:
+                logger.warning(
+                    "[%s] stop bg-kill failed proc=%s session_key=%s: %s",
+                    self.name, proc_id, key, exc,
+                )
+                continue
+            status = str((result or {}).get("status") or "")
+            if status in ("killed", "already_exited"):
+                killed += 1
+                logger.info(
+                    "[%s] stop bg-kill proc=%s status=%s session_key=%s",
+                    self.name, proc_id, status, key,
+                )
+        return killed
+
+    async def _clear_bg_hold_ui(self, session_key: str, session_id: str) -> bool:
+        """清掉该会话相关的 bg-hold 虚拟 running 与 composing。"""
+        key = str(session_key or "").strip()
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        owner_key = self._active_owner_key()
+        state = self._state_for(owner_key)
+        had_hold = False
+        if key and key in state.toolbar_active_work:
+            state.toolbar_active_work.pop(key, None)
+            had_hold = True
+        for other_key, other_work in list(state.toolbar_active_work.items()):
+            if other_work.get("session_id") == sid and other_work.get("bg_hold"):
+                state.toolbar_active_work.pop(other_key, None)
+                had_hold = True
+        if not had_hold:
+            return False
+        await self._push_queue_snapshot(sid, owner_key)
+        await self._refresh_bg_hold_activity(sid, owner_key, active=False)
+        return True
+
+    async def _cleanup_session_background(
+        self, session_id: str, session_keys: List[str],
+    ) -> bool:
+        """停会话时清理后台进程 + bg-hold UI。有任一清理动作则返回 True。"""
+        sid = str(session_id or "").strip()
+        if not sid:
+            return False
+        killed = 0
+        for key in session_keys:
+            killed += self._kill_session_bg_processes(key)
+        cleared = False
+        for key in session_keys:
+            if await self._clear_bg_hold_ui(key, sid):
+                cleared = True
+        if killed and not cleared:
+            # 进程已杀但 toolbar 无记录：仍推空快照，清前端残留虚拟 running。
+            owner_key = self._active_owner_key()
+            await self._push_queue_snapshot(sid, owner_key)
+            await self._refresh_bg_hold_activity(sid, owner_key, active=False)
+        if killed or cleared:
+            logger.info(
+                "[%s] stop background cleanup session=%s killed=%s cleared_ui=%s keys=%s",
+                self.name, sid, killed, cleared, session_keys,
+            )
+        return bool(killed or cleared)
 
     def _resolve_stop_source(self, stop: GrixStopEvent):
         source = self._active_state().latest_sources.get(stop.session_id)
