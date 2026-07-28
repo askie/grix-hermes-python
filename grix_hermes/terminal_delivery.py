@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import OrderedDict
 from contextlib import suppress
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
@@ -22,6 +21,7 @@ from .persistence import (
     StopResultOutbox,
     StopResultOutboxEntry,
     TerminalCommitTokenStore,
+    TerminalCommittedStore,
     TerminalOutbox,
     TerminalOutboxEntry,
     TerminalRejection,
@@ -47,17 +47,20 @@ class TerminalDeliveryController:
     def __init__(self, client: "GrixTransportClient"):
         self._client = client
         config = client._config
-        outbox_path, token_path, stop_path = resolve_terminal_sidecar_paths(
+        outbox_path, token_path, stop_path, committed_path = resolve_terminal_sidecar_paths(
             getattr(config, "terminal_outbox_path", None),
             token_path=getattr(config, "terminal_commit_token_store_path", None),
             stop_path=getattr(config, "stop_result_outbox_path", None),
+            committed_path=getattr(config, "terminal_committed_store_path", None),
         )
         self.terminal_outbox = TerminalOutbox(outbox_path)
         self.terminal_commit_tokens = TerminalCommitTokenStore(token_path)
         self.stop_result_outbox = StopResultOutbox(stop_path)
+        self.terminal_committed = TerminalCommittedStore(
+            committed_path, max_size=MAX_COMMITTED_TERMINAL_EVENTS
+        )
 
         self._provisional_responded: Dict[str, Dict[str, Any]] = {}
-        self._committed_terminals: OrderedDict[str, None] = OrderedDict()
         self._terminal_in_flight: set[str] = set()
         self._terminal_replay_after_flight: set[str] = set()
         self._terminal_retry_handles: Dict[str, asyncio.TimerHandle] = {}
@@ -65,8 +68,8 @@ class TerminalDeliveryController:
         self._stop_retry_handles: Dict[str, asyncio.TimerHandle] = {}
         self._delivery_tasks: set[asyncio.Task] = set()
 
-        for entry in self.terminal_outbox.list_pending():
-            self._remember_committed_skip(entry.payload.get("event_id", ""))
+    def is_terminal_settled(self, event_id: str) -> bool:
+        return self.terminal_committed.has(event_id)
 
     # --- inbound token capture -------------------------------------------------
 
@@ -151,7 +154,7 @@ class TerminalDeliveryController:
 
         event_id = str(payload.get("event_id") or "")
         durable = self.terminal_outbox.get(event_id)
-        if event_id in self._committed_terminals and not durable:
+        if self.terminal_committed.has(event_id) and not durable:
             logger.info(
                 "ignored duplicate terminal after committed ACK event=%s status=%s",
                 event_id,
@@ -426,6 +429,9 @@ class TerminalDeliveryController:
                         ),
                     )
                     if moved:
+                        # Dead-letter is a settled terminal: seal against memory
+                        # replay re-enqueue after client replacement.
+                        self.remember_committed_terminal_event(event_id)
                         logger.error(
                             "event_result rejected and moved to dead-letter: event=%s "
                             "status=%s cmd=%s code=%s msg=%s",
@@ -626,17 +632,7 @@ class TerminalDeliveryController:
         )
 
     def remember_committed_terminal_event(self, event_id: str) -> None:
-        eid = str(event_id or "").strip()
-        if not eid:
-            return
-        self._committed_terminals.pop(eid, None)
-        self._committed_terminals[eid] = None
-        while len(self._committed_terminals) > MAX_COMMITTED_TERMINAL_EVENTS:
-            self._committed_terminals.popitem(last=False)
-
-    def _remember_committed_skip(self, event_id: Any) -> None:
-        # Warm nothing on load — pending entries are not committed yet.
-        _ = event_id
+        self.terminal_committed.add(event_id)
 
     def clear_terminal_retry_timers(self) -> None:
         for handle in self._terminal_retry_handles.values():
@@ -647,6 +643,14 @@ class TerminalDeliveryController:
         for handle in self._stop_retry_handles.values():
             handle.cancel()
         self._stop_retry_handles.clear()
+
+    def on_soft_disconnect(self) -> None:
+        """Clear timers/provisional state without cancelling the caller task."""
+        self.clear_terminal_retry_timers()
+        self.clear_stop_result_retry_timers()
+        self._provisional_responded.clear()
+        self._terminal_in_flight.clear()
+        self._stop_in_flight.clear()
 
     def _spawn(self, coro) -> None:
         try:

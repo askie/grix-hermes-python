@@ -285,16 +285,18 @@ def build_grix_connection_config(config: PlatformConfig) -> GrixConnectionConfig
         str(getattr(config, "name", None) or "hermes"),
         base.agent_id,
     )
-    outbox_path, token_path, stop_path = resolve_terminal_sidecar_paths(
+    outbox_path, token_path, stop_path, committed_path = resolve_terminal_sidecar_paths(
         outbox_path,
         token_path=str(extra.get("terminal_commit_token_store_path") or "").strip() or None,
         stop_path=str(extra.get("stop_result_outbox_path") or "").strip() or None,
+        committed_path=str(extra.get("terminal_committed_store_path") or "").strip() or None,
     )
     return dataclasses.replace(
         base,
         terminal_outbox_path=outbox_path,
         terminal_commit_token_store_path=token_path,
         stop_result_outbox_path=stop_path,
+        terminal_committed_store_path=committed_path,
     )
 
 
@@ -311,6 +313,9 @@ def build_shared_connection_config(
             base.terminal_commit_token_store_path, owner
         ),
         stop_result_outbox_path=suffix_shared_path(base.stop_result_outbox_path, owner),
+        terminal_committed_store_path=suffix_shared_path(
+            base.terminal_committed_store_path, owner
+        ),
     )
 
 
@@ -4951,19 +4956,20 @@ class GrixAdapter(BasePlatformAdapter):
         }
         self._active_state().completed_event_ids.add(event_id)
         try:
-            # 走 _get_ready_client 感知重连拿存活连接，而不是直接用 ContextVar
-            # 里可能已失效的旧 client（主连接重连后会换新对象）。
+            # Prefer a ready client for immediate delivery, but still enqueue on
+            # a disconnected client object so crash/reconnect can replay disk.
             client = await self._get_ready_client(operation="complete_event")
-            if client is None:
+            persist_client = client or self._active_client() or self._client
+            if persist_client is None:
                 logger.warning(
-                    "[%s] GRIX complete_event deferred (no ready client) for %s status=%s — "
+                    "[%s] GRIX complete_event deferred (no client) for %s status=%s — "
                     "will replay after reconnect",
                     self.name,
                     event_id,
                     status,
                 )
                 return
-            await client.complete_event(
+            await persist_client.complete_event(
                 event_id=event_id,
                 status=status,
                 message=message,
@@ -5034,8 +5040,19 @@ class GrixAdapter(BasePlatformAdapter):
             result = self._active_state().completed_event_results.get(eid)
             if not result:
                 continue
+            # Skip terminals already ACK'd / dead-lettered on disk so client
+            # replacement cannot re-enqueue a settled verdict.
+            settled_client = self._active_client() or self._client
+            if settled_client is not None and getattr(
+                settled_client, "is_terminal_settled", None
+            ):
+                try:
+                    if settled_client.is_terminal_settled(eid):
+                        continue
+                except Exception:
+                    pass
             try:
-                await self._active_client().complete_event(
+                await (self._active_client() or self._client).complete_event(
                     event_id=eid,
                     status=str(result.get("status") or STATUS_RESPONDED),
                     message=result.get("message"),

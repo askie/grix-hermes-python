@@ -40,11 +40,13 @@ def resolve_terminal_sidecar_paths(
     *,
     token_path: Optional[str] = None,
     stop_path: Optional[str] = None,
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    committed_path: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
     if not terminal_outbox_path:
-        return None, token_path, stop_path
+        return None, token_path, stop_path, committed_path
     return (
         terminal_outbox_path,
         token_path or f"{terminal_outbox_path}.tokens",
         stop_path or f"{terminal_outbox_path}.stops",
+        committed_path or f"{terminal_outbox_path}.committed",
     )

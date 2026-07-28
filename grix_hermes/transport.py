@@ -250,7 +250,55 @@ class GrixTransportClient:
         )
 
     async def reconnect_after_outbound_failure(self, reason: str) -> None:
-        await self.disconnect(reason)
+        """Soft-close the socket without cancelling the calling delivery task.
+
+        Aligns with connector ``reconnectAfterOutboundWriteFailure``: bump
+        generation, clear caps/timers, reject pending requests, close socket,
+        mark disconnected — leave delivery task cancellation to normal
+        disconnect / adapter reconnect paths.
+        """
+        async with self._disconnect_lock:
+            if self._disconnect_requested and not self._socket:
+                return
+            self._connection_generation += 1
+            self._negotiated_capabilities.clear()
+            self._ack_policy = None
+            self._terminal.on_soft_disconnect()
+            self._reject_pending(GrixTransportError(reason or "grix transport disconnected"))
+
+            # Cancel reader/heartbeat only — not packet/delivery tasks that may
+            # be the caller of this method.
+            current_task = asyncio.current_task()
+            side_tasks = [
+                task
+                for task in (self._heartbeat_task, self._reader_task)
+                if task and task is not current_task
+            ]
+            for task in side_tasks:
+                task.cancel()
+            if side_tasks:
+                await asyncio.gather(*side_tasks, return_exceptions=True)
+
+            socket = self._socket
+            self._socket = None
+            self._heartbeat_task = None
+            self._reader_task = None
+            self._auth_session = None
+            if socket:
+                with suppress(Exception):
+                    await socket.close(reason)
+            self._update_status(
+                {
+                    "running": False,
+                    "connected": False,
+                    "authed": False,
+                    "last_disconnect_at": _now_ms(),
+                    "last_error": reason or None,
+                }
+            )
+
+    def is_terminal_settled(self, event_id: str) -> bool:
+        return self._terminal.is_terminal_settled(event_id)
 
     async def connect(self) -> GrixAuthSession:
         if self._status["connected"] and self._auth_session:

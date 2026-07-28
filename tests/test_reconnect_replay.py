@@ -102,6 +102,9 @@ class ReplayRecordingClient:
     def replay_terminal_outboxes(self):
         return None
 
+    def is_terminal_settled(self, event_id: str) -> bool:
+        return False
+
 
 def _make_adapter():
     ReplayRecordingClient.instances.clear()

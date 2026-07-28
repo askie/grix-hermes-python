@@ -440,6 +440,84 @@ def test_first_durable_terminal_wins():
     asyncio.run(_run())
 
 
+def test_committed_tombstone_survives_client_replacement():
+    async def _run():
+        with tempfile.TemporaryDirectory() as data_dir:
+            outbox_path = Path(data_dir) / "tombstone.json"
+            socket1 = MockSocket()
+
+            async def connector1(_config):
+                return socket1
+
+            first = GrixTransportClient(_make_config(outbox_path), connector=connector1)
+            await _authenticate(first, socket1)
+            await first.complete_event(event_id="evt-tomb", status="responded")
+            await _wait_until(lambda: any(p["cmd"] == "event_result" for p in socket1.sent))
+            request = _latest_result(socket1, "evt-tomb")
+            _respond(
+                socket1,
+                request,
+                "send_ack",
+                {"event_id": "evt-tomb", "status": "responded"},
+            )
+            await _wait_until(lambda: first.is_terminal_settled("evt-tomb"))
+            await first.disconnect()
+
+            socket2 = MockSocket()
+
+            async def connector2(_config):
+                return socket2
+
+            second = GrixTransportClient(_make_config(outbox_path), connector=connector2)
+            await _authenticate(second, socket2)
+            await second.complete_event(event_id="evt-tomb", status="responded")
+            await asyncio.sleep(0.05)
+            assert not any(
+                p["cmd"] == "event_result" and p["payload"].get("event_id") == "evt-tomb"
+                for p in socket2.sent
+            )
+            assert second.is_terminal_settled("evt-tomb")
+            await second.disconnect()
+
+    asyncio.run(_run())
+
+
+def test_dead_letter_also_seals_against_reenqueue():
+    async def _run():
+        with tempfile.TemporaryDirectory() as data_dir:
+            outbox_path = Path(data_dir) / "dead-seal.json"
+            socket1 = MockSocket()
+
+            async def connector1(_config):
+                return socket1
+
+            first = GrixTransportClient(_make_config(outbox_path), connector=connector1)
+            await _authenticate(first, socket1)
+            await first.complete_event(event_id="evt-dead", status="canceled")
+            await _wait_until(lambda: any(p["cmd"] == "event_result" for p in socket1.sent))
+            request = _latest_result(socket1, "evt-dead")
+            _respond(socket1, request, "send_nack", {"code": 4003, "msg": "denied"})
+            await _wait_until(lambda: first.is_terminal_settled("evt-dead"))
+            await first.disconnect()
+
+            socket2 = MockSocket()
+
+            async def connector2(_config):
+                return socket2
+
+            second = GrixTransportClient(_make_config(outbox_path), connector=connector2)
+            await _authenticate(second, socket2)
+            await second.complete_event(event_id="evt-dead", status="canceled")
+            await asyncio.sleep(0.05)
+            assert not any(
+                p["cmd"] == "event_result" and p["payload"].get("event_id") == "evt-dead"
+                for p in socket2.sent
+            )
+            await second.disconnect()
+
+    asyncio.run(_run())
+
+
 if __name__ == "__main__":
     test_suffix_shared_path_isolates_owner()
     test_terminal_outbox_atomic_enqueue_and_ack()
@@ -451,4 +529,6 @@ if __name__ == "__main__":
     test_stop_canceled_replaces_unsent_output_guard()
     test_stop_outbox_discard_on_hard_reject()
     test_first_durable_terminal_wins()
+    test_committed_tombstone_survives_client_replacement()
+    test_dead_letter_also_seals_against_reenqueue()
     print("ok")
