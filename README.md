@@ -153,6 +153,19 @@ hermes --profile <agent-slug> gateway restart
 
 Each profile runs its own gateway, so agents stay isolated from one another.
 
+## Terminal delivery durability
+
+Hermes mirrors grix-connector's durable terminal outbox for `event_result` /
+`event_stop_result`:
+
+- Persist to disk **before** the first WebSocket send (`~/.grix/data/terminal-outbox-*.json`, plus `.tokens` / `.stops` sidecars).
+- Shared-owner connections use isolated paths (`.shared.<owner_id>` suffix).
+- Auth advertises `terminal_commit_v1` + `event_result_ack`; tokenized terminals require a matching backend.
+
+**Deploy order:** roll out backend `terminal_commit_v1` / stop-token support
+**before** this Hermes version. Keep protocol semantics identical to
+grix-connector — do not invent a parallel commit scheme.
+
 ## Plugin skills
 
 After installation, Hermes can load these namespaced skills:
