@@ -32,7 +32,13 @@ class QuotaTier(TypedDict, total=False):
     resetsAt: Optional[str]  # ISO 8601
 
 
+# Balance semantics discriminator.
+# - "currency": money or provider credits amount (remaining/unit), not a 5h/7d percentage tier.
+BalanceKind = str  # "currency"
+
+
 class BalanceInfo(TypedDict, total=False):
+    kind: BalanceKind
     remaining: float
     total: Optional[float]
     used: Optional[float]
@@ -473,6 +479,7 @@ def _deepseek_result_from_body(body: Any) -> Optional[ProviderQuotaResult]:
         "planName": None,
         "tiers": [],
         "balance": {
+            "kind": "currency",
             "remaining": _parse_f64(first.get("total_balance")) or 0.0,
             "total": None,
             "used": None,
@@ -511,7 +518,13 @@ def _stepfun_result(balance: float) -> ProviderQuotaResult:
         "providerLabel": "StepFun",
         "planName": None,
         "tiers": [],
-        "balance": {"remaining": balance, "total": None, "used": None, "unit": "CNY"},
+        "balance": {
+            "kind": "currency",
+            "remaining": balance,
+            "total": None,
+            "used": None,
+            "unit": "CNY",
+        },
         "success": True,
         "error": None,
     }
@@ -561,6 +574,7 @@ async def _query_siliconflow(api_key: str, is_cn: bool) -> ProviderQuotaResult:
             "planName": None,
             "tiers": [],
             "balance": {
+                "kind": "currency",
                 "remaining": total_balance,
                 "total": None,
                 "used": None,
@@ -590,6 +604,7 @@ def _openrouter_result_from_body(body: Any) -> Optional[ProviderQuotaResult]:
         "planName": None,
         "tiers": [],
         "balance": {
+            "kind": "currency",
             "remaining": total_credits - total_usage,
             "total": total_credits,
             "used": total_usage,
@@ -628,7 +643,13 @@ def _novita_result(available: float) -> ProviderQuotaResult:
         "providerLabel": "Novita AI",
         "planName": None,
         "tiers": [],
-        "balance": {"remaining": available, "total": None, "used": None, "unit": "USD"},
+        "balance": {
+            "kind": "currency",
+            "remaining": available,
+            "total": None,
+            "used": None,
+            "unit": "USD",
+        },
         "success": True,
         "error": None,
     }
@@ -752,6 +773,7 @@ async def _query_via_base_url(
                 "planName": None,
                 "tiers": [],
                 "balance": {
+                    "kind": "currency",
                     "remaining": _parse_f64(data.get("totalBalance")) or 0.0,
                     "total": None,
                     "used": None,
@@ -923,14 +945,18 @@ def provider_quota_to_rate_limits(
     balance = quota.get("balance")
     if not balance:
         return None
+    credit: Dict[str, Any] = {
+        "remaining": balance.get("remaining"),
+        "total": balance.get("total"),
+        "used": balance.get("used"),
+        "unit": balance.get("unit"),
+        "resetsAt": _reset_epoch_seconds(balance.get("resetsAt")),
+    }
+    # 透传 kind（如 currency），保持旧字段兼容；无 kind 时不写入。
+    if balance.get("kind"):
+        credit["kind"] = balance.get("kind")
     return {
-        "credit": {
-            "remaining": balance.get("remaining"),
-            "total": balance.get("total"),
-            "used": balance.get("used"),
-            "unit": balance.get("unit"),
-            "resetsAt": _reset_epoch_seconds(balance.get("resetsAt")),
-        },
+        "credit": credit,
         "planName": quota.get("planName"),
         "sampledAt": sampled_at_ms,
     }

@@ -256,6 +256,38 @@ def test_toolbar_meta_enriches_provider_quota_and_rate_limits():
     assert meta["rate_limits"]["sampledAt"] == 1700000000000
 
 
+def test_toolbar_meta_credit_passthrough_balance_kind():
+    """DeepSeek 等 currency 余额经 toolbar meta 透传 kind/unit/remaining。"""
+    inst = _bare_adapter()
+    inst._provider_quota = {
+        "provider": "deepseek",
+        "providerLabel": "DeepSeek",
+        "planName": None,
+        "tiers": [],
+        "balance": {
+            "kind": "currency",
+            "remaining": 12.34,
+            "total": None,
+            "used": None,
+            "unit": "CNY",
+        },
+        "success": True,
+        "error": None,
+    }
+    inst._provider_quota_sampled_at_ms = 1700000000000
+    meta = inst._provider_quota_toolbar_meta()
+    assert meta["provider_quota"]["balance"]["kind"] == "currency"
+    assert meta["rate_limits"]["credit"] == {
+        "remaining": 12.34,
+        "total": None,
+        "used": None,
+        "unit": "CNY",
+        "resetsAt": 0,
+        "kind": "currency",
+    }
+    assert meta["rate_limits"]["sampledAt"] == 1700000000000
+
+
 def test_toolbar_meta_skips_failed_quota():
     inst = _bare_adapter()
     inst._provider_quota = {"provider": "kimi", "success": False, "error": "401"}

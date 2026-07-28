@@ -181,7 +181,13 @@ def test_query_deepseek_balance(monkeypatch):
     )
     result = run(pq.query_provider_quota("https://api.deepseek.com", "key"))
     assert result["success"] is True
-    assert result["balance"] == {"remaining": 12.34, "total": None, "used": None, "unit": "CNY"}
+    assert result["balance"] == {
+        "kind": "currency",
+        "remaining": 12.34,
+        "total": None,
+        "used": None,
+        "unit": "CNY",
+    }
 
 
 def test_query_minimax_weekly(monkeypatch):
@@ -220,24 +226,33 @@ def test_query_openrouter_credits(monkeypatch):
     result = run(pq.query_provider_quota("https://openrouter.ai/api/v1", "key"))
     assert result["balance"]["remaining"] == 7.5
     assert result["balance"]["unit"] == "USD"
+    assert result["balance"]["kind"] == "currency"
 
 
 def test_query_novita_scales_balance(monkeypatch):
     _patch_http(monkeypatch, {"api.novita.ai": (200, {"availableBalance": 123400})})
     result = run(pq.query_provider_quota("https://api.novita.ai/v3", "key"))
     assert result["balance"]["remaining"] == pytest.approx(12.34)
+    assert result["balance"]["kind"] == "currency"
 
 
 def test_query_stepfun_balance(monkeypatch):
     _patch_http(monkeypatch, {"api.stepfun.com": (200, {"balance": 88.5})})
     result = run(pq.query_provider_quota("https://api.stepfun.com/v1", "key"))
-    assert result["balance"] == {"remaining": 88.5, "total": None, "used": None, "unit": "CNY"}
+    assert result["balance"] == {
+        "kind": "currency",
+        "remaining": 88.5,
+        "total": None,
+        "used": None,
+        "unit": "CNY",
+    }
 
 
 def test_query_siliconflow_balance(monkeypatch):
     _patch_http(monkeypatch, {"api.siliconflow.cn": (200, {"data": {"totalBalance": 66.0}})})
     result = run(pq.query_provider_quota("https://api.siliconflow.cn/v1", "key"))
     assert result["balance"]["remaining"] == 66.0
+    assert result["balance"]["kind"] == "currency"
 
 
 def test_query_empty_api_key():
@@ -300,6 +315,7 @@ def test_query_hint_falls_back_to_native_when_relay_misses(monkeypatch):
     assert result["success"] is True
     assert result["provider"] == "deepseek"
     assert result["balance"]["remaining"] == 12.5
+    assert result["balance"]["kind"] == "currency"
     assert any(u.startswith("https://api.deepseek.com/") for u in calls)
 
 
@@ -319,9 +335,11 @@ def test_probe_identifies_provider_through_relay(monkeypatch):
     result = run(pq.query_provider_quota("https://relay.example.com/v1", "key"))
     assert result["success"] is True
     assert result["provider"] == "deepseek"
+    assert result["balance"]["kind"] == "currency"
     # 探测缓存生效：第二次走缓存的 provider 直接命中
     result2 = run(pq.query_provider_quota("https://relay.example.com/v1", "key"))
     assert result2["provider"] == "deepseek"
+    assert result2["balance"]["kind"] == "currency"
 
 
 def test_probe_unknown_provider(monkeypatch):
@@ -359,6 +377,7 @@ def test_query_siliconflow_en(monkeypatch):
     assert result["providerLabel"] == "SiliconFlow (EN)"
     assert result["balance"]["unit"] == "USD"
     assert result["balance"]["remaining"] == 3.5
+    assert result["balance"]["kind"] == "currency"
 
 
 def test_query_minimax_en(monkeypatch):
@@ -454,6 +473,34 @@ def test_rate_limits_from_balance():
         "providerLabel": "DeepSeek",
         "planName": None,
         "tiers": [],
+        "balance": {
+            "kind": "currency",
+            "remaining": 8.0,
+            "total": 10.0,
+            "used": 2.0,
+            "unit": "CNY",
+        },
+        "success": True,
+        "error": None,
+    }
+    rl = pq.provider_quota_to_rate_limits(quota, 1)
+    assert rl["credit"] == {
+        "remaining": 8.0,
+        "total": 10.0,
+        "used": 2.0,
+        "unit": "CNY",
+        "resetsAt": 0,
+        "kind": "currency",
+    }
+
+
+def test_rate_limits_from_balance_without_kind_keeps_compat():
+    """无 kind 时不写入 credit.kind，旧字段保持兼容。"""
+    quota = {
+        "provider": "deepseek",
+        "providerLabel": "DeepSeek",
+        "planName": None,
+        "tiers": [],
         "balance": {"remaining": 8.0, "total": 10.0, "used": 2.0, "unit": "CNY"},
         "success": True,
         "error": None,
@@ -466,6 +513,7 @@ def test_rate_limits_from_balance():
         "unit": "CNY",
         "resetsAt": 0,
     }
+    assert "kind" not in rl["credit"]
 
 
 def test_rate_limits_empty_returns_none():
