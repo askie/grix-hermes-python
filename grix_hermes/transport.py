@@ -51,6 +51,7 @@ from .protocol import (
     parse_heartbeat_sec,
     parse_message,
 )
+from .terminal_delivery import TerminalDeliveryController
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +124,8 @@ StatusHandler = Callable[[Dict[str, Any]], Awaitable[None] | None]
 class GrixAuthSession:
     heartbeat_sec: int
     protocol: Optional[str] = None
+    supported_capabilities: tuple[str, ...] = ()
+    ack_policy: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -209,16 +212,52 @@ class GrixTransportClient:
             "last_connect_at": None,
             "last_disconnect_at": None,
         }
+        self._connection_generation = 0
+        self._negotiated_capabilities: set[str] = set()
+        self._ack_policy: Optional[Dict[str, Any]] = None
+        self._terminal = TerminalDeliveryController(self)
 
     @property
     def status(self) -> Dict[str, Any]:
         return dict(self._status)
+
+    @property
+    def connection_generation(self) -> int:
+        return self._connection_generation
+
+    @property
+    def negotiated_capabilities(self) -> set[str]:
+        return set(self._negotiated_capabilities)
+
+    @property
+    def ack_policy(self) -> Optional[Dict[str, Any]]:
+        return dict(self._ack_policy) if self._ack_policy else None
+
+    @property
+    def is_ready_for_outbound(self) -> bool:
+        return bool(
+            self._socket
+            and self._status.get("connected")
+            and self._status.get("authed")
+        )
+
+    def is_connection_current(self, generation: int) -> bool:
+        return (
+            self._socket is not None
+            and self._connection_generation == generation
+            and bool(self._status.get("connected"))
+            and bool(self._status.get("authed"))
+        )
+
+    async def reconnect_after_outbound_failure(self, reason: str) -> None:
+        await self.disconnect(reason)
 
     async def connect(self) -> GrixAuthSession:
         if self._status["connected"] and self._auth_session:
             return self._auth_session
 
         self._disconnect_requested = False
+        self._connection_generation += 1
         self._update_status({"running": True, "last_error": None})
         self._socket = await self._connector(self._config)
         self._update_status(
@@ -240,11 +279,16 @@ class GrixTransportClient:
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(auth_session.heartbeat_sec)
         )
+        self._terminal.on_authenticated()
         return auth_session
 
     async def disconnect(self, reason: str = "") -> None:
         async with self._disconnect_lock:
             self._disconnect_requested = True
+            self._connection_generation += 1
+            self._terminal.on_disconnect()
+            self._negotiated_capabilities.clear()
+            self._ack_policy = None
             current_task = asyncio.current_task()
 
             tasks = [
@@ -291,9 +335,28 @@ class GrixTransportClient:
         if code != 0:
             raise GrixAuthRejectedError(code, parse_message(packet["payload"]))
 
+        payload = packet["payload"] or {}
+        raw_caps = payload.get("supported_capabilities")
+        negotiated: set[str] = set()
+        if isinstance(raw_caps, list):
+            negotiated = {str(item).strip() for item in raw_caps if str(item).strip()}
+        self._negotiated_capabilities = negotiated
+
+        ack_policy = payload.get("ack_policy")
+        self._ack_policy = dict(ack_policy) if isinstance(ack_policy, dict) else None
+        if self._ack_policy:
+            logger.info(
+                "ack_policy received: push_ack_timeout_ms=%s max_retries=%s timeout_action=%s",
+                self._ack_policy.get("push_ack_timeout_ms", "default"),
+                self._ack_policy.get("max_retries", "default"),
+                self._ack_policy.get("timeout_action", "default"),
+            )
+
         auth_session = GrixAuthSession(
-            heartbeat_sec=parse_heartbeat_sec(packet["payload"]),
-            protocol=(str(packet["payload"].get("protocol") or "").strip() or None),
+            heartbeat_sec=parse_heartbeat_sec(payload),
+            protocol=(str(payload.get("protocol") or "").strip() or None),
+            supported_capabilities=tuple(sorted(negotiated)),
+            ack_policy=self._ack_policy,
         )
         self._update_status({"authed": True, "last_error": None})
         return auth_session
@@ -560,7 +623,14 @@ class GrixTransportClient:
         code: Optional[str] = None,
         message: Optional[str] = None,
         updated_at: Optional[int] = None,
+        terminal_commit_token: Optional[str] = None,
     ) -> None:
+        """Persist-then-send terminal event_result (connector outbox semantics).
+
+        Returns after the durable enqueue schedules delivery; ACK completion is
+        asynchronous. Callers that need fire-and-forget compatibility should not
+        assume the network write has finished when this returns.
+        """
         payload: Dict[str, Any] = {
             "event_id": event_id.strip(),
             "status": status,
@@ -570,7 +640,18 @@ class GrixTransportClient:
             payload["code"] = code.strip()
         if message:
             payload["msg"] = message.strip()
-        await self.send_packet(CMD_EVENT_RESULT, payload)
+        if terminal_commit_token:
+            payload["terminal_commit_token"] = terminal_commit_token.strip()
+        self._terminal.send_event_result(payload)
+
+    def capture_inbound_terminal_commit_token(
+        self, event_id: Optional[str], raw_token: Optional[str]
+    ) -> bool:
+        return self._terminal.capture_inbound_terminal_commit_token(event_id, raw_token)
+
+    def replay_terminal_outboxes(self) -> None:
+        self._terminal.replay_terminal_outbox()
+        self._terminal.replay_stop_result_outbox()
 
     async def acknowledge_stop(
         self,
@@ -598,6 +679,7 @@ class GrixTransportClient:
         code: Optional[str] = None,
         message: Optional[str] = None,
         updated_at: Optional[int] = None,
+        terminal_commit_token: Optional[str] = None,
     ) -> None:
         payload: Dict[str, Any] = {
             "event_id": event_id.strip(),
@@ -610,7 +692,9 @@ class GrixTransportClient:
             payload["code"] = code.strip()
         if message:
             payload["msg"] = message.strip()
-        await self.send_packet(CMD_EVENT_STOP_RESULT, payload)
+        if terminal_commit_token:
+            payload["terminal_commit_token"] = terminal_commit_token.strip()
+        self._terminal.send_event_stop_result(payload)
 
     async def send_event_cancel_result(
         self,

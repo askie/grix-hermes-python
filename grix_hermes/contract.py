@@ -142,6 +142,10 @@ CAP_INBOUND_MEDIA_V1 = "inbound_media_v1"
 CAP_LOCAL_ACTION_V1 = "local_action_v1"
 CAP_AGENT_INVOKE_V1 = "agent_invoke_v1"
 CAP_STREAM_CHUNK = "stream_chunk"
+# 终态投递持久化：与 grix-connector 同协议。后端须先支持 terminal_commit_v1 /
+# stop-token，再升级本 Hermes 版本；勿另起一套协议。
+CAP_EVENT_RESULT_ACK = "event_result_ack"
+CAP_TERMINAL_COMMIT_V1 = "terminal_commit_v1"
 
 REQUIRED_AUTH_CAPABILITIES = (CAP_LOCAL_ACTION_V1,)
 STABLE_AUTH_CAPABILITIES = (
@@ -151,6 +155,8 @@ STABLE_AUTH_CAPABILITIES = (
     CAP_INBOUND_MEDIA_V1,
     CAP_LOCAL_ACTION_V1,
     CAP_AGENT_INVOKE_V1,
+    CAP_EVENT_RESULT_ACK,
+    CAP_TERMINAL_COMMIT_V1,
 )
 
 # 本地动作（exec_approve/exec_reject/file_list 与后端 hermesSupportedLocalActions

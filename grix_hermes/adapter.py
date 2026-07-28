@@ -113,6 +113,11 @@ from .protocol import (
     normalize_stop_event,
     resolve_event_queue_settings,
 )
+from .terminal_paths import (
+    build_terminal_outbox_path,
+    resolve_terminal_sidecar_paths,
+    suffix_shared_path,
+)
 from .event_queue import (
     EventQueue,
     EventQueueConfig,
@@ -274,7 +279,39 @@ def build_grix_connection_config(config: PlatformConfig) -> GrixConnectionConfig
     if not api_key:
         api_key = os.environ.get("GRIX_API_KEY", "").strip()
 
-    return build_connection_config(extra, api_key)
+    base = build_connection_config(extra, api_key)
+    explicit_outbox = str(extra.get("terminal_outbox_path") or "").strip() or None
+    outbox_path = explicit_outbox or build_terminal_outbox_path(
+        str(getattr(config, "name", None) or "hermes"),
+        base.agent_id,
+    )
+    outbox_path, token_path, stop_path = resolve_terminal_sidecar_paths(
+        outbox_path,
+        token_path=str(extra.get("terminal_commit_token_store_path") or "").strip() or None,
+        stop_path=str(extra.get("stop_result_outbox_path") or "").strip() or None,
+    )
+    return dataclasses.replace(
+        base,
+        terminal_outbox_path=outbox_path,
+        terminal_commit_token_store_path=token_path,
+        stop_result_outbox_path=stop_path,
+    )
+
+
+def build_shared_connection_config(
+    base: GrixConnectionConfig, shared_owner_id: str
+) -> GrixConnectionConfig:
+    """Derive a sharee connection with isolated terminal outbox paths."""
+    owner = str(shared_owner_id or "").strip()
+    return dataclasses.replace(
+        base,
+        shared_owner_id=owner,
+        terminal_outbox_path=suffix_shared_path(base.terminal_outbox_path, owner),
+        terminal_commit_token_store_path=suffix_shared_path(
+            base.terminal_commit_token_store_path, owner
+        ),
+        stop_result_outbox_path=suffix_shared_path(base.stop_result_outbox_path, owner),
+    )
 
 
 def resolve_configured_model(hermes_home: Optional[str] = None) -> str:
@@ -2252,8 +2289,8 @@ class GrixAdapter(BasePlatformAdapter):
                 if self._shutting_down or self._disconnect_requested:
                     return False
                 try:
-                    shared_config = dataclasses.replace(
-                        self.connection, shared_owner_id=shared_owner_id
+                    shared_config = build_shared_connection_config(
+                        self.connection, shared_owner_id
                     )
                     new_client = GrixTransportClient(
                         shared_config,
@@ -2339,6 +2376,14 @@ class GrixAdapter(BasePlatformAdapter):
         payload = packet.get("payload") or {}
         token = _CURRENT_CLIENT_CTX.set(source_client) if source_client is not None else None
         try:
+            if cmd in (CMD_EVENT_MSG, CMD_EVENT_STOP) and source_client is not None:
+                # Persist negotiated terminal tokens before exposing the event
+                # to bridge logic (fail-closed: close socket on persist failure).
+                if not source_client.capture_inbound_terminal_commit_token(
+                    payload.get("event_id"),
+                    payload.get("terminal_commit_token"),
+                ):
+                    return
             if cmd == CMD_EVENT_MSG:
                 await self._handle_message_packet(payload)
             elif cmd == CMD_LOCAL_ACTION:
@@ -2453,8 +2498,8 @@ class GrixAdapter(BasePlatformAdapter):
                 if self._shutting_down:
                     break
                 try:
-                    shared_config = dataclasses.replace(
-                        self.connection, shared_owner_id=shared_owner_id
+                    shared_config = build_shared_connection_config(
+                        self.connection, shared_owner_id
                     )
                     shared_client = GrixTransportClient(
                         shared_config,
@@ -4973,11 +5018,15 @@ class GrixAdapter(BasePlatformAdapter):
     async def _replay_pending_completed_events(self) -> None:
         """Re-send event_result for events that completed while WS was disconnected.
 
-        When ``_complete_event_if_needed`` is called during a disconnect, the
-        ``complete_event`` call silently fails but the event_id is still added
-        to ``_completed_event_ids``.  On reconnect we re-emit those results so
-        the backend can resolve the pending events via its durable storage.
+        Durable terminals live in the transport outbox (disk). Memory
+        ``completed_event_results`` remains a same-process dedup / replay aid;
+        after reconnect, prefer the transport outbox replay first, then push
+        any memory-only leftovers through ``complete_event`` (first-durable-wins).
         """
+        client = self._active_client()
+        if client is not None:
+            with suppress(Exception):
+                client.replay_terminal_outboxes()
         if not self._client or not self._active_state().completed_event_ids:
             return
         replayed = 0

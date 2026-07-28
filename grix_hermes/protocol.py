@@ -12,6 +12,8 @@ from .compat import sanitize_card_action_tag
 from .contract import (
     AIBOT_DEFAULT_CONTRACT_VERSION,
     AIBOT_PROTOCOL_VERSION,
+    CAP_EVENT_RESULT_ACK,
+    CAP_TERMINAL_COMMIT_V1,
     REQUIRED_AUTH_CAPABILITIES,
     STABLE_AUTH_CAPABILITIES,
     STABLE_LOCAL_ACTIONS,
@@ -131,6 +133,11 @@ class GrixConnectionConfig:
     # 事件队列能力描述符（auth 握手时声明，对齐 connector 的 concurrency 字段），
     # 键：max_concurrent / max_queued / queue_timeout_ms / cancelable_queued / cancelable_running。
     concurrency: Optional[Dict[str, Any]] = None
+    # 终态投递持久化路径（对齐 connector）。每个 agent / shared_owner 必须独立路径。
+    # 缺省由 adapter 按 ~/.grix/data/terminal-outbox-*.json 生成；None 则仅内存 outbox。
+    terminal_outbox_path: Optional[str] = None
+    terminal_commit_token_store_path: Optional[str] = None
+    stop_result_outbox_path: Optional[str] = None
 
 
 def _resolve_client_version() -> str:
@@ -156,6 +163,9 @@ def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> Gr
         capabilities = list(STABLE_AUTH_CAPABILITIES)
     else:
         capabilities = _ensure_names(capabilities, REQUIRED_AUTH_CAPABILITIES)
+        capabilities = _ensure_names(
+            capabilities, (CAP_EVENT_RESULT_ACK, CAP_TERMINAL_COMMIT_V1)
+        )
 
     local_actions = normalize_names(raw_local_actions)
     if not local_actions:
@@ -326,6 +336,9 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     local_actions = normalize_names(config.local_actions)
     if capabilities:
         capabilities = _ensure_names(capabilities, REQUIRED_AUTH_CAPABILITIES)
+        capabilities = _ensure_names(
+            capabilities, (CAP_EVENT_RESULT_ACK, CAP_TERMINAL_COMMIT_V1)
+        )
     else:
         capabilities = list(STABLE_AUTH_CAPABILITIES)
     if local_actions:

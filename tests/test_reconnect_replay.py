@@ -99,6 +99,9 @@ class ReplayRecordingClient:
     async def complete_event(self, *, event_id, status, message=None):
         self.completed.append((event_id, status, message))
 
+    def replay_terminal_outboxes(self):
+        return None
+
 
 def _make_adapter():
     ReplayRecordingClient.instances.clear()
