@@ -1285,6 +1285,11 @@ class GrixAdapter(BasePlatformAdapter):
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
 
+        # Resolve routing metadata before any wire-only tool-card compaction.
+        # Tool cards discard provider metadata, but must remain in the same
+        # conversation thread as the original progress event.
+        thread_id_hint = self._metadata_thread_id(metadata)
+
         # Read per-session connector hints injected by the backend (e.g. group chat).
         _hints = self._active_state().session_connector_hints.get(str(chat_id)) or {}
         _drop_thinking = _hints.get("thinking_events") == "drop"
@@ -1310,7 +1315,8 @@ class GrixAdapter(BasePlatformAdapter):
         # 正式应答（is_final_reply=True）无条件按普通消息投递：跳过 status/tool/hook
         # 分类，避免正文恰好命中这些窄正则时被误判成过程卡片、或（托管/群聊 drop 时）
         # 被当过程内容丢弃。分类仅对非最终的过程输出生效。
-        tp = None  # set only on the tool-progress path; consumed after send below
+        tp = None  # set only on the tool-progress path
+        is_tool_execution = False
         status_text = detect_agent_status(content) if not is_final_reply else None
         if status_text:
             if _drop_thinking:
@@ -1336,26 +1342,29 @@ class GrixAdapter(BasePlatformAdapter):
                     # Backend instructed us to suppress tool execution events.
                     return SendResult(success=True, retryable=False)
                 tool_name, preview = tp
-                if metadata is None:
-                    metadata = {}
-                else:
-                    metadata = dict(metadata)
-                cd = dict(metadata.get("channel_data") or {})
-                cd.update(build_tool_execution_channel_data(tool_name, preview))
-                metadata["channel_data"] = cd
+                is_tool_execution = True
+                # The original progress content and metadata belong to the
+                # local Hermes transcript/audit path.  Build a new, minimal
+                # wire-only payload so verbose args, provider blobs and tool
+                # output do not cross the websocket boundary.
+                content = ""
+                metadata = {
+                    "channel_data": build_tool_execution_channel_data(tool_name, preview),
+                }
             else:
                 hs = detect_hook_status(content) if not is_final_reply else None
                 if hs:
                     if _drop_tools:
                         return SendResult(success=True, retryable=False)
                     action_name, description = hs
-                    if metadata is None:
-                        metadata = {}
-                    else:
-                        metadata = dict(metadata)
-                    cd = dict(metadata.get("channel_data") or {})
-                    cd.update(build_tool_execution_channel_data(action_name, description))
-                    metadata["channel_data"] = cd
+                    is_tool_execution = True
+                    content = ""
+                    metadata = {
+                        "channel_data": build_tool_execution_channel_data(
+                            action_name,
+                            description,
+                        ),
+                    }
                 elif _drop_text and not is_final_reply:
                     # 纯文本过程消息/续写（非 status/tool/hook 卡片）：托管场景下非最终
                     # 应答一律不投递给对端。grix_reply 走 send_final_reply
@@ -1375,7 +1384,7 @@ class GrixAdapter(BasePlatformAdapter):
             client,
             self.connection,
             str(chat_id),
-            thread_id=self._metadata_thread_id(metadata),
+            thread_id=thread_id_hint,
             source_hint=source_hint,
         )
         # NOTE: event_id is deliberately NOT included in send_text here.
@@ -1385,15 +1394,24 @@ class GrixAdapter(BasePlatformAdapter):
         # "event_id not owned by current agent".
         # Event lifecycle is now managed at the handler level
         # (_handle_message_packet) instead.
-        biz_card = _clone_metadata_object(metadata, "biz_card")
+        biz_card = (
+            None
+            if is_tool_execution
+            else _clone_metadata_object(metadata, "biz_card")
+        )
         channel_data = _clone_metadata_object(metadata, "channel_data")
 
         try:
-            chunks = self.truncate_message(
-                self.format_message(content),
-                self.MAX_MESSAGE_LENGTH,
-                len_fn=self._message_size,
-            )
+            if is_tool_execution:
+                # A tool card is fully represented by channel_data.  Keep one
+                # empty send so no raw progress line is duplicated in content.
+                chunks = [""]
+            else:
+                chunks = self.truncate_message(
+                    self.format_message(content),
+                    self.MAX_MESSAGE_LENGTH,
+                    len_fn=self._message_size,
+                )
             receipt = None
             for index, chunk in enumerate(chunks):
                 is_first = index == 0
@@ -1414,7 +1432,7 @@ class GrixAdapter(BasePlatformAdapter):
                 retryable=False,
             )
             # Track tool progress messages so edit_message can intercept them.
-            if tp and result.success and result.message_id:
+            if is_tool_execution and result.success and result.message_id:
                 self._active_state().tool_progress_msg_ids.add(result.message_id)
             if result.message_id and reply_to:
                 _normalized_reply_to = str(reply_to).strip()

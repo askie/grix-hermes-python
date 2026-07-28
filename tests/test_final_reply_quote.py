@@ -11,6 +11,7 @@
 """
 
 import asyncio
+import copy
 import sys
 import types
 from pathlib import Path
@@ -127,6 +128,9 @@ class FakeTransportClient:
             "session_id": session_id,
             "content": content,
             "reply_to_message_id": reply_to_message_id,
+            "thread_id": thread_id,
+            "biz_card": biz_card,
+            "channel_data": channel_data,
         })
         return {"ok": True, "message_id": f"m{len(self.sent)}"}
 
@@ -160,7 +164,7 @@ def _make_adapter(client=None):
 
 
 async def _resolve_target(client, connection, chat_id, thread_id=None, source_hint=None):
-    return str(chat_id), None
+    return str(chat_id), thread_id
 
 
 def _with_ctx(client, coro):
@@ -202,6 +206,46 @@ def test_send_force_quote_first_chunk_only(monkeypatch):
 
     assert result.success is True
     assert [s["reply_to_message_id"] for s in client.sent] == ["trigger-1", None]
+
+
+def test_send_tool_progress_uses_minimal_wire_payload_without_mutating_audit_input(monkeypatch):
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    raw_args = '{"path": "' + ("secret-or-large-content-" * 200) + '"}'
+    content = "⚙️ read_file(['path'])\n" + raw_args
+    metadata = {
+        "thread_id": "thread-7",
+        "biz_card": {"raw_tool_result": raw_args},
+        "channel_data": {
+            "provider": {"raw_event": raw_args},
+            "grix": {"toolExecution": {"detail_text": raw_args}},
+        },
+    }
+    original_metadata = copy.deepcopy(metadata)
+
+    result = _with_ctx(client, inst.send("chat-1", content, metadata=metadata))
+
+    assert result.success is True
+    assert client.sent == [{
+        "session_id": "chat-1",
+        "content": "",
+        "reply_to_message_id": None,
+        "thread_id": "thread-7",
+        "biz_card": None,
+        "channel_data": {
+            "grix": {
+                "toolExecution": {
+                    "summary_text": "read_file: ['path']",
+                },
+            },
+        },
+    }]
+    assert raw_args not in str(client.sent[0])
+    # send() only compacts its wire copy.  The caller-owned values remain
+    # available to Hermes' local transcript/audit flow.
+    assert content.endswith(raw_args)
+    assert metadata == original_metadata
 
 
 # ── 2. edit_message 瞬时失败重试 ──────────────────────────────────────────────

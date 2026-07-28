@@ -31,6 +31,9 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+TOOL_WIRE_SUMMARY_MAX_CHARS = 500
+_TOOL_WIRE_TRUNCATION_SUFFIX = "..."
+
 _TOOL_PROGRESS_RE = re.compile(
     r"^[^\w\s]+"           # leading emoji(s) (non-word, non-space)
     r"\s+"
@@ -228,8 +231,24 @@ def detect_hook_status(content: str) -> Optional[Tuple[str, str]]:
 
 
 def build_tool_execution_channel_data(tool_name: str, preview: str) -> Dict[str, Any]:
-    """Build ``channel_data.grix.toolExecution`` for the backend."""
-    summary = f"{tool_name}: {preview}" if preview else tool_name
+    """Build the compact online tool card sent to the backend.
+
+    Hermes keeps the provider/tool transcript locally.  The backend only
+    needs a short user-facing summary, so raw arguments and tool output must
+    not be copied into ``channel_data``.
+    """
+    normalized_name = " ".join(str(tool_name or "").split()) or "tool"
+    normalized_preview = " ".join(str(preview or "").split())
+    summary = (
+        f"{normalized_name}: {normalized_preview}"
+        if normalized_preview
+        else normalized_name
+    )
+    if len(summary) > TOOL_WIRE_SUMMARY_MAX_CHARS:
+        summary = (
+            summary[: TOOL_WIRE_SUMMARY_MAX_CHARS - len(_TOOL_WIRE_TRUNCATION_SUFFIX)]
+            + _TOOL_WIRE_TRUNCATION_SUFFIX
+        )
     return {
         "grix": {
             "toolExecution": {

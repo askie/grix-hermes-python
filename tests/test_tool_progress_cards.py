@@ -7,6 +7,7 @@ card instead of leaking the line as chat text.
 """
 
 from grix_hermes.tool_progress_cards import (
+    TOOL_WIRE_SUMMARY_MAX_CHARS,
     build_tool_execution_channel_data,
     detect_tool_progress,
 )
@@ -145,3 +146,16 @@ def test_channel_data_summary():
 def test_channel_data_summary_without_preview():
     cd = build_tool_execution_channel_data("skills_list", "")
     assert cd["grix"]["toolExecution"]["summary_text"] == "skills_list"
+
+
+def test_channel_data_normalizes_and_bounds_online_summary():
+    cd = build_tool_execution_channel_data(
+        "  terminal  ",
+        "line 1\n" + ("x" * 800),
+    )
+    summary = cd["grix"]["toolExecution"]["summary_text"]
+
+    assert "\n" not in summary
+    assert "  " not in summary
+    assert len(summary) == TOOL_WIRE_SUMMARY_MAX_CHARS
+    assert summary.endswith("...")
