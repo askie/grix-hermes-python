@@ -728,9 +728,9 @@ class GrixAdapter(BasePlatformAdapter):
     # 编辑消息的瞬时失败重试参数（覆盖 ws 内部重连窗口，约 3×3s）。
     _EDIT_RETRY_ATTEMPTS = 4
     _EDIT_RETRY_DELAY_S = 3.0
-    # LLM 轮次已 event_result 收口后，若 Hermes 后台进程仍在跑，继续用虚拟
-    # running 保活工具栏队列（对齐 connector Claude selfDriven）。超过此年龄的
-    # 进程视为僵尸/常驻 daemon，不再挡队列收口。
+    # LLM 轮次已 event_result 收口后，若 Hermes 后台进程仍在跑且仍会产生
+    # 后续信号（完成通知/watch 命中），继续用虚拟 running 保活工具栏队列。
+    # 超过此年龄或无后续信号的进程视为僵尸/常驻 daemon，不再挡队列收口。
     _BG_HOLD_MAX_AGE_S = 6 * 3600
     _BG_HOLD_SWEEP_INTERVAL_S = 15.0
     _BG_HOLD_COMPOSING_TTL_MS = 90_000
@@ -4286,11 +4286,11 @@ class GrixAdapter(BasePlatformAdapter):
             if token is not None:
                 _CURRENT_CLIENT_CTX.reset(token)
 
-    def _session_has_bg_hold(self, session_key: str) -> bool:
-        """该 Hermes session_key 是否仍有未退出的后台进程需要保活队列。"""
+    def _active_bg_hold_processes(self, session_key: str) -> List[Dict[str, Any]]:
+        """返回该 session 下仍应保活本轮 running 的后台进程。"""
         key = str(session_key or "").strip()
         if not key:
-            return False
+            return []
         try:
             from tools.process_registry import process_registry
         except Exception as exc:
@@ -4298,51 +4298,46 @@ class GrixAdapter(BasePlatformAdapter):
                 "[%s] bg-hold unavailable (process_registry import failed): %s",
                 self.name, exc,
             )
-            return False
+            return []
         try:
-            return bool(
-                process_registry.has_active_for_session(
-                    key, max_active_age=float(self._BG_HOLD_MAX_AGE_S)
-                )
-            )
-        except TypeError as exc:
-            # 旧 hermes 可能不接受 max_active_age；降级为无年龄过滤。
-            logger.warning(
-                "[%s] bg-hold has_active_for_session signature mismatch, "
-                "retrying without max_active_age: %s",
-                self.name, exc,
-            )
-            try:
-                return bool(process_registry.has_active_for_session(key))
-            except Exception as inner:
-                logger.warning("[%s] bg-hold process check failed: %s", self.name, inner)
-                return False
+            sessions = process_registry.list_sessions(session_key=key)
         except Exception as exc:
-            logger.warning("[%s] bg-hold process check failed: %s", self.name, exc)
-            return False
+            logger.warning(
+                "[%s] bg-hold process lookup failed for %s: %s",
+                self.name, key, exc,
+            )
+            return []
+
+        max_age = float(getattr(self, "_BG_HOLD_MAX_AGE_S", 0) or 0)
+        hold: List[Dict[str, Any]] = []
+        for proc in sessions:
+            if not isinstance(proc, dict) or proc.get("status") != "running":
+                continue
+            if max_age > 0:
+                try:
+                    uptime = float(proc.get("uptime_seconds", 0) or 0)
+                except (TypeError, ValueError):
+                    uptime = 0.0
+                if uptime >= max_age:
+                    continue
+            # Plain long-lived daemons have no terminal signal that will close
+            # the user's turn. They remain tracked by process_registry, but
+            # must not keep Grix composing/running alive.
+            if not proc.get("notify_on_complete") and not proc.get("watch_patterns"):
+                continue
+            hold.append(proc)
+        return hold
+
+    def _session_has_bg_hold(self, session_key: str) -> bool:
+        """该 Hermes session_key 是否仍有未退出的后台进程需要保活队列。"""
+        return bool(self._active_bg_hold_processes(session_key))
 
     def _bg_hold_label(self, session_key: str) -> str:
         """取该会话最新活跃后台进程的命令预览，作虚拟 running 标题。"""
         key = str(session_key or "").strip()
         if not key:
             return ""
-        try:
-            from tools.process_registry import process_registry
-        except Exception as exc:
-            logger.warning(
-                "[%s] bg-hold label unavailable (process_registry import failed): %s",
-                self.name, exc,
-            )
-            return ""
-        try:
-            sessions = process_registry.list_sessions(session_key=key)
-        except Exception as exc:
-            logger.warning("[%s] bg-hold label lookup failed: %s", self.name, exc)
-            return ""
-        running = [
-            s for s in sessions
-            if isinstance(s, dict) and s.get("status") == "running"
-        ]
+        running = self._active_bg_hold_processes(key)
         if not running:
             return ""
         # 最新启动的优先（started_at 为可读字符串时退回命令序）。
