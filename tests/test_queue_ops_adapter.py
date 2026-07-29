@@ -201,6 +201,19 @@ def _make_adapter(client=None):
     return inst
 
 
+def _install_process_registry(monkeypatch, sessions):
+    proc_mod = types.ModuleType("tools.process_registry")
+
+    class _ProcessRegistry:
+        def list_sessions(self, session_key=None):
+            return list(sessions)
+
+    proc_mod.process_registry = _ProcessRegistry()
+    monkeypatch.setitem(sys.modules, "tools.process_registry", proc_mod)
+    if "tools" in sys.modules:
+        monkeypatch.setattr(sys.modules["tools"], "process_registry", proc_mod, raising=False)
+
+
 def _item(inst, event_id, session_id="s1", group_key="g1", owner_key="", text=""):
     message = SimpleNamespace(event_id=event_id, session_id=session_id, text=text or event_id)
     source = SimpleNamespace(chat_id=session_id, thread_id=None)
@@ -416,6 +429,71 @@ def test_processing_complete_keeps_virtual_running_while_bg_process_alive(monkey
     assert all(snap["running"] for snap in client.snapshots), client.snapshots
     assert client.snapshots[-1]["running"] == ["selfdrive_s1"]
     assert not any(i["action"] == "chat_state_update" for i in client.invokes)
+
+
+def test_bg_hold_ignores_silent_long_lived_daemon(monkeypatch):
+    """无完成通知/watch 的常驻后台进程不应让本轮对话一直 running。"""
+    inst = _make_adapter()
+    _install_process_registry(monkeypatch, [
+        {
+            "session_id": "proc-daemon",
+            "command": "cd /Volumes/disk1/go/src/grix-connector && node dist/grix.js",
+            "status": "running",
+            "uptime_seconds": 60,
+        }
+    ])
+
+    assert inst._session_has_bg_hold("sk:s1") is False
+    assert inst._bg_hold_label("sk:s1") == ""
+
+
+def test_bg_hold_keeps_notified_background_process(monkeypatch):
+    """会产生完成通知的后台任务仍保留虚拟 running。"""
+    inst = _make_adapter()
+    _install_process_registry(monkeypatch, [
+        {
+            "session_id": "proc-build",
+            "command": "npm test -- --watch=false",
+            "status": "running",
+            "uptime_seconds": 60,
+            "notify_on_complete": True,
+        }
+    ])
+
+    assert inst._session_has_bg_hold("sk:s1") is True
+    assert inst._bg_hold_label("sk:s1") == "npm test -- --watch=false"
+
+
+def test_processing_complete_clears_virtual_running_for_silent_daemon(monkeypatch):
+    """事故回归：常驻 daemon 仍在 process_registry 里，也不能阻塞本轮收口。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", lambda *a, **kw: "sk:s1")
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _install_process_registry(monkeypatch, [
+        {
+            "session_id": "proc-daemon",
+            "command": "cd /Volumes/disk1/go/src/grix-connector && node dist/grix.js",
+            "status": "running",
+            "uptime_seconds": 60,
+        }
+    ])
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(chat_id="s1", thread_id=None),
+        message_id="m1",
+        text="restart connector",
+        raw_message={"_grix_kind": "message", "event_id": "ev-1"},
+    )
+
+    async def _flow():
+        await inst.on_processing_start(event)
+        await inst.on_processing_complete(event, adapter_mod.ProcessingOutcome.SUCCESS)
+
+    _run_with_ctx(inst, client, _flow())
+
+    assert "sk:s1" not in inst._state_for("").toolbar_active_work
+    assert client.completed[-1]["status"] == "responded"
+    assert client.snapshots[-1]["running"] == []
 
 
 def test_processing_complete_clears_virtual_running_without_bg_process(monkeypatch):
