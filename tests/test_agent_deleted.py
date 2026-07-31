@@ -4,9 +4,11 @@
 1. kicked reason=agent_deleted：置 fatal（retryable=False）、断开连接、永久禁止重连
 2. kicked 其他 reason：不触发 fatal（维持既有断线重连语义）
 3. 内部重连遇 auth_ack 10008：立即终止（单次尝试），置 agent_deleted fatal
-4. 内部重连遇一般鉴权拒绝（10001）：立即放弃但不标记 agent_deleted
+4. 内部重连遇一般鉴权拒绝（10001）：按退避策略重试，不标记永久 fatal
 5. agent_deleted 置位后：内部重连直接短路，不再新建连接
 6. connect() 首连遇 10008：置 agent_deleted fatal
+7. connect() 首连遇一般鉴权拒绝（10001）：交给 gateway watcher 持续重试
+8. 重连退避指数增长并封顶，避免忙循环
 """
 
 import asyncio
@@ -124,6 +126,7 @@ def _make_adapter():
     inst._last_send_at = 0.0
     inst._send_lock = asyncio.Lock()
     inst._reconnect_lock = asyncio.Lock()
+    inst._status_reconnect_lock = asyncio.Lock()
     inst._shared_clients = {}
     inst._share_sync_lock = asyncio.Lock()
     inst._shutting_down = False
@@ -222,12 +225,19 @@ def test_internal_reconnect_aborts_on_agent_deleted_code(monkeypatch):
     assert inst.fatal_calls[-1][2] is False
 
 
-# ── 4. 内部重连遇一般鉴权拒绝（10001）→ 立即放弃但不标记 agent_deleted ──
-def test_internal_reconnect_aborts_on_generic_auth_reject(monkeypatch):
+# ── 4. 内部重连遇一般鉴权拒绝（10001）→ 受控重试且保持 retryable ──
+def test_internal_reconnect_retries_generic_auth_reject(monkeypatch):
     class Rejecting10001(AuthRejectingClient):
         reject_code = 10001
 
     _patch_transport(monkeypatch, Rejecting10001)
+    monkeypatch.setattr(adapter_mod.random, "uniform", lambda _low, _high: 0.0)
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
     inst = _make_adapter()
     inst._client.connected = False
 
@@ -236,9 +246,62 @@ def test_internal_reconnect_aborts_on_generic_auth_reject(monkeypatch):
 
     assert ok is False
     assert inst._agent_deleted is False
-    assert len(FakeTransportClient.instances) == created_before + 1
-    assert inst.fatal_calls and inst.fatal_calls[-1][0] == "grix_auth_rejected"
-    assert inst.fatal_calls[-1][2] is False
+    assert len(FakeTransportClient.instances) == created_before + 3
+    assert delays == [2.0, 4.0]
+    assert inst.fatal_calls == []
+
+
+def test_internal_reconnect_recovers_after_transient_auth_reject(monkeypatch):
+    class Recovering10001(FakeTransportClient):
+        connect_attempts = 0
+
+        async def connect(self):
+            type(self).connect_attempts += 1
+            if type(self).connect_attempts < 3:
+                raise GrixAuthRejectedError(10001, "service recovering")
+            self.connected = True
+
+    _patch_transport(monkeypatch, Recovering10001)
+    monkeypatch.setattr(adapter_mod.random, "uniform", lambda _low, _high: 0.0)
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    async def noop():
+        pass
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
+    inst = _make_adapter()
+    inst._client.connected = False
+    inst._report_skills = noop
+    inst._replay_pending_completed_events = noop
+    inst._push_all_queue_snapshots = noop
+
+    ok = asyncio.run(inst._try_reconnect_transport(reason="test", max_attempts=3))
+
+    assert ok is True
+    assert Recovering10001.connect_attempts == 3
+    assert delays == [2.0, 4.0]
+    assert inst.fatal_calls == []
+
+
+def test_reconnect_backoff_is_exponential_and_capped(monkeypatch):
+    monkeypatch.setattr(adapter_mod.random, "uniform", lambda _low, _high: 0.0)
+
+    delays = [
+        adapter_mod._reconnect_delay_seconds(attempt)
+        for attempt in range(1, 8)
+    ]
+
+    assert delays == [2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+    assert [
+        adapter_mod._background_reconnect_delay_seconds(attempt)
+        for attempt in range(1, 7)
+    ] == [30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
+
+    monkeypatch.setattr(adapter_mod.random, "uniform", lambda _low, _high: 0.2)
+    assert adapter_mod._background_reconnect_delay_seconds(100_000) == 300.0
 
 
 # ── 5. connect() 首连遇 10008 → 置 agent_deleted fatal ──
@@ -253,3 +316,155 @@ def test_connect_marks_agent_deleted_on_10008(monkeypatch):
     assert inst._agent_deleted is True
     assert inst.fatal_calls and inst.fatal_calls[-1][0] == "grix_agent_deleted"
     assert inst.fatal_calls[-1][2] is False
+
+
+# ── 7. connect() 首连遇 10001 → 保留后台重连资格 ──
+def test_connect_keeps_generic_auth_reject_retryable(monkeypatch):
+    class Rejecting10001(AuthRejectingClient):
+        reject_code = 10001
+
+    _patch_transport(monkeypatch, Rejecting10001)
+    inst = _make_adapter()
+    inst._client = None
+
+    ok = asyncio.run(inst.connect())
+
+    assert ok is False
+    assert inst._agent_deleted is False
+    assert inst.fatal_calls[-1][0] == "grix_auth_rejected"
+    assert inst.fatal_calls[-1][2] is True
+
+
+def test_stale_primary_status_callback_is_ignored(monkeypatch):
+    inst = _make_adapter()
+    inst.is_connected = True
+    stale_client = FakeTransportClient(inst.connection)
+    reconnect_calls = 0
+
+    async def fake_reconnect(*, reason):
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        return False
+
+    monkeypatch.setattr(inst, "_try_reconnect_transport", fake_reconnect)
+
+    asyncio.run(
+        inst._handle_transport_status(
+            {"connected": False, "last_error": "stale"},
+            source_client=stale_client,
+        )
+    )
+
+    assert reconnect_calls == 0
+    assert inst.fatal_calls == []
+    assert inst.notify_count == 0
+
+
+def test_duplicate_primary_status_callbacks_are_coalesced(monkeypatch):
+    inst = _make_adapter()
+    inst.is_connected = True
+    source_client = inst._client
+    reconnect_calls = 0
+
+    async def fake_reconnect(*, reason):
+        nonlocal reconnect_calls
+        reconnect_calls += 1
+        # Match the real failed rebuild: it detaches the old source client.
+        inst._client = None
+        await asyncio.sleep(0)
+        return False
+
+    monkeypatch.setattr(inst, "_try_reconnect_transport", fake_reconnect)
+
+    async def run_duplicate_callbacks():
+        status = {"connected": False, "last_error": "closed"}
+        await asyncio.gather(
+            inst._handle_transport_status(status, source_client=source_client),
+            inst._handle_transport_status(status, source_client=source_client),
+        )
+
+    asyncio.run(run_duplicate_callbacks())
+
+    assert reconnect_calls == 1
+    assert inst.notify_count == 1
+    assert inst.fatal_calls == [
+        ("grix_connection_lost", "closed", True),
+    ]
+
+
+def test_internal_reconnect_does_not_resurrect_after_shutdown(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    inst._client.connected = False
+    inst._disconnect_requested = True
+    created_before = len(FakeTransportClient.instances)
+
+    ok = asyncio.run(inst._try_reconnect_transport(reason="shutdown"))
+
+    assert ok is False
+    assert len(FakeTransportClient.instances) == created_before
+
+
+def test_waiting_internal_reconnect_rechecks_shutdown_after_lock(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    inst._client.connected = False
+    created_before = len(FakeTransportClient.instances)
+
+    async def run_race():
+        await inst._reconnect_lock.acquire()
+        reconnect_task = asyncio.create_task(
+            inst._try_reconnect_transport(reason="queued before shutdown")
+        )
+        await asyncio.sleep(0)
+        inst._disconnect_requested = True
+        inst._shutting_down = True
+        inst._reconnect_lock.release()
+        return await reconnect_task
+
+    ok = asyncio.run(run_race())
+
+    assert ok is False
+    assert len(FakeTransportClient.instances) == created_before
+
+
+def test_failed_candidate_status_does_not_amplify_reconnect(monkeypatch):
+    status_tasks = []
+
+    class StatusEmittingRejectClient(FakeTransportClient):
+        async def connect(self):
+            if self.on_status is not None:
+                result = self.on_status(
+                    {"connected": False, "last_error": "auth failed"}
+                )
+                if asyncio.iscoroutine(result):
+                    status_tasks.append(asyncio.create_task(result))
+            raise GrixAuthRejectedError(10001, "service recovering")
+
+    _patch_transport(monkeypatch, StatusEmittingRejectClient)
+    monkeypatch.setattr(adapter_mod.random, "uniform", lambda _low, _high: 0.0)
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(_delay):
+        await real_sleep(0)
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
+    inst = _make_adapter()
+    inst.is_connected = True
+    inst._client.connected = False
+    created_before = len(FakeTransportClient.instances)
+
+    async def run_failure():
+        ok = await inst._try_reconnect_transport(reason="closed", max_attempts=2)
+        if status_tasks:
+            await asyncio.gather(*status_tasks)
+        # Give callbacks a chance to enqueue further work if stale-source
+        # filtering is broken.
+        await asyncio.sleep(0)
+        return ok
+
+    ok = asyncio.run(run_failure())
+
+    assert ok is False
+    assert len(FakeTransportClient.instances) == created_before + 2
+    assert inst.notify_count == 0

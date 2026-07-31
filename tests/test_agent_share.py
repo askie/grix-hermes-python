@@ -115,6 +115,7 @@ def _make_adapter():
     inst._client = None
     inst._connector = None
     inst._disconnect_requested = False
+    inst._agent_deleted = False
     inst._token_lock_identity = None
     # owner 隔离：所有 per-chat/per-event 状态收口到 _owner_states
     from collections import defaultdict
@@ -122,10 +123,23 @@ def _make_adapter():
     inst._last_send_at = 0.0
     inst._send_lock = asyncio.Lock()
     inst._reconnect_lock = asyncio.Lock()
+    inst._status_reconnect_lock = asyncio.Lock()
     inst._shared_clients = {}
+    inst._desired_shared_owner_ids = set()
+    inst._shared_reconnect_tasks = {}
     inst._share_sync_lock = asyncio.Lock()
     inst._shutting_down = False
     inst._background_tasks = set()
+    inst.fatal_calls = []
+    inst.notify_count = 0
+    inst._set_fatal_error = lambda code, msg, retryable=True: inst.fatal_calls.append(
+        (code, msg, retryable)
+    )
+
+    async def _notify():
+        inst.notify_count += 1
+
+    inst._notify_fatal_error = _notify
     # 主连接（用 FakeClient 占位）
     inst._client = FakeTransportClient(inst.connection)
     inst._bind_packet_handler(inst._client)
@@ -531,8 +545,8 @@ def test_shared_client_auto_reconnects_on_disconnect(monkeypatch):
     assert new_b.config.shared_owner_id == "B"
 
 
-# ── 15. 重连被拒（共享已撤销）→ 清理 owner state，不再重试 ──
-def test_shared_client_reconnect_auth_rejected_cleans_up(monkeypatch):
+# ── 15. 通用 auth 拒绝可能来自服务恢复窗口 → 重试且保留 owner state ──
+def test_shared_client_reconnect_auth_rejected_stays_retryable(monkeypatch):
     _patch_transport(monkeypatch)
     inst = _make_adapter()
     asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
@@ -543,7 +557,6 @@ def test_shared_client_reconnect_auth_rejected_cleans_up(monkeypatch):
     inst._state_for("B").processing_message_ids["sk"] = "msg-x"
 
     # 让 FakeClient.connect 抛 GrixAuthRejectedError
-    call_count = 0
     original_init = FakeTransportClient.__init__
 
     def rejecting_init(self, config, *, connector=None, on_status=None):
@@ -555,11 +568,201 @@ def test_shared_client_reconnect_auth_rejected_cleans_up(monkeypatch):
         raise GrixAuthRejectedError(403, "share revoked")
 
     monkeypatch.setattr(FakeTransportClient, "connect", rejecting_connect)
+    monkeypatch.setattr(adapter_mod.random, "uniform", lambda _low, _high: 0.0)
+
+    async def fake_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
 
     asyncio.run(inst._try_reconnect_shared_client("B", reason="ws closed"))
 
     assert "B" not in inst._shared_clients, "认证被拒后不应保留 client"
-    assert "B" not in inst._owner_states, "认证被拒后必须清掉 owner state"
+    assert "B" in inst._owner_states, "瞬时认证拒绝不得清掉 owner state"
+    assert inst._state_for("B").processing_message_ids["sk"] == "msg-x"
+
+
+def test_shared_client_recovers_after_transient_auth_reject(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    old_b = inst._shared_clients["B"]
+    old_b.connected = False
+    inst._state_for("B").processing_message_ids["sk"] = "msg-x"
+
+    connect_attempts = 0
+
+    async def recovering_connect(self):
+        nonlocal connect_attempts
+        connect_attempts += 1
+        if connect_attempts < 3:
+            raise GrixAuthRejectedError(10001, "service recovering")
+        self.connected = True
+
+    async def fake_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(FakeTransportClient, "connect", recovering_connect)
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(adapter_mod.random, "uniform", lambda _low, _high: 0.0)
+
+    ok = asyncio.run(
+        inst._try_reconnect_shared_client(
+            "B",
+            reason="ws closed",
+            max_attempts=3,
+        )
+    )
+
+    assert ok is True
+    assert connect_attempts == 3
+    assert inst._shared_clients["B"].connected is True
+    assert inst._state_for("B").processing_message_ids["sk"] == "msg-x"
+
+
+def test_shared_background_reconnect_survives_prolonged_outage(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    inst._shared_clients["B"].connected = False
+
+    connect_attempts = 0
+    delays = []
+
+    async def eventually_recovering_connect(self):
+        nonlocal connect_attempts
+        connect_attempts += 1
+        if connect_attempts <= 128:
+            raise OSError("network still unavailable")
+        self.connected = True
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(FakeTransportClient, "connect", eventually_recovering_connect)
+    monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(adapter_mod.random, "uniform", lambda _low, _high: 0.0)
+
+    ok = asyncio.run(
+        inst._try_reconnect_shared_client(
+            "B",
+            reason="prolonged outage",
+            max_attempts=None,
+        )
+    )
+
+    assert ok is True
+    assert connect_attempts == 129
+    assert delays[:5] == [30.0, 60.0, 120.0, 240.0, 300.0]
+    assert len(delays) == 128
+    assert delays[-1] == 300.0
+    assert inst._shared_clients["B"].connected is True
+
+
+def test_shared_client_stops_on_explicit_agent_deleted(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    inst._shared_clients["B"].connected = False
+    connect_attempts = 0
+
+    async def deleted_connect(self):
+        nonlocal connect_attempts
+        connect_attempts += 1
+        raise GrixAuthRejectedError(
+            adapter_mod.AUTH_CODE_AGENT_DELETED,
+            "agent deleted",
+        )
+
+    monkeypatch.setattr(FakeTransportClient, "connect", deleted_connect)
+
+    ok = asyncio.run(
+        inst._try_reconnect_shared_client(
+            "B",
+            reason="ws closed",
+            max_attempts=3,
+        )
+    )
+
+    assert ok is False
+    assert connect_attempts == 1
+    assert inst._agent_deleted is True
+    assert inst.fatal_calls[-1][0] == "grix_agent_deleted"
+    assert inst.fatal_calls[-1][2] is False
+    assert inst.notify_count == 1
+
+
+def test_shared_status_reconnect_is_singleflight_and_revocation_cancels(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    old_b = inst._shared_clients["B"]
+    old_b.connected = False
+
+    async def rejecting_connect(self):
+        raise GrixAuthRejectedError(10001, "service recovering")
+
+    monkeypatch.setattr(FakeTransportClient, "connect", rejecting_connect)
+
+    async def run_scenario():
+        sleep_started = asyncio.Event()
+        sleep_forever = asyncio.Event()
+
+        async def controlled_sleep(_delay):
+            sleep_started.set()
+            await sleep_forever.wait()
+
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", controlled_sleep)
+
+        disconnected = {"connected": False, "last_error": "closed"}
+        await old_b.on_status(disconnected)
+        first_task = inst._shared_reconnect_tasks["B"]
+        await old_b.on_status(disconnected)
+        assert inst._shared_reconnect_tasks["B"] is first_task
+
+        await sleep_started.wait()
+        await inst._handle_share_set_packet({"agent_id": "100", "shared_to": []})
+
+        assert first_task.cancelled()
+        assert inst._shared_reconnect_tasks == {}
+        assert "B" not in inst._desired_shared_owner_ids
+        assert "B" not in inst._shared_clients
+
+    asyncio.run(run_scenario())
+
+
+def test_share_revoked_during_connect_closes_candidate(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+    asyncio.run(inst._handle_share_set_packet({"agent_id": "100", "shared_to": ["B"]}))
+    old_b = inst._shared_clients["B"]
+    old_b.connected = False
+
+    async def run_scenario():
+        connect_started = asyncio.Event()
+        connect_blocker = asyncio.Event()
+
+        async def blocking_connect(self):
+            connect_started.set()
+            await connect_blocker.wait()
+            self.connected = True
+
+        monkeypatch.setattr(FakeTransportClient, "connect", blocking_connect)
+
+        await old_b.on_status({"connected": False, "last_error": "closed"})
+        reconnect_task = inst._shared_reconnect_tasks["B"]
+        await connect_started.wait()
+        candidate = FakeTransportClient.instances[-1]
+
+        await inst._handle_share_set_packet({"agent_id": "100", "shared_to": []})
+
+        assert reconnect_task.cancelled()
+        assert candidate.connected is False
+        assert candidate.disconnect_reason == "shared reconnect cancelled"
+        assert "B" not in inst._shared_clients
+        assert "B" not in inst._desired_shared_owner_ids
+
+    asyncio.run(run_scenario())
 
 
 # ── 16. 关停期间不重连共享子连接 ──

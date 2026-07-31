@@ -12,6 +12,7 @@ import dataclasses
 import json
 import logging
 import os
+import random
 import re
 import time
 from collections import defaultdict
@@ -141,6 +142,47 @@ from .transport import (
 _PLATFORM_VALUE = "grix"
 
 logger = logging.getLogger(__name__)
+
+_RECONNECT_BASE_DELAY_SECONDS = 2.0
+_RECONNECT_MAX_DELAY_SECONDS = 30.0
+_RECONNECT_JITTER_RATIO = 0.2
+_BACKGROUND_RECONNECT_BASE_DELAY_SECONDS = 30.0
+_BACKGROUND_RECONNECT_MAX_DELAY_SECONDS = 300.0
+
+
+def _reconnect_delay_seconds(
+    attempt: int,
+    *,
+    base_delay_seconds: float = _RECONNECT_BASE_DELAY_SECONDS,
+    max_delay_seconds: float = _RECONNECT_MAX_DELAY_SECONDS,
+) -> float:
+    """Return capped exponential backoff with jitter for reconnect attempts."""
+    base_delay = min(max(0.0, base_delay_seconds), max_delay_seconds)
+    # Saturating multiplication avoids constructing 2**attempt. A platform
+    # may remain offline for days, so attempt can grow large enough for direct
+    # exponentiation to overflow before min() gets a chance to cap it.
+    for _ in range(max(0, attempt - 1)):
+        if base_delay >= max_delay_seconds:
+            break
+        base_delay = min(base_delay * 2.0, max_delay_seconds)
+    jitter = random.uniform(
+        -_RECONNECT_JITTER_RATIO,
+        _RECONNECT_JITTER_RATIO,
+    )
+    return min(
+        max_delay_seconds,
+        max(0.0, base_delay * (1.0 + jitter)),
+    )
+
+
+def _background_reconnect_delay_seconds(attempt: int) -> float:
+    """Return long-running reconnect backoff with jitter."""
+    return _reconnect_delay_seconds(
+        attempt,
+        base_delay_seconds=_BACKGROUND_RECONNECT_BASE_DELAY_SECONDS,
+        max_delay_seconds=_BACKGROUND_RECONNECT_MAX_DELAY_SECONDS,
+    )
+
 
 # agent 共享：handler 在入口把「正在处理本 packet 的 client」绑定到这个 ContextVar，
 # 下游所有 send 通过 self._active_client() 取（contextvars 跨 await 自动透传，
@@ -764,11 +806,18 @@ class GrixAdapter(BasePlatformAdapter):
         self._last_send_at: float = 0.0
         self._send_lock = asyncio.Lock()
         self._reconnect_lock = asyncio.Lock()
+        # Serializes the complete status-driven reconnect + fatal handoff.
+        # _reconnect_lock alone only serializes transport rebuilds; without
+        # this outer lock, already queued on_status callbacks can each perform
+        # another rebuild after the first one gives up.
+        self._status_reconnect_lock = asyncio.Lock()
 
         # agent 共享：为每个被共享者维护一条独立 WS 连接（key=shared_owner_id, value=client）。
         # 主连接收到 CMD_CONTROL_SHARE_SET 后 diff 名单增删；共享子连接复用 self._handle_protocol_packet
         # 处理回调，所有 send 通过 _active_client() 路由到「事件来源 client」（contextvars 透传）。
         self._shared_clients: Dict[str, GrixTransportClient] = {}
+        self._desired_shared_owner_ids: Set[str] = set()
+        self._shared_reconnect_tasks: Dict[str, asyncio.Task] = {}
         # 串行化共享子连接的增删，避免并发 control_share_set 造成重复建/漏删。
         self._share_sync_lock = asyncio.Lock()
         # 关停标志：disconnect 期间禁止再为共享名单建新子连接，避免泄漏。
@@ -1024,6 +1073,26 @@ class GrixAdapter(BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
+    def _new_primary_transport_client(self) -> GrixTransportClient:
+        """Build a primary client whose status callback is source-aware.
+
+        A failed authentication calls transport.disconnect(), which emits a
+        disconnected status. Binding the source client lets the adapter ignore
+        callbacks from failed/stale reconnect candidates instead of recursively
+        scheduling more reconnects.
+        """
+        client = GrixTransportClient(
+            self.connection,
+            connector=self._connector,
+            on_status=None,
+        )
+
+        async def _on_status(status: Dict[str, Any]) -> None:
+            await self._handle_transport_status(status, source_client=client)
+
+        client.on_status = _on_status
+        return client
+
     async def _try_reconnect_transport(
         self, reason: str = "", max_attempts: int = 2
     ) -> bool:
@@ -1033,9 +1102,23 @@ class GrixAdapter(BasePlatformAdapter):
         sending responses through the same adapter reference, avoiding the
         "transport not connected" failure caused by gateway adapter replacement.
         """
-        if self._agent_deleted:
+        if (
+            self._agent_deleted
+            or self._disconnect_requested
+            or getattr(self, "_shutting_down", False)
+        ):
             return False
         async with self._reconnect_lock:
+            # A status callback may have waited for another reconnect or for
+            # adapter shutdown. Re-check terminal state after acquiring the
+            # lock so stale queued callbacks cannot resurrect the transport.
+            if (
+                self._agent_deleted
+                or self._disconnect_requested
+                or getattr(self, "_shutting_down", False)
+            ):
+                return False
+
             # Double-check: another coroutine may have already reconnected.
             client = self._client
             if client:
@@ -1055,12 +1138,14 @@ class GrixAdapter(BasePlatformAdapter):
                     await old.disconnect(reason or "internal reconnect")
 
             for attempt in range(1, max_attempts + 1):
+                if (
+                    self._agent_deleted
+                    or self._disconnect_requested
+                    or getattr(self, "_shutting_down", False)
+                ):
+                    return False
                 try:
-                    new_client = GrixTransportClient(
-                        self.connection,
-                        connector=self._connector,
-                        on_status=self._handle_transport_status,
-                    )
+                    new_client = self._new_primary_transport_client()
                     self._bind_packet_handler(new_client)
                     await new_client.connect()
                     self._client = new_client
@@ -1084,7 +1169,8 @@ class GrixAdapter(BasePlatformAdapter):
                     )
                     return True
                 except GrixAuthRejectedError as exc:
-                    # 鉴权拒绝不会因重试而变好，立即放弃；10008 = agent 已删除，永久停止重连。
+                    # 只有明确的永久错误才终止重连。10001 可能出现在服务端故障恢复窗口，
+                    # 若把它标成 non-retryable，Hermes watcher 会永久移除该连接。
                     if exc.code == AUTH_CODE_AGENT_DELETED:
                         self._agent_deleted = True
                         logger.error(
@@ -1094,23 +1180,33 @@ class GrixAdapter(BasePlatformAdapter):
                             exc,
                         )
                         self._set_fatal_error("grix_agent_deleted", str(exc), retryable=False)
-                    else:
-                        logger.error(
-                            "[%s] Internal reconnect auth rejected (attempt %d), not retrying: %s",
-                            self.name,
-                            attempt,
-                            exc,
-                        )
-                        self._set_fatal_error("grix_auth_rejected", str(exc), retryable=False)
-                    return False
-                except Exception as exc:
+                        return False
+
                     logger.warning(
-                        "[%s] Internal reconnect attempt %d failed: %s",
+                        "[%s] Internal reconnect auth rejected (attempt %d/%d), "
+                        "treating as retryable: %s",
                         self.name,
                         attempt,
+                        max_attempts,
                         exc,
                     )
-                    await asyncio.sleep(2 * attempt)
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Internal reconnect attempt %d/%d failed: %s",
+                        self.name,
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+
+                if attempt < max_attempts:
+                    delay = _reconnect_delay_seconds(attempt)
+                    logger.info(
+                        "[%s] Internal reconnect retry in %.1fs",
+                        self.name,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
 
             logger.error(
                 "[%s] Internal reconnect failed after %d attempts",
@@ -1153,11 +1249,7 @@ class GrixAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to acquire GRIX lock: %s", self.name, exc)
 
         self._disconnect_requested = False
-        self._client = GrixTransportClient(
-            self.connection,
-            connector=self._connector,
-            on_status=self._handle_transport_status,
-        )
+        self._client = self._new_primary_transport_client()
         self._bind_packet_handler(self._client)
         try:
             await self._client.connect()
@@ -1173,7 +1265,16 @@ class GrixAdapter(BasePlatformAdapter):
                 )
                 self._set_fatal_error("grix_agent_deleted", str(exc), retryable=False)
             else:
-                self._set_fatal_error("grix_auth_rejected", str(exc), retryable=False)
+                # Generic auth failures can be transient while the service is
+                # recovering. Keep the gateway watcher retry queue alive; its
+                # capped backoff controls long-running retry frequency.
+                logger.warning(
+                    "[%s] Auth rejected during connect; keeping background "
+                    "reconnect enabled: %s",
+                    self.name,
+                    exc,
+                )
+                self._set_fatal_error("grix_auth_rejected", str(exc), retryable=True)
             await self._safe_release_lock()
             return False
         except Exception as exc:
@@ -1268,6 +1369,15 @@ class GrixAdapter(BasePlatformAdapter):
             self._skill_syncer = None
         # agent 共享：置位 shutting_down,串行等在途 share-set 同步结束,避免关停后泄漏。
         self._shutting_down = True
+        getattr(self, "_desired_shared_owner_ids", set()).clear()
+        shared_reconnect_tasks = list(
+            getattr(self, "_shared_reconnect_tasks", {}).values()
+        )
+        getattr(self, "_shared_reconnect_tasks", {}).clear()
+        for task in shared_reconnect_tasks:
+            task.cancel()
+        if shared_reconnect_tasks:
+            await asyncio.gather(*shared_reconnect_tasks, return_exceptions=True)
         # 清空事件队列：排队事件已 ack 给平台，静默丢弃会留下永远 running 的
         # 幽灵任务（对齐 connector removeSlot：destroy 前先逐条以 canceled
         # 收口）。此时主连接还活着，终态能发出去。
@@ -2243,7 +2353,32 @@ class GrixAdapter(BasePlatformAdapter):
 
         session_store.append_to_transcript(session_entry.session_id, transcript_entry)
 
-    def _make_shared_status_handler(self, shared_owner_id: str) -> Callable:
+    def _new_shared_transport_client(
+        self,
+        shared_owner_id: str,
+    ) -> GrixTransportClient:
+        """Build a source-aware shared client."""
+        shared_config = build_shared_connection_config(
+            self.connection,
+            shared_owner_id,
+        )
+        client = GrixTransportClient(
+            shared_config,
+            connector=self._connector,
+            on_status=None,
+        )
+        client.on_status = self._make_shared_status_handler(
+            shared_owner_id,
+            source_client=client,
+        )
+        return client
+
+    def _make_shared_status_handler(
+        self,
+        shared_owner_id: str,
+        *,
+        source_client: Optional[GrixTransportClient] = None,
+    ) -> Callable:
         """Return an on_status callback bound to a specific shared_owner_id.
 
         When the shared client disconnects unexpectedly, this triggers
@@ -2255,119 +2390,276 @@ class GrixAdapter(BasePlatformAdapter):
                 return
             if status.get("connected", True):
                 return
+            if (
+                source_client is not None
+                and self._shared_clients.get(shared_owner_id) is not source_client
+            ):
+                logger.debug(
+                    "[%s] Ignoring stale shared transport status callback "
+                    "shared_owner=%s",
+                    self.name,
+                    shared_owner_id,
+                )
+                return
             reason = str(status.get("last_error") or "shared client disconnected")
-            await self._try_reconnect_shared_client(shared_owner_id, reason=reason)
+            self._ensure_shared_reconnect_task(shared_owner_id, reason=reason)
 
         return handler
 
-    async def _try_reconnect_shared_client(
-        self, shared_owner_id: str, *, reason: str = "", max_attempts: int = 2
-    ) -> bool:
-        """Try to reconnect a disconnected shared client.
+    def _ensure_shared_reconnect_task(
+        self,
+        shared_owner_id: str,
+        *,
+        reason: str = "",
+    ) -> Optional[asyncio.Task]:
+        if self._disconnect_requested or self._shutting_down or self._agent_deleted:
+            return None
+        desired = getattr(self, "_desired_shared_owner_ids", set())
+        if shared_owner_id not in desired:
+            return None
 
-        On auth rejection (share revoked) we clean up and stop.
-        On transient failure we retry with exponential backoff."""
-        async with self._share_sync_lock:
+        tasks = getattr(self, "_shared_reconnect_tasks", None)
+        if tasks is None:
+            tasks = self._shared_reconnect_tasks = {}
+        existing = tasks.get(shared_owner_id)
+        if existing is not None and not existing.done():
+            return existing
+
+        client = self._shared_clients.get(shared_owner_id)
+        status = getattr(client, "status", None) if client is not None else None
+        if (
+            isinstance(status, dict)
+            and status.get("connected")
+            and status.get("authed")
+        ):
+            return None
+
+        task = asyncio.create_task(
+            self._try_reconnect_shared_client(
+                shared_owner_id,
+                reason=reason,
+                max_attempts=None,
+            )
+        )
+        tasks[shared_owner_id] = task
+
+        def _done(done_task: asyncio.Task) -> None:
+            if tasks.get(shared_owner_id) is done_task:
+                tasks.pop(shared_owner_id, None)
+            if done_task.cancelled():
+                return
+            try:
+                error = done_task.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "[%s] Shared reconnect task crashed shared_owner=%s: %s",
+                    self.name,
+                    shared_owner_id,
+                    error,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_done)
+        return task
+
+    async def _try_reconnect_shared_client(
+        self,
+        shared_owner_id: str,
+        *,
+        reason: str = "",
+        max_attempts: Optional[int] = 2,
+    ) -> bool:
+        """Reconnect a shared client with cancellable, capped backoff.
+
+        ``max_attempts=None`` keeps retrying until the share is revoked or the
+        adapter shuts down. A finite value remains available for narrow tests.
+        Generic auth rejection is retryable because 10001 is also emitted while
+        the service is recovering; only explicit agent deletion is terminal.
+        """
+        attempt = 0
+        first_reason = reason or "shared client disconnected"
+
+        while True:
             if self._shutting_down or self._disconnect_requested:
                 return False
 
-            old_client = self._shared_clients.get(shared_owner_id)
-            if old_client is None:
-                # Already removed by control_share_set (revoked) or prior reconnect.
-                return False
-            s = getattr(old_client, "status", None)
-            if isinstance(s, dict) and s.get("connected") and s.get("authed"):
-                return True
-
-            logger.info(
-                "[%s] Shared client reconnect shared_owner=%s: %s",
-                self.name,
-                shared_owner_id,
-                reason or "unknown",
-            )
-
-            self._shared_clients.pop(shared_owner_id, None)
-            with suppress(Exception):
-                await old_client.disconnect(reason or "shared client reconnect")
-
-            for attempt in range(1, max_attempts + 1):
-                if self._shutting_down or self._disconnect_requested:
+            async with self._share_sync_lock:
+                desired = getattr(self, "_desired_shared_owner_ids", set())
+                if shared_owner_id not in desired:
                     return False
-                try:
-                    shared_config = build_shared_connection_config(
-                        self.connection, shared_owner_id
-                    )
-                    new_client = GrixTransportClient(
-                        shared_config,
-                        connector=self._connector,
-                        on_status=self._make_shared_status_handler(shared_owner_id),
-                    )
-                    self._bind_packet_handler(new_client)
-                    await new_client.connect()
-                    self._shared_clients[shared_owner_id] = new_client
-                    logger.info(
-                        "[%s] Shared client reconnect OK shared_owner=%s (attempt %d)",
-                        self.name,
-                        shared_owner_id,
-                        attempt,
-                    )
-                    # 补发断连期间滞留的 event_result（按该 owner 的状态桶）。
-                    token = _CURRENT_CLIENT_CTX.set(new_client)
-                    try:
-                        await self._replay_pending_completed_events()
-                        await self._push_all_queue_snapshots()
-                    except Exception as exc:
-                        logger.debug(
-                            "[%s] Shared client event_result replay failed shared_owner=%s: %s",
-                            self.name, shared_owner_id, exc,
-                        )
-                    finally:
-                        _CURRENT_CLIENT_CTX.reset(token)
+                old_client = self._shared_clients.get(shared_owner_id)
+                status = (
+                    getattr(old_client, "status", None)
+                    if old_client is not None
+                    else None
+                )
+                if (
+                    isinstance(status, dict)
+                    and status.get("connected")
+                    and status.get("authed")
+                ):
                     return True
-                except GrixAuthRejectedError:
-                    logger.info(
-                        "[%s] Shared client auth rejected (share revoked) shared_owner=%s",
+                self._shared_clients.pop(shared_owner_id, None)
+
+            if old_client is not None:
+                with suppress(Exception):
+                    await old_client.disconnect(first_reason)
+
+            attempt += 1
+            new_client = self._new_shared_transport_client(shared_owner_id)
+            self._bind_packet_handler(new_client)
+            try:
+                await new_client.connect()
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await new_client.disconnect("shared reconnect cancelled")
+                raise
+            except GrixAuthRejectedError as exc:
+                if exc.code == AUTH_CODE_AGENT_DELETED:
+                    self._agent_deleted = True
+                    logger.error(
+                        "[%s] Shared reconnect stopped: agent deleted "
+                        "shared_owner=%s: %s",
                         self.name,
                         shared_owner_id,
-                    )
-                    self._drop_owner_state(shared_owner_id)
-                    return False
-                except Exception as exc:
-                    logger.warning(
-                        "[%s] Shared client reconnect attempt %d failed shared_owner=%s: %s",
-                        self.name,
-                        shared_owner_id,
-                        attempt,
                         exc,
                     )
-                    await asyncio.sleep(2 * attempt)
+                    self._set_fatal_error(
+                        "grix_agent_deleted",
+                        str(exc),
+                        retryable=False,
+                    )
+                    await self._notify_fatal_error()
+                    return False
+                logger.warning(
+                    "[%s] Shared reconnect auth rejected (attempt %d) "
+                    "shared_owner=%s, treating as retryable: %s",
+                    self.name,
+                    attempt,
+                    shared_owner_id,
+                    exc,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Shared reconnect attempt %d failed "
+                    "shared_owner=%s: %s",
+                    self.name,
+                    attempt,
+                    shared_owner_id,
+                    exc,
+                )
+            else:
+                install_client = False
+                async with self._share_sync_lock:
+                    desired = getattr(self, "_desired_shared_owner_ids", set())
+                    if (
+                        shared_owner_id in desired
+                        and not self._shutting_down
+                        and not self._disconnect_requested
+                    ):
+                        self._shared_clients[shared_owner_id] = new_client
+                        install_client = True
 
-            logger.error(
-                "[%s] Shared client reconnect failed after %d attempts shared_owner=%s",
+                if not install_client:
+                    with suppress(Exception):
+                        await new_client.disconnect("share revoked during reconnect")
+                    return False
+
+                logger.info(
+                    "[%s] Shared client reconnect OK shared_owner=%s (attempt %d)",
+                    self.name,
+                    shared_owner_id,
+                    attempt,
+                )
+                # 补发断连期间滞留的 event_result（按该 owner 的状态桶）。
+                token = _CURRENT_CLIENT_CTX.set(new_client)
+                try:
+                    await self._replay_pending_completed_events()
+                    await self._push_all_queue_snapshots()
+                except Exception as exc:
+                    logger.debug(
+                        "[%s] Shared client event_result replay failed "
+                        "shared_owner=%s: %s",
+                        self.name,
+                        shared_owner_id,
+                        exc,
+                    )
+                finally:
+                    _CURRENT_CLIENT_CTX.reset(token)
+                return True
+
+            if max_attempts is not None and attempt >= max_attempts:
+                logger.error(
+                    "[%s] Shared client reconnect failed after %d attempts "
+                    "shared_owner=%s",
+                    self.name,
+                    attempt,
+                    shared_owner_id,
+                )
+                return False
+
+            delay = (
+                _background_reconnect_delay_seconds(attempt)
+                if max_attempts is None
+                else _reconnect_delay_seconds(attempt)
+            )
+            logger.info(
+                "[%s] Shared reconnect retry in %.1fs shared_owner=%s",
                 self.name,
-                max_attempts,
+                delay,
                 shared_owner_id,
             )
-            return False
+            await asyncio.sleep(delay)
 
-    async def _handle_transport_status(self, status: Dict[str, Any]) -> None:
-        if self._disconnect_requested or self._agent_deleted:
+    async def _handle_transport_status(
+        self,
+        status: Dict[str, Any],
+        *,
+        source_client: Optional[GrixTransportClient] = None,
+    ) -> None:
+        if self._disconnect_requested or self._agent_deleted or self._shutting_down:
             return
         if status.get("connected", True):
             return
         if not self.is_connected:
             return
 
-        message = str(status.get("last_error") or "grix websocket disconnected")
+        status_lock = getattr(self, "_status_reconnect_lock", None)
+        if status_lock is None:
+            # Compatibility for narrow tests that construct the adapter via
+            # __new__ instead of __init__.
+            status_lock = self._status_reconnect_lock = asyncio.Lock()
 
-        # Try internal transport reconnection first — keeps the same adapter
-        # instance alive so in-flight agent sessions can still send responses.
-        if await self._try_reconnect_transport(reason=message):
-            return
+        # Cover both the internal rebuild and the gateway fatal handoff. This
+        # coalesces duplicate on_status callbacks rather than merely serializing
+        # each callback into another full reconnect cycle.
+        async with status_lock:
+            if self._disconnect_requested or self._agent_deleted or self._shutting_down:
+                return
+            if source_client is not None and source_client is not self._client:
+                logger.debug(
+                    "[%s] Ignoring stale primary transport status callback",
+                    self.name,
+                )
+                return
+            if status.get("connected", True) or not self.is_connected:
+                return
 
-        # Internal reconnection failed; delegate to gateway adapter replacement.
-        self._set_fatal_error("grix_connection_lost", message, retryable=True)
-        await self._notify_fatal_error()
+            message = str(status.get("last_error") or "grix websocket disconnected")
+
+            # Try internal transport reconnection first — keeps the same adapter
+            # instance alive so in-flight agent sessions can still send responses.
+            if await self._try_reconnect_transport(reason=message):
+                return
+
+            if self._disconnect_requested or self._agent_deleted or self._shutting_down:
+                return
+
+            # Internal reconnection failed; delegate to gateway adapter replacement.
+            self._set_fatal_error("grix_connection_lost", message, retryable=True)
+            await self._notify_fatal_error()
 
     async def _handle_protocol_packet(
         self,
@@ -2483,6 +2775,13 @@ class GrixAdapter(BasePlatformAdapter):
         """agent 共享：后端下发当前被共享者全量名单，diff 后增删共享子连接。
         每个被共享者一条独立 WS（主人 api_key + shared_owner_id），handler 回调
         通过 contextvar 路由到各自 client，确保回执不串。"""
+        # Compatibility for narrow tests that construct the adapter via
+        # __new__ instead of __init__.
+        if not hasattr(self, "_desired_shared_owner_ids"):
+            self._desired_shared_owner_ids = set(self._shared_clients.keys())
+        if not hasattr(self, "_shared_reconnect_tasks"):
+            self._shared_reconnect_tasks = {}
+
         raw_list = payload.get("shared_to") or []
         if not isinstance(raw_list, list):
             logger.warning("[%s] control_share_set ignored: shared_to not list", self.name)
@@ -2494,45 +2793,32 @@ class GrixAdapter(BasePlatformAdapter):
                 desired.add(s)
 
         async with self._share_sync_lock:
-            current = set(self._shared_clients.keys())
-            to_add = desired - current
-            to_remove = current - desired
+            previous = set(self._desired_shared_owner_ids)
+            previous.update(self._shared_clients.keys())
+            self._desired_shared_owner_ids = set(desired)
+            to_remove = previous - desired
+            removed_clients = {
+                shared_owner_id: self._shared_clients.pop(shared_owner_id, None)
+                for shared_owner_id in to_remove
+            }
+            removed_tasks = {
+                shared_owner_id: self._shared_reconnect_tasks.pop(
+                    shared_owner_id,
+                    None,
+                )
+                for shared_owner_id in to_remove
+            }
 
-            # 新增：为名单中尚未运行的被共享者建独立 client。
-            for shared_owner_id in to_add:
-                if self._shutting_down:
-                    break
-                try:
-                    shared_config = build_shared_connection_config(
-                        self.connection, shared_owner_id
-                    )
-                    shared_client = GrixTransportClient(
-                        shared_config,
-                        connector=self._connector,
-                        on_status=self._make_shared_status_handler(shared_owner_id),
-                    )
-                    self._bind_packet_handler(shared_client)
-                    await shared_client.connect()
-                    self._shared_clients[shared_owner_id] = shared_client
-                    logger.info(
-                        "[%s] shared client connected agent=%s shared_owner=%s",
-                        self.name,
-                        self.connection.agent_id,
-                        shared_owner_id,
-                    )
-                except Exception as exc:
-                    logger.error(
-                        "[%s] connect shared client failed shared_owner=%s: %s",
-                        self.name,
-                        shared_owner_id,
-                        exc,
-                    )
+        # Cancellation and network shutdown happen outside _share_sync_lock so
+        # an in-flight worker can unwind without deadlocking share-set handling.
+        tasks_to_cancel = [task for task in removed_tasks.values() if task is not None]
+        for task in tasks_to_cancel:
+            task.cancel()
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
-            # 移除：已不在名单中的子连接，断开并清理。
-            for shared_owner_id in to_remove:
-                shared_client = self._shared_clients.pop(shared_owner_id, None)
-                if shared_client is None:
-                    continue
+        for shared_owner_id, shared_client in removed_clients.items():
+            if shared_client is not None:
                 try:
                     await shared_client.disconnect("share revoked")
                 except Exception as exc:
@@ -2542,15 +2828,24 @@ class GrixAdapter(BasePlatformAdapter):
                         shared_owner_id,
                         exc,
                     )
-                # 共享被撤销后，对应 owner 的所有 per-chat/per-event 状态一并丢弃，
-                # 防止后续若 owner 重新被授权时拿到旧残留（也避免长期累积内存）。
-                self._drop_owner_state(shared_owner_id)
-                logger.info(
-                    "[%s] shared client disconnected agent=%s shared_owner=%s",
-                    self.name,
-                    self.connection.agent_id,
-                    shared_owner_id,
-                )
+            # 共享被撤销后，对应 owner 的所有 per-chat/per-event 状态一并丢弃，
+            # 防止后续若 owner 重新被授权时拿到旧残留（也避免长期累积内存）。
+            self._drop_owner_state(shared_owner_id)
+            logger.info(
+                "[%s] shared client disconnected agent=%s shared_owner=%s",
+                self.name,
+                self.connection.agent_id,
+                shared_owner_id,
+            )
+
+        # Missing/disconnected desired owners each get one cancellable worker.
+        # The worker attempts immediately, then retries indefinitely with
+        # capped jittered backoff until a later share-set revokes the owner.
+        for shared_owner_id in desired:
+            self._ensure_shared_reconnect_task(
+                shared_owner_id,
+                reason="control_share_set",
+            )
 
     async def _handle_local_action_packet(self, payload: Dict[str, Any]) -> None:
         if not self._active_client():
