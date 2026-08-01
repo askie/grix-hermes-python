@@ -1443,7 +1443,8 @@ class GrixAdapter(BasePlatformAdapter):
         thread_id_hint = self._metadata_thread_id(metadata)
 
         # Read per-session connector hints injected by the backend (e.g. group chat).
-        _hints = self._active_state().session_connector_hints.get(str(chat_id)) or {}
+        state = self._active_state()
+        _hints = state.session_connector_hints.get(str(chat_id)) or {}
         _drop_thinking = _hints.get("thinking_events") == "drop"
         _drop_tools = _hints.get("tool_events") == "drop"
         # 托管代答场景（后端对 widget 客服等私聊托管下发）：agent 代 owner 回复对端，
@@ -1452,11 +1453,35 @@ class GrixAdapter(BasePlatformAdapter):
         # 分片仅首片带引用、第二次 grix_reply 也不带引用，那些信号都是有损的。
         _drop_text = _hints.get("text_events") == "drop"
         # 框架整轮最终应答兜底：base.py "Sending response" 路径投递前会在 metadata
-        # 打 notify=True 标记（仅最终应答/语音应答打标，过程文本不带）。托管场景下
-        # 模型若未走 grix_reply 工具，最终应答也经普通 send() 到达这里——必须按最终
-        # 应答对待（跳过过程分类与 text drop），否则对端完全收不到回复，且静默
-        # success 会让框架误判已投递。
-        if _drop_text and not is_final_reply and (metadata or {}).get("notify") is True:
+        # 打 notify=True 标记（仅最终应答/语音应答打标，过程文本不带）。若同一触发
+        # 消息已经由 grix_reply 成功投递，框架 final 只是工具调用后的重复总结，必须
+        # 静默收口；显式第二次 grix_reply 走 is_final_reply=True，不受影响。按原消息
+        # ID 匹配，避免上一轮 replied 状态误伤同一会话的新消息。
+        _is_framework_final = (
+            not is_final_reply and (metadata or {}).get("notify") is True
+        )
+        reply_to_id = str(reply_to or "").strip()
+        if _is_framework_final and reply_to_id:
+            for target in state.active_reply_targets.values():
+                if not target.get("replied"):
+                    continue
+                if str(target.get("chat_id") or "") != str(chat_id):
+                    continue
+                if str(target.get("message_id") or "") != reply_to_id:
+                    continue
+                logger.debug(
+                    "[%s] Suppressing framework final after grix_reply "
+                    "for chat=%s message_id=%s",
+                    self.name,
+                    chat_id,
+                    reply_to_id,
+                )
+                return SendResult(success=True, retryable=False)
+
+        # 托管场景下模型未走 grix_reply 时，最终应答也经普通 send() 到达这里——
+        # 必须按最终应答对待（跳过过程分类与 text drop），否则对端完全收不到回复，
+        # 且静默 success 会让框架误判已投递。
+        if _drop_text and _is_framework_final:
             is_final_reply = True
 
         # Detect structured content and inject channel_data for card display.

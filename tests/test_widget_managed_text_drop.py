@@ -31,6 +31,14 @@ def _set_hints(inst, chat_id, hints):
     inst._active_state().session_connector_hints[str(chat_id)] = hints
 
 
+def _set_reply_target(inst, *, chat_id="chat-1", message_id="t1", replied=True):
+    inst._active_state().active_reply_targets["session-1"] = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "replied": replied,
+    }
+
+
 def test_managed_drops_plain_process_text(monkeypatch):
     """托管场景：纯文本过程/续写被丢弃，但对 agent 报成功。"""
     monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
@@ -129,6 +137,59 @@ def test_managed_delivers_framework_final_text(monkeypatch):
     assert result.success is True
     assert len(client.sent) == 1
     assert client.sent[0]["content"] == "您好呀，有什么可以帮您的？"
+
+
+def test_managed_drops_framework_final_after_grix_reply(monkeypatch):
+    """托管场景：grix_reply 已成功投递时，不再重复投递框架整轮最终文本。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_hints(inst, "chat-1", MANAGED)
+    _set_reply_target(inst)
+
+    result = _with_ctx(
+        client,
+        inst.send("chat-1", "已回复。总结：正式客服回复", reply_to="t1",
+                  metadata={"notify": True}),
+    )
+
+    assert result.success is True
+    assert client.sent == []
+
+
+def test_no_hint_drops_framework_final_after_grix_reply(monkeypatch):
+    """普通私聊：grix_reply 已成功投递时，同轮 framework final 也必须去重。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_reply_target(inst)
+
+    result = _with_ctx(
+        client,
+        inst.send("chat-1", "已回复。总结：正式答复", reply_to="t1",
+                  metadata={"notify": True}),
+    )
+
+    assert result.success is True
+    assert client.sent == []
+
+
+def test_framework_final_for_new_message_is_not_suppressed(monkeypatch):
+    """同一会话的新消息不能被上一条消息的 replied 状态误伤。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_reply_target(inst, message_id="old-message")
+
+    result = _with_ctx(
+        client,
+        inst.send("chat-1", "新一轮最终答复", reply_to="new-message",
+                  metadata={"notify": True}),
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "新一轮最终答复"
 
 
 def test_managed_framework_final_survives_status_lookalike(monkeypatch):
