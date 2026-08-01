@@ -477,6 +477,22 @@ def test_reply_tool_second_call_drops_quote(monkeypatch):
     assert "already been sent" in out2 or "already" in out2
 
 
+def test_reply_tool_registration_uses_full_non_duplicate_guidance():
+    """Hermes 注册描述必须复用 schema 的完整交互约束，避免短文案覆盖。"""
+    captured = {}
+
+    class _Context:
+        def register_tool(self, **kwargs):
+            captured.update(kwargs)
+
+    reply_tool_mod.register_reply_tool(_Context())
+
+    description = reply_tool_mod.GRIX_REPLY_SCHEMA["description"]
+    assert captured["description"] == description
+    assert "before or after" in description
+    assert "progress only" in description
+
+
 def test_reply_tool_failed_send_does_not_mark_replied(monkeypatch):
     """首次发送失败不应占用完成信号，重试仍要带引用。"""
     monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)

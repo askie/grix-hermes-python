@@ -19,8 +19,8 @@ GRIX_REPLY_SCHEMA = {
         "current task. The message automatically quotes the message that triggered "
         "this task; that quote is the completion signal (in multi-agent pipelines it "
         "hands the work to the next agent), so call this exactly once, when the task "
-        "is truly complete. Use normal streamed text for progress along the way, and "
-        "do not repeat the same conclusion as plain text after calling this tool."
+        "is truly complete. Use normal streamed text for progress only; do not send "
+        "the complete conclusion as plain text before or after calling this tool."
     ),
     "parameters": {
         "type": "object",
@@ -195,7 +195,7 @@ def register_reply_tool(ctx=None) -> None:
         handler=_grix_reply_handler,
         check_fn=_check_reply,
         is_async=True,
-        description="Send the task's final reply, quoting the triggering message (completion signal).",
+        description=GRIX_REPLY_SCHEMA["description"],
         emoji="✅",
     )
     if _register:
