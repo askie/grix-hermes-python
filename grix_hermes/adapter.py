@@ -1478,6 +1478,34 @@ class GrixAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=True, retryable=False)
 
+        # grix_reply 完成最终应答后，模型在同一轮里继续输出的纯文本（流式文本
+        # 通道，不带 notify 标记、常无 reply_to）只是重复总结，必须同样收口——
+        # 线上实证：gateway.run 的 final-send 去重只挡 notify=True 路径，流式
+        # 文本会绕过它直接投递成第二条重复消息。按处理任务 context 里的
+        # session_key 精确定位本轮 entry（群聊 per-user 并发时 chat_id 无法
+        # 消歧）；entry 在 on_processing_complete 才被清除，窗口正好覆盖
+        # 「replied 之后到本轮结束」。ContextVar 缺失（非处理任务链路）时宁可
+        # 放过，不误伤其它轮次/其它用户的文本。
+        if not is_final_reply and not _is_framework_final:
+            _ctx_key = _CURRENT_REPLY_SESSION_KEY.get()
+            _target = (
+                state.active_reply_targets.get(_ctx_key) if _ctx_key else None
+            )
+            if (
+                _target
+                and _target.get("replied")
+                and str(_target.get("chat_id") or "") == str(chat_id)
+            ):
+                logger.debug(
+                    "[%s] Dropping post-reply text after grix_reply "
+                    "for chat=%s session_key=%s (%d chars)",
+                    self.name,
+                    chat_id,
+                    _ctx_key,
+                    len(content or ""),
+                )
+                return SendResult(success=True, retryable=False)
+
         # 托管场景下模型未走 grix_reply 时，最终应答也经普通 send() 到达这里——
         # 必须按最终应答对待（跳过过程分类与 text drop），否则对端完全收不到回复，
         # 且静默 success 会让框架误判已投递。

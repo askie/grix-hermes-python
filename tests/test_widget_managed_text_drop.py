@@ -221,3 +221,108 @@ def test_no_hint_delivers_plain_text(monkeypatch):
     assert result.success is True
     assert len(client.sent) == 1
     assert client.sent[0]["content"] == "普通进程消息"
+
+
+# ── grix_reply 之后的同轮流式文本收口 ────────────────────────────────────────
+
+
+def _with_reply_ctx(session_key, fn):
+    """在处理任务 context（_CURRENT_REPLY_SESSION_KEY）内执行 fn。"""
+    token = adapter_mod._CURRENT_REPLY_SESSION_KEY.set(session_key)
+    try:
+        return fn()
+    finally:
+        adapter_mod._CURRENT_REPLY_SESSION_KEY.reset(token)
+
+
+def test_drops_streamed_text_after_grix_reply(monkeypatch):
+    """复现线上重复：grix_reply 已投递后，同轮模型续写的纯文本（无 notify、
+    无 reply_to，流式文本通道）必须被丢弃，否则对端收到第二条重复总结。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_reply_target(inst)
+
+    result = _with_reply_ctx(
+        "session-1",
+        lambda: _with_ctx(client, inst.send("chat-1", "发布完成：重复总结")),
+    )
+
+    assert result.success is True
+    assert client.sent == []
+
+
+def test_delivers_streamed_text_before_grix_reply(monkeypatch):
+    """grix_reply 尚未投递（replied=False）时，同轮流式过程文本正常投递。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_reply_target(inst, replied=False)
+
+    result = _with_reply_ctx(
+        "session-1",
+        lambda: _with_ctx(client, inst.send("chat-1", "构建完成，正在上传")),
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "构建完成，正在上传"
+
+
+def test_post_reply_drop_requires_processing_ctx(monkeypatch):
+    """ContextVar 缺失（非处理任务链路）时宁可放过，不误伤其它来源的文本。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_reply_target(inst)
+
+    result = _with_ctx(client, inst.send("chat-1", "其它来源的文本"))
+
+    assert result.success is True
+    assert len(client.sent) == 1
+
+
+def test_post_reply_drop_ignores_other_sessions(monkeypatch):
+    """群聊 per-user 并发：别的 session 已 replied 不影响本轮文本投递。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_reply_target(inst)  # session-1 已 replied
+    inst._active_state().active_reply_targets["session-2"] = {
+        "chat_id": "chat-1",
+        "message_id": "t2",
+        "replied": False,
+    }
+
+    result = _with_reply_ctx(
+        "session-2",
+        lambda: _with_ctx(client, inst.send("chat-1", "另一用户的过程文本")),
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+
+
+def test_second_final_reply_survives_post_reply_drop(monkeypatch):
+    """显式第二次 grix_reply（is_final_reply=True）不受收口影响。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _set_reply_target(inst)
+
+    result = _with_reply_ctx(
+        "session-1",
+        lambda: _with_ctx(
+            client,
+            inst.send_final_reply(
+                chat_id="chat-1",
+                content="补充说明",
+                quoted_message_id=None,
+                source_client=client,
+            ),
+        ),
+    )
+
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "补充说明"
