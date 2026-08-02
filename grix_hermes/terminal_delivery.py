@@ -402,10 +402,21 @@ class TerminalDeliveryController:
                     return 0
 
                 err = packet.get("payload") or {}
-                if token:
+                err_code = err.get("code")
+                err_code_int = (
+                    int(err_code) if isinstance(err_code, (int, float)) else None
+                )
+                # 服务端 4xxx NACK（非 4008 握手限流）重连不会变好，直接进死信，
+                # 避免反复 reconnect 把正在发送的普通消息也冲失败、触发框架重试产生重复气泡。
+                is_permanent_nack = (
+                    err_code_int is not None
+                    and 4000 <= err_code_int < 5000
+                    and err_code_int != 4008
+                )
+                if token and not is_permanent_nack:
                     last_error = (
                         f"tokenized terminal rejected: cmd={packet['cmd']} "
-                        f"code={err.get('code')} msg={err.get('msg')}"
+                        f"code={err_code} msg={err.get('msg')}"
                     )
                     await self._client.reconnect_after_outbound_failure(
                         "tokenized terminal rejected"
@@ -416,11 +427,7 @@ class TerminalDeliveryController:
                         entry,
                         TerminalRejection(
                             response_cmd=str(packet["cmd"]),
-                            code=(
-                                int(err["code"])
-                                if isinstance(err.get("code"), (int, float))
-                                else None
-                            ),
+                            code=err_code_int,
                             message=(
                                 str(err.get("msg"))
                                 if err.get("msg") is not None
