@@ -765,6 +765,11 @@ async def resolve_grix_target(
 
 
 class GrixAdapter(BasePlatformAdapter):
+    # Grix/aibot 协议不支持编辑已发出的消息（没有客户端编辑能力）。
+    # 声明此项可使 Hermes gateway 跳过逐 token 的流式编辑消费者，避免在
+    # 对端产生「部分消息 + cursor + 完整消息」的重复气泡；最终回复走非流式
+    # 路径统一发送一次，并自动带上对触发消息的引用。
+    SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = 1800
     _SEND_MIN_INTERVAL = 0.5
     # 编辑消息的瞬时失败重试参数（覆盖 ws 内部重连窗口，约 3×3s）。

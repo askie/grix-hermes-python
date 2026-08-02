@@ -550,3 +550,13 @@ def test_reply_tool_falls_back_to_primary_client(monkeypatch):
     assert out.startswith("OK:")
     assert len(client.sent) == 1
     assert client.sent[0]["reply_to_message_id"] == "trigger-1"
+
+
+def test_adapter_declares_no_message_editing_support():
+    """Grix 协议不支持编辑已发出消息，必须声明以便 gateway 跳过流式编辑消费者。
+
+    否则 Hermes 的 GatewayStreamConsumer 会先 send 一条带 cursor 的部分消息，
+    再尝试 edit_message 更新；编辑失败后 fallback 成新消息发送完整文本，导致
+    对端看到多个重复气泡且都没有引用触发消息。
+    """
+    assert adapter_mod.GrixAdapter.SUPPORTS_MESSAGE_EDITING is False
