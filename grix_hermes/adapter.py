@@ -258,6 +258,13 @@ class _OwnerState:
     # 避免工具栏队列数在 agent 仍工作时错误归零；这里保存同等的运行态。
     # key=session_key，value={session_id, title, bg_hold?}。按 owner 分桶由 _OwnerState 保证。
     toolbar_active_work: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Hermes gateway 的 stream consumer 在部分代码路径（proxy 路径）中即使
+    # SUPPORTS_MESSAGE_EDITING=False 也不会被跳过；它会先 send 一条 preview
+    # 消息再反复 edit_message 更新。Grix 协议没有客户端编辑能力，preview 会
+    # 变成「不完整消息气泡」留在对端。这里按 chat_id 缓冲 preview 帧，仅在
+    # finalize 时一次性发出完整内容。
+    # key=chat_id，value={content, reply_to, metadata, fake_message_id, updated_at}
+    streaming_previews: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 class _PendingMessagesDict(dict):
@@ -887,6 +894,18 @@ class GrixAdapter(BasePlatformAdapter):
 
     def _active_state(self) -> _OwnerState:
         return self._state_for(self._active_owner_key())
+
+    def _clean_stale_streaming_previews(self, state: _OwnerState) -> None:
+        """清理超时的流式 preview buffer，避免跨轮次/崩溃后残留导致误发。"""
+        now = time.monotonic()
+        _max_age = 300.0
+        stale = [
+            chat_id
+            for chat_id, preview in state.streaming_previews.items()
+            if now - preview.get("updated_at", 0) > _max_age
+        ]
+        for chat_id in stale:
+            state.streaming_previews.pop(chat_id, None)
 
     def _drop_owner_state(self, owner_key: str) -> None:
         """从 owner_states 移除某 owner 的全部状态（撤销共享 / 共享子连接关闭时调用）。"""
@@ -1587,6 +1606,39 @@ class GrixAdapter(BasePlatformAdapter):
                     )
                     return SendResult(success=True, retryable=False)
 
+        # 流式 preview 缓冲：Hermes gateway 在 proxy 等路径下即使
+        # SUPPORTS_MESSAGE_EDITING=False 仍会跑 GatewayStreamConsumer；它会先
+        # send 一条 expect_edits=True 的 preview 消息，再反复 edit_message 更新。
+        # Grix 协议没有客户端编辑能力，preview 会凝固成「不完整消息气泡」留在对端。
+        # 这里把 preview 帧缓冲在 adapter 内，仅在 finalize 时一次性发出完整内容。
+        _is_stream_preview = (
+            (metadata or {}).get("expect_edits") is True
+            and not is_final_reply
+            and (metadata or {}).get("notify") is not True
+        )
+        if _is_stream_preview:
+            self._clean_stale_streaming_previews(state)
+            fake_id = f"__grix_stream_preview:{chat_id}"
+            state.streaming_previews[str(chat_id)] = {
+                "content": content,
+                "reply_to": reply_to,
+                "metadata": metadata,
+                "fake_message_id": fake_id,
+                "updated_at": time.monotonic(),
+            }
+            logger.debug(
+                "[%s] Buffering streaming preview for chat=%s (%d chars)",
+                self.name,
+                chat_id,
+                len(content or ""),
+            )
+            return SendResult(success=True, message_id=fake_id, retryable=False)
+
+        # 最终/兜底发送时清掉同 chat 的过时 preview buffer，避免残留内容被下一轮的
+        # edit_message(finalize=True) 误发。
+        if is_final_reply or (metadata or {}).get("notify") is True:
+            state.streaming_previews.pop(str(chat_id), None)
+
         await self._enforce_send_rate()
 
         source_hint = self._active_state().latest_sources.get(str(chat_id))
@@ -1829,6 +1881,41 @@ class GrixAdapter(BasePlatformAdapter):
         if message_id in self._active_state().tool_progress_msg_ids:
             self._active_state().tool_progress_msg_ids.discard(message_id)
             return SendResult(success=False, error="tool_progress_card_fallback")
+
+        # 流式 preview 更新 / 收口：GatewayStreamConsumer 先 send preview 拿到 fake id，
+        # 之后用 edit_message 更新。非 finalize 时仅更新 buffer；finalize 时一次性发出。
+        state = self._active_state()
+        if str(message_id).startswith("__grix_stream_preview:"):
+            self._clean_stale_streaming_previews(state)
+            preview = state.streaming_previews.get(str(chat_id))
+            if not finalize:
+                if preview is not None:
+                    preview["content"] = content
+                    preview["updated_at"] = time.monotonic()
+                return SendResult(success=True, message_id=message_id, retryable=False)
+            # finalize=True: 把 stream consumer 传来的最终内容一次性发出（带引用触发消息）。
+            # 注意用调用方传入的 content（ accumulated 完整文本），而不是 buffer 里最后一次
+            # 更新的中间内容。
+            state.streaming_previews.pop(str(chat_id), None)
+            reply_to = preview.get("reply_to") if preview is not None else None
+            flush_metadata: Optional[Dict[str, Any]] = None
+            if preview is not None and preview.get("metadata"):
+                flush_metadata = dict(preview["metadata"])
+                flush_metadata.pop("expect_edits", None)
+            logger.debug(
+                "[%s] Flushing streaming preview for chat=%s (%d chars)",
+                self.name,
+                chat_id,
+                len(content or ""),
+            )
+            return await self.send(
+                str(chat_id),
+                content,
+                reply_to=reply_to,
+                metadata=flush_metadata,
+                force_quote=True,
+                is_final_reply=True,
+            )
 
         # Apply the same status-to-card conversion as send() so that heartbeat
         # edits (⏳ Working — N min…) render as progress cards rather than plain
@@ -2100,6 +2187,9 @@ class GrixAdapter(BasePlatformAdapter):
         _reply_target = state.active_reply_targets.get(session_key)
         if _reply_target and (not message_id or _reply_target.get("message_id") == message_id):
             state.active_reply_targets.pop(session_key, None)
+
+        # 本轮结束，清掉本 chat 可能残留的流式 preview buffer，避免跨轮次误发。
+        state.streaming_previews.pop(str(event.source.chat_id), None)
 
         raw_event_id = str(raw_message.get("event_id") or "").strip()
 
