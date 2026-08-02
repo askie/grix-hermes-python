@@ -552,6 +552,119 @@ def test_reply_tool_falls_back_to_primary_client(monkeypatch):
     assert client.sent[0]["reply_to_message_id"] == "trigger-1"
 
 
+def test_stream_preview_is_buffered_until_finalize(monkeypatch):
+    """模拟 GatewayStreamConsumer：preview send / 中途 edit / finalize edit。
+
+    在 Grix 上 preview 不应真正发出去；只有 finalize 时才发一条完整消息，
+    并带上对触发消息的引用。
+    """
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    # 1) preview send：被缓冲，不实际发送
+    result = _with_ctx(
+        client,
+        inst.send(
+            "chat-1",
+            "Hel",
+            reply_to="trigger-1",
+            metadata={"expect_edits": True},
+        ),
+    )
+    assert result.success is True
+    assert result.message_id.startswith("__grix_stream_preview:")
+    assert client.sent == []
+
+    preview_id = result.message_id
+
+    # 2) 中途 edit：仅更新 buffer，不发消息
+    result2 = _with_ctx(
+        client,
+        inst.edit_message("chat-1", preview_id, "Hello worl"),
+    )
+    assert result2.success is True
+    assert client.sent == []
+    assert client.edits == []
+
+    # 3) finalize edit：一次性发出完整内容，并带引用
+    result3 = _with_ctx(
+        client,
+        inst.edit_message("chat-1", preview_id, "Hello world", finalize=True),
+    )
+    assert result3.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "Hello world"
+    assert client.sent[0]["reply_to_message_id"] == "trigger-1"
+    assert client.edits == []
+
+
+def test_stream_preview_dropped_when_explicit_final_send_arrives(monkeypatch):
+    """若框架直接走显式 final send（带 notify），应清掉 buffer 并按最终内容发送。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    _with_ctx(
+        client,
+        inst.send(
+            "chat-1",
+            "partial preview",
+            reply_to="trigger-1",
+            metadata={"expect_edits": True},
+        ),
+    )
+    assert client.sent == []
+
+    result = _with_ctx(
+        client,
+        inst.send(
+            "chat-1",
+            "explicit final",
+            reply_to="trigger-1",
+            metadata={"notify": True},
+        ),
+    )
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "explicit final"
+    assert client.sent[0]["reply_to_message_id"] is None
+    # buffer 已被清掉
+    assert "chat-1" not in inst._owner_states[""].streaming_previews
+
+
+def test_stream_preview_long_content_split_with_quote_on_first_chunk(monkeypatch):
+    """finalize 时若内容超长，首片带引用、后续分片不带。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst.truncate_message = lambda content, limit, len_fn=None: [
+        content[:4],
+        content[4:8],
+        content[8:],
+    ]
+
+    preview_id = _with_ctx(
+        client,
+        inst.send(
+            "chat-1",
+            "abcdefghij",
+            reply_to="trigger-1",
+            metadata={"expect_edits": True},
+        ),
+    ).message_id
+
+    result = _with_ctx(
+        client,
+        inst.edit_message("chat-1", preview_id, "abcdefghij", finalize=True),
+    )
+    assert result.success is True
+    assert len(client.sent) == 3
+    assert client.sent[0]["reply_to_message_id"] == "trigger-1"
+    assert client.sent[1]["reply_to_message_id"] is None
+    assert client.sent[2]["reply_to_message_id"] is None
+
+
 def test_adapter_declares_no_message_editing_support():
     """Grix 协议不支持编辑已发出消息，必须声明以便 gateway 跳过流式编辑消费者。
 
