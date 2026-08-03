@@ -92,6 +92,7 @@ def _install_stubs() -> None:
 _install_stubs()
 
 from grix_hermes import adapter as adapter_mod  # noqa: E402
+from grix_hermes import upgrade_checker as uc  # noqa: E402
 from grix_hermes.upgrade_checker import UpgradeChecker  # noqa: E402
 
 
@@ -166,6 +167,30 @@ def test_stopped_checker_skips_restart_entirely(monkeypatch):
 
     assert calls == []
     assert kills == []
+
+
+def test_run_cmd_hides_windows_console(monkeypatch):
+    calls = []
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return b"ok", b""
+
+    async def _fake_create_subprocess_exec(*cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return _Proc()
+
+    monkeypatch.setattr(uc.os, "name", "nt")
+    monkeypatch.setattr(uc.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr(uc.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+
+    code, stdout, stderr = asyncio.run(UpgradeChecker._run_cmd(["hermes", "plugins", "update", "grix-hermes"]))
+
+    assert (code, stdout, stderr) == (0, "ok", "")
+    assert calls
+    assert calls[0][1]["creationflags"] == 0x08000000
 
 
 # ---------------------------------------------------------------------------

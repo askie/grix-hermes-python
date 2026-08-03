@@ -15,6 +15,7 @@ import os
 import platform
 import signal
 import socket
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -32,6 +33,12 @@ UPDATE_MAX_ATTEMPTS = 4
 UPDATE_RETRY_BASE_S = 1.5
 PLUGIN_NAME = "grix-hermes"
 PLUGIN_GIT_REPO = "askie/grix-hermes-python"
+
+
+def _hidden_window_subprocess_kwargs() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
 
 
 def _running_plugin_dir_name() -> str:
@@ -585,6 +592,7 @@ class UpgradeChecker:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_hidden_window_subprocess_kwargs(),
         )
         try:
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)

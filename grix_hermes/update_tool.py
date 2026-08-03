@@ -93,6 +93,12 @@ def _build_update_commands(params: Dict[str, Any]) -> Tuple[List[List[str]], Dic
     return commands, env
 
 
+def _hidden_window_subprocess_kwargs() -> Dict[str, Any]:
+    if os.name != "nt":
+        return {}
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+
+
 def _run_command(
     cmd: List[str],
     *,
@@ -108,6 +114,7 @@ def _run_command(
         text=True,
         env=merged_env,
         timeout=timeout,
+        **_hidden_window_subprocess_kwargs(),
     )
     return result.returncode, result.stdout.strip(), result.stderr.strip()
 
