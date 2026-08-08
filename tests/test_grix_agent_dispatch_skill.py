@@ -17,7 +17,39 @@ OWNER_RELAY = (
 ).read_text(encoding="utf-8")
 
 
-def test_requires_callback_protocol_block():
+def test_defines_report_dispatch_result_as_skill_procedure_with_exactly_5_parameters():
+    assert "report_dispatch_result" in DISPATCH
+    assert "skill procedure — not a tool" in DISPATCH
+    assert "not a\n`grix_invoke` action" in DISPATCH or "not a `grix_invoke` action" in DISPATCH
+    assert 'grix_invoke(action="report_dispatch_result"' in DISPATCH
+    assert "that action does not" in DISPATCH
+    assert "exist" in DISPATCH.split("that action does not", 1)[1][:40]
+    assert "Exactly 5 parameters" in DISPATCH
+    assert "callback_session_id" in DISPATCH
+    assert "work_session_id" in DISPATCH
+    assert "| 1 | `callback_session_id`" in DISPATCH
+    assert "| 2 | `status`" in DISPATCH
+    assert "| 3 | `summary`" in DISPATCH
+    assert "| 4 | `detail`" in DISPATCH
+    assert "| 5 | `work_session_id`" in DISPATCH
+
+
+def test_embeds_only_short_callback_pointer_in_dispatched_tasks():
+    assert "short callback pointer" in DISPATCH
+    assert (
+        "完成后、或进入 blocked（等待审批/提问）时，按 grix-agent-dispatch 技能规程"
+        in DISPATCH
+    )
+    assert "不是工具名/不是 grix_invoke action" in DISPATCH
+    assert "when blocked (waiting for approval/a question)" in DISPATCH
+    assert "do **not** paste the" in DISPATCH
+    assert "`[dispatch-result]` wire template into `task`" in DISPATCH
+    # Old long-form task embed must not return.
+    assert "【完成后必须回写，不要只在本会话收尾】" not in DISPATCH
+    assert "1. 调用 grix_invoke(action=\"session_send\"" not in DISPATCH
+
+
+def test_keeps_wire_format_inside_report_dispatch_result():
     assert "[dispatch-result]" in DISPATCH
     assert "[/dispatch-result]" in DISPATCH
     assert 'action="session_send"' in DISPATCH
@@ -46,6 +78,9 @@ def test_documents_blocked_intermediate_callback():
     assert "blocked" in DISPATCH
     assert "waiting_approval" in DISPATCH or "等待审批" in DISPATCH
     assert "keep this session alive" in DISPATCH or "保持本会话" in DISPATCH
+    # Short pointer must mention blocked, not only terminal "when done".
+    assert "进入 blocked" in DISPATCH
+    assert "when blocked" in DISPATCH
 
 
 def test_states_anti_loop_and_trust_boundary_guardrails():
@@ -60,7 +95,7 @@ def test_requires_dispatched_task_language_to_match_user_conversation():
 
 
 def test_puts_each_dispatch_result_field_value_in_its_own_text_fence():
-    assert "Put each field **value** in its own" in DISPATCH
+    assert "put each field **value** in its own" in DISPATCH
     assert "not inline backticks" in DISPATCH
     assert "**status**:\n```text\ncompleted|failed|blocked\n```" in DISPATCH
     assert "**summary**:\n```text\n<一句话结论>\n```" in DISPATCH
@@ -90,13 +125,19 @@ def test_supports_agent_name_update():
 
 def test_owner_relay_documents_dispatch_callback_use_case():
     assert "[dispatch-result]" in OWNER_RELAY
-    assert "First-class use case: dispatch callback" in OWNER_RELAY
+    assert "report_dispatch_result" in OWNER_RELAY
+    assert "skill procedure" in OWNER_RELAY
+    assert "exactly 5 parameters" in OWNER_RELAY
+    assert "not** a tool name" in OWNER_RELAY
     assert 'action="session_send"' in OWNER_RELAY
 
 
 def test_plugin_skills_registration_matches_callback_semantics():
     dispatch_desc = PLUGIN_SKILLS["grix-agent-dispatch"]["description"]
     assert "[dispatch-result]" in dispatch_desc
+    assert "report_dispatch_result" in dispatch_desc
+    assert "skill procedure" in dispatch_desc
+    assert "not a grix_invoke action" in dispatch_desc
     assert "display name" in dispatch_desc
     assert "introduction" in dispatch_desc
     # Old introduction-only discovery copy must not return.
@@ -108,3 +149,5 @@ def test_plugin_skills_registration_matches_callback_semantics():
     relay_desc = PLUGIN_SKILLS["grix-owner-relay"]["description"]
     assert "dispatch" in relay_desc.lower()
     assert "[dispatch-result]" in relay_desc
+    assert "report_dispatch_result" in relay_desc
+    assert "skill procedure" in relay_desc

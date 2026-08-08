@@ -18,8 +18,9 @@ PLUGIN_SKILLS = {
     "grix-agent-dispatch": {
         "description": (
             "Dispatch one of the owner's other agents to work in a directory "
-            "(callback via [dispatch-result]), and update an agent's display "
-            "name and/or text introduction."
+            "(callback via skill procedure report_dispatch_result / "
+            "[dispatch-result], not a grix_invoke action), and update an "
+            "agent's display name and/or text introduction."
         ),
         "tools": ["grix_invoke"],
     },
@@ -33,8 +34,9 @@ PLUGIN_SKILLS = {
     },
     "grix-owner-relay": {
         "description": (
-            "Send a message as the owner into another session (including "
-            "dispatch [dispatch-result] callbacks), or call the owner into a "
+            "Send a message as the owner into another session (dispatch "
+            "callbacks use skill procedure report_dispatch_result → "
+            "[dispatch-result] via session_send), or call the owner into a "
             "session for a voice talk/approval."
         ),
         "tools": ["grix_invoke"],

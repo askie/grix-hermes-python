@@ -1,6 +1,6 @@
 ---
 name: grix-owner-relay
-description: Act on the owner's behalf through the Python Hermes tool grix_invoke — send a message as the owner into another session (`session_send`), or call the owner into a session for a voice talk/approval (`call_owner`). Trigger when the user asks to speak as the owner in a session, or when you need to reach the owner to discuss or get approval.
+description: Act on the owner's behalf through the Python Hermes tool grix_invoke — send a message as the owner into another session (`session_send`), or call the owner into a session for a voice talk/approval (`call_owner`). Trigger when the user asks to speak as the owner in a session, or when you need to reach the owner to discuss or get approval. Dispatch callbacks follow the grix-agent-dispatch skill procedure `report_dispatch_result` (not a grix_invoke action; it formats `[dispatch-result]` and calls `session_send`).
 trigger: 当需要以 owner 身份在某会话发言、或把 owner 叫进当前会话语音沟通/审批时
 ---
 
@@ -28,11 +28,14 @@ somewhere and need to drop a note to the owner (or to others) in a *different*
 session of theirs.
 
 **First-class use case: dispatch callback.** When you were dispatched via
-`grix-agent-dispatch` and your task includes a callback protocol block, this
-tool is how you write the `[dispatch-result]` back to the dispatching session.
-Send it exactly as the block specifies — as the owner, into that session id,
-with `content` containing **only** the `[dispatch-result]` block: no extra
-instructions, explanations, or requests outside the block.
+`grix-agent-dispatch`, follow the skill procedure `report_dispatch_result` in
+that skill (exactly 5 parameters; **not** a tool name and **not** a
+`grix_invoke` action). It formats the `[dispatch-result]` wire block and calls
+this action with `session_id` = `callback_session_id` and `content` containing
+**only** that block. Do not hand-roll the wire template in the task text; if
+you must call `session_send` directly, still send **only** the
+`[dispatch-result]` block — no extra instructions, explanations, or requests
+outside the block.
 
 ### Before you call it, make sure
 
