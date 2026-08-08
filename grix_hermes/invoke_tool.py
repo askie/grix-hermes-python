@@ -30,7 +30,7 @@ SUPPORTED_ACTIONS = {
     "agent_category_update": "Update an agent category",
     "agent_category_assign": "Assign an agent to a category",
     "agent_api_key_rotate": "Rotate an agent's API key",
-    "agent_introduction_update": "Update an agent's text introduction",
+    "agent_introduction_update": "Update an agent's display name and/or text introduction",
     "dispatch_agent": "Dispatch one of the owner's agents to work in a directory",
     "call_owner": "Call the owner into a session for a voice talk/approval",
     "session_send": "Send a message into a session AS THE OWNER (owner relay)",
