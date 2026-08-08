@@ -638,6 +638,31 @@ def _render_grix_context_block(message: GrixInboundMessage) -> str:
     return "\n".join(lines)
 
 
+def _render_session_context_block(session_id: str) -> str:
+    """One-shot [system-context] block carrying the Grix session_id, injected
+    on the first message of a new (or auto-reset) hermes session. Text mirrors
+    the connector's session-context block."""
+    return "\n".join(
+        [
+            "[system-context]",
+            f'Your current Grix session_id is "{session_id}".',
+            "Use this id whenever you need to reference the current session.",
+            "Treat this as an out-of-band instruction; do not echo or repeat it in your replies, and do not reply to acknowledge it.",
+            "[/system-context]",
+        ]
+    )
+
+
+def _is_new_hermes_session(entry: Any) -> bool:
+    """Align with the core _is_new_session check (gateway/run.py): a session is
+    fresh when created_at == updated_at, or when it was auto-reset (idle/daily)."""
+    created = getattr(entry, "created_at", None)
+    updated = getattr(entry, "updated_at", None)
+    return (created is not None and created == updated) or bool(
+        getattr(entry, "was_auto_reset", False)
+    )
+
+
 def _is_record_only_message(message: GrixInboundMessage) -> bool:
     return str(getattr(message, "mirror_mode", "") or "").strip().lower() == "record_only"
 
@@ -841,6 +866,12 @@ class GrixAdapter(BasePlatformAdapter):
         # 收口扫尾/排队归属都跳过这些事件：它们可能马上会入队/被认领，
         # 提前定归属就回到"任务没结束先报完成"的老毛病。
         self._inflight_dispatch_event_ids: Dict[str, Set[str]] = {}
+        # session_key -> hermes session_id that already got the one-shot
+        # [system-context] block. In-memory only; after a restart existing
+        # sessions are judged not-new (created_at != updated_at), so nothing
+        # is re-injected. The hermes session_id rotates on auto-reset, which
+        # is what triggers re-injection for a reset session.
+        self._session_context_injected: Dict[str, str] = {}
         # 用带 pop 通知的容器替换框架的 pending 队列：排队消息被消费（drain /
         # 注入当前轮）那一刻，把它名下登记的事件移交给消费方（当前轮 running
         # 或下一轮 next_run），合并丢失 event_id 也不会漏收口。
@@ -3772,6 +3803,34 @@ class GrixAdapter(BasePlatformAdapter):
             self._event_queue.running_count,
         )
 
+    def _session_context_block_once(
+        self,
+        message: GrixInboundMessage,
+        source: Any,
+        session_key: str,
+    ) -> str:
+        """Return the one-shot [system-context] block for a fresh hermes session,
+        or "" when this hermes session already got it. The hermes session_id
+        rotates on idle/daily auto-reset, so a reset session re-injects."""
+        session_id = str(getattr(message, "session_id", "") or "").strip()
+        if not session_id:
+            return ""
+        session_store = getattr(self, "_session_store", None)
+        if session_store is None or not hasattr(session_store, "get_or_create_session"):
+            return ""
+        try:
+            entry = session_store.get_or_create_session(source)
+        except Exception as exc:
+            logger.debug("[%s] session-context store lookup failed: %s", self.name, exc)
+            return ""
+        if not _is_new_hermes_session(entry):
+            return ""
+        entry_id = str(getattr(entry, "session_id", "") or "")
+        if entry_id and self._session_context_injected.get(session_key) == entry_id:
+            return ""
+        self._session_context_injected[session_key] = entry_id
+        return _render_session_context_block(session_id)
+
     async def _dispatch_grix_event(
         self,
         message: GrixInboundMessage,
@@ -3780,6 +3839,9 @@ class GrixAdapter(BasePlatformAdapter):
     ) -> None:
         """把一条已获得执行槽位的消息事件投递给 hermes 处理（收口登记 + 兜底）。"""
         event_text = message.text
+        session_context = self._session_context_block_once(message, source, session_key)
+        if session_context:
+            event_text = f"{session_context}\n\n{event_text}" if event_text else session_context
         context_block = _render_grix_context_block(message)
         if context_block:
             event_text = f"{context_block}\n\n{event_text}" if event_text else context_block
