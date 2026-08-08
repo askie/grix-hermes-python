@@ -80,7 +80,8 @@ def test_keeps_wire_format_inside_report_dispatch_result_and_requires_at_sender_
     assert "**summary**:" in DISPATCH
     assert "**detail**:" in DISPATCH
     assert "**session**:" in DISPATCH
-    assert "Never omit the\n`@<sender_id>` line" in DISPATCH
+    assert "Never omit\nthe `@<sender_id>` line inside the block" in DISPATCH
+    assert "@<sender_id>\n[dispatch-result]" not in DISPATCH
 
 
 def test_defaults_to_event_loop_and_forbids_polling():
@@ -120,8 +121,7 @@ def test_requires_dispatched_task_language_to_match_user_conversation():
 def test_puts_each_dispatch_result_field_value_in_its_own_text_fence():
     assert "put each field" in DISPATCH
     assert "**value** in its own text fence" in DISPATCH
-    assert "not inline" in DISPATCH
-    assert "backticks" in DISPATCH
+    assert "inline backticks" in DISPATCH
     assert "**status**:\n```text\ncompleted|failed|blocked\n```" in DISPATCH
     assert "**summary**:\n```text\n<一句话结论>\n```" in DISPATCH
     assert "**detail**:\n```text\n<关键证据/路径/命令结果，尽量短>\n```" in DISPATCH
@@ -129,7 +129,7 @@ def test_puts_each_dispatch_result_field_value_in_its_own_text_fence():
         "**session**:\n```text\n<本工作会话 id（你被派来干活的这个会话）>\n```"
         in DISPATCH
     )
-    assert "@<sender_id>\n[dispatch-result]" in DISPATCH
+    assert "[dispatch-result]\n@<sender_id>" in DISPATCH
 
 
 def test_uses_hermes_invoke_actions_not_connector_mcp_names():
@@ -155,9 +155,11 @@ def test_owner_relay_documents_dispatch_callback_use_case():
     assert "skill procedure" in OWNER_RELAY
     assert "exactly 6 parameters" in OWNER_RELAY
     assert "@<sender_id>" in OWNER_RELAY
+    assert "first line inside the block" in OWNER_RELAY
     assert "not** a tool name" in OWNER_RELAY
     assert 'action="session_send"' in OWNER_RELAY
     assert "exactly 5 parameters" not in OWNER_RELAY
+    assert "leading `@<sender_id>`" not in OWNER_RELAY
 
 
 def test_plugin_skills_registration_matches_callback_semantics():
