@@ -29,13 +29,14 @@ session of theirs.
 
 **First-class use case: dispatch callback.** When you were dispatched via
 `grix-agent-dispatch`, follow the skill procedure `report_dispatch_result` in
-that skill (exactly 5 parameters; **not** a tool name and **not** a
-`grix_invoke` action). It formats the `[dispatch-result]` wire block and calls
-this action with `session_id` = `callback_session_id` and `content` containing
-**only** that block. Do not hand-roll the wire template in the task text; if
-you must call `session_send` directly, still send **only** the
-`[dispatch-result]` block — no extra instructions, explanations, or requests
-outside the block.
+that skill (exactly 6 parameters; **not** a tool name and **not** a
+`grix_invoke` action). It formats `content` as a leading `@<sender_id>` line
+plus the `[dispatch-result]` wire block, and calls this action with
+`session_id` = `callback_session_id`. Do not hand-roll the wire template in
+the task text; if you must call `session_send` directly for a dispatch
+callback, still send **only** `@<sender_id>` + the `[dispatch-result]`
+block — no extra instructions, explanations, or requests outside those two
+parts.
 
 ### Before you call it, make sure
 
