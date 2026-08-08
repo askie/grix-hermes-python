@@ -14,11 +14,14 @@ Send a message into a session **as the owner** — it shows up as if the owner
 themselves sent it, **not** as you (the agent).
 
 ```text
-grix_invoke(action="session_send", params={"session_id": "<ID>", "content": "<TEXT>"})
+grix_invoke(action="session_send", params={"session_id": "<ID>", "content": "<TEXT>", "quoted_message_id": "<MSG_ID>"})
 ```
 
 - `session_id` (required) — target session ID.
 - `content` (required) — message text to send as the owner (max 10000 chars).
+- `quoted_message_id` (optional) — message ID in the **same** target session to
+  quote/reply to. Required for dispatch callbacks so the dispatcher is
+  quote-woken.
 
 ### When to use it
 
@@ -31,12 +34,12 @@ session of theirs.
 `grix-agent-dispatch`, follow the skill procedure `report_dispatch_result` in
 that skill (exactly 6 parameters; **not** a tool name and **not** a
 `grix_invoke` action). It formats `content` as **only** the
-`[dispatch-result]` wire block (first line inside the block is
-`@<sender_id>`), and calls this action with
-`session_id` = `callback_session_id`. Do not hand-roll the wire template in
-the task text; if you must call `session_send` directly for a dispatch
-callback, still send **only** that block — no extra instructions,
-explanations, or requests outside it.
+`[dispatch-result]` wire block (no `@` line), and calls this action with
+`session_id` = `callback_session_id` and `quoted_message_id` = the dispatcher
+anchor from the task pointer. Do not hand-roll the wire template in the task
+text; if you must call `session_send` directly for a dispatch callback, still
+send **only** that block plus the quote id — no extra instructions,
+explanations, or requests outside the block.
 
 ### Before you call it, make sure
 

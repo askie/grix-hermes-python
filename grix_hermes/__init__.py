@@ -19,8 +19,9 @@ PLUGIN_SKILLS = {
         "description": (
             "Dispatch one of the owner's other agents to work in a directory "
             "(callback via skill procedure report_dispatch_result / "
-            "[dispatch-result], not a grix_invoke action), and update an "
-            "agent's display name and/or text introduction."
+            "[dispatch-result] via session_send with quoted_message_id, not a "
+            "grix_invoke action), and update an agent's display name and/or "
+            "text introduction."
         ),
         "tools": ["grix_invoke"],
     },
