@@ -314,3 +314,26 @@ def test_unaudited_event_completion_is_noop(tmp_path, monkeypatch):
     assert client.audit_states == []
     assert client.completed == [{"event_id": "ev-plain", "status": "responded", "message": None}]
     assert not (tmp_path / "audit").exists() or not list((tmp_path / "audit").rglob("*.json"))
+
+
+def test_audit_state_msg_id_normalized_or_dropped(tmp_path):
+    """后端 MsgID 是 json:",string" int64 且要求 >0：空串/非数字/"0" 一律省略。"""
+    client = FakeTransportClient()
+    inst = _make_adapter(client, tmp_path / "audit")
+
+    async def _send(payload):
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(client)
+        try:
+            await inst._send_audit_state(payload)
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+
+    asyncio.run(_send({"event_id": "e1", "session_id": "s1", "state": "accepted", "msg_id": "12345"}))
+    asyncio.run(_send({"event_id": "e2", "session_id": "s1", "state": "accepted", "msg_id": ""}))
+    asyncio.run(_send({"event_id": "e3", "session_id": "s1", "state": "accepted", "msg_id": "abc"}))
+    asyncio.run(_send({"event_id": "e4", "session_id": "s1", "state": "accepted", "msg_id": "0"}))
+    asyncio.run(_send({"event_id": "e5", "session_id": "s1", "state": "accepted"}))
+
+    assert client.audit_states[0]["msg_id"] == "12345"
+    for entry in client.audit_states[1:]:
+        assert entry.get("msg_id") is None

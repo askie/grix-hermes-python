@@ -2298,12 +2298,13 @@ class GrixAdapter(BasePlatformAdapter):
         client = self._active_client()
         if client is None or not hasattr(client, "send_audit_state"):
             return
-        # 后端 AuditStatePayload.MsgID 是 `json:",string"` 的 int64：空串/非数字
-        # 会被 4003 拒收。统一归一成数字字符串，否则省略（omitempty）。
+        # 后端 AuditStatePayload.MsgID 是 `json:",string"` 的 int64 且要求 >0：
+        # 空串/非数字/"0" 会被 4003 拒收。统一归一成有效数字字符串，否则省略。
         msg_id = payload.get("msg_id")
         if msg_id is not None:
             normalized = str(msg_id).strip()
-            payload = {**payload, "msg_id": normalized if normalized.isdigit() else None}
+            valid = normalized.isdigit() and int(normalized) > 0
+            payload = {**payload, "msg_id": normalized if valid else None}
         try:
             await client.send_audit_state({**payload, "updated_at": int(time.time() * 1000)})
         except Exception as exc:
