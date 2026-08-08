@@ -285,8 +285,6 @@ class HermesAuditStore:
                 return {"status": "ok", "result": replay["manifest"]}
             if action_type == "audit_list_spans":
                 return self._paged(replay, params, "spans", coordinates)
-            if action_type == "audit_list_tool_calls":
-                return self._paged(replay, params, "tool_calls", coordinates)
             if action_type == "audit_get_content_chunk":
                 return self._content_chunk(replay, params, coordinates)
             raise AuditReplayError(AUDIT_ERROR_CODES["invalid_params"], "Unsupported audit local action")
@@ -333,7 +331,6 @@ class HermesAuditStore:
                     "revision": replay["revision"],
                 }) if more else None,
                 "has_more": more,
-                **({"total": len(replay.get(kind, []))} if kind == "tool_calls" else {}),
             },
         }
 
@@ -530,7 +527,6 @@ class HermesAuditStore:
             "quality": quality,
             "statistics": statistics,
             "spans": spans,
-            "tool_calls": [],
             "content_refs": refs,
             "manifest": {
                 "audit_id": audit_id,
