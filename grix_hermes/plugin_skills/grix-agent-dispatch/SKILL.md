@@ -59,7 +59,7 @@ stable. Chinese example:
 
 ```text
 【完成后必须回写，不要只在本会话收尾】
-1. 调用 session_send（见 grix-owner-relay 技能；没有该技能就直接调 grix_invoke）
+1. 调用 grix_invoke(action="session_send", params={"session_id": "<回调目标会话 id>", "content": "<仅下方结构块>"})（见 grix-owner-relay 技能）
 2. session_id = "<回调目标会话 id（即派发本任务的调度方会话）>"
 3. content 只放下面这个结构块（字段名用 Markdown 加粗），块外不要附加任何文字：
 
@@ -82,7 +82,7 @@ English example (same structure; use when the user conversation is English):
 
 ```text
 [Required callback — do not only wrap up in this session]
-1. Call session_send (see grix-owner-relay; or call grix_invoke directly)
+1. Call grix_invoke(action="session_send", params={"session_id": "<callback target session id>", "content": "<block only>"}) (see grix-owner-relay)
 2. session_id = "<callback target session id (the dispatcher session)>"
 3. Put ONLY the block below in content (bold the field names with Markdown);
    no text outside the block:

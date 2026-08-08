@@ -6,6 +6,8 @@ Hermes grix_invoke action names (dispatch_agent / session_send / chat_state_quer
 
 from pathlib import Path
 
+from grix_hermes import PLUGIN_SKILLS
+
 ROOT = Path(__file__).resolve().parents[1]
 DISPATCH = (
     ROOT / "grix_hermes" / "plugin_skills" / "grix-agent-dispatch" / "SKILL.md"
@@ -17,7 +19,8 @@ OWNER_RELAY = (
 
 def test_requires_callback_protocol_block():
     assert "[dispatch-result]" in DISPATCH
-    assert "session_send" in DISPATCH
+    assert "[/dispatch-result]" in DISPATCH
+    assert 'action="session_send"' in DISPATCH
     assert "never guess a session id" in DISPATCH
     assert "**status**:" in DISPATCH
     assert "**summary**:" in DISPATCH
@@ -35,7 +38,14 @@ def test_defaults_to_event_loop_and_forbids_polling():
 
 def test_keeps_final_result_as_fallback_instead_of_message_history():
     assert "final_result" in DISPATCH
+    assert "stop_reason" in DISPATCH
     assert "Never query message history" in DISPATCH
+
+
+def test_documents_blocked_intermediate_callback():
+    assert "blocked" in DISPATCH
+    assert "waiting_approval" in DISPATCH or "等待审批" in DISPATCH
+    assert "keep this session alive" in DISPATCH or "保持本会话" in DISPATCH
 
 
 def test_states_anti_loop_and_trust_boundary_guardrails():
@@ -53,6 +63,7 @@ def test_uses_hermes_invoke_actions_not_connector_mcp_names():
     assert 'action="dispatch_agent"' in DISPATCH
     assert 'action="agent_introduction_update"' in DISPATCH
     assert 'action="chat_state_query"' in DISPATCH
+    assert 'action="session_send"' in DISPATCH
     # Connector MCP tool names must not leak into Hermes skill bodies.
     assert "grix_dispatch_agent" not in DISPATCH
     assert "grix_agent_update" not in DISPATCH
@@ -67,5 +78,21 @@ def test_supports_agent_name_update():
 
 def test_owner_relay_documents_dispatch_callback_use_case():
     assert "[dispatch-result]" in OWNER_RELAY
-    assert "dispatch callback" in OWNER_RELAY.lower() or "First-class use case: dispatch callback" in OWNER_RELAY
+    assert "First-class use case: dispatch callback" in OWNER_RELAY
     assert 'action="session_send"' in OWNER_RELAY
+
+
+def test_plugin_skills_registration_matches_callback_semantics():
+    dispatch_desc = PLUGIN_SKILLS["grix-agent-dispatch"]["description"]
+    assert "[dispatch-result]" in dispatch_desc
+    assert "display name" in dispatch_desc
+    assert "introduction" in dispatch_desc
+    # Old introduction-only discovery copy must not return.
+    assert dispatch_desc != (
+        "Dispatch one of the owner's agents to work in a directory, "
+        "and update an agent's introduction."
+    )
+
+    relay_desc = PLUGIN_SKILLS["grix-owner-relay"]["description"]
+    assert "dispatch" in relay_desc.lower()
+    assert "[dispatch-result]" in relay_desc
