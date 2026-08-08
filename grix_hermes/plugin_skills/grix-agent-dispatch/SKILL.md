@@ -55,19 +55,33 @@ Every dispatched `task` MUST end with a callback protocol block like this
 section). Write the **wrapper instructions** in the same language as the
 user conversation; keep the `[dispatch-result]` tags and field names
 (`status` / `summary` / `detail` / `session`) unchanged so parsers stay
-stable. Chinese example:
+stable. Put each field **value** in its own ` ```text ` fence (not the whole
+block, and not inline backticks) so rendered bubbles expose a copy button.
+Chinese example:
 
-```text
+````text
 【完成后必须回写，不要只在本会话收尾】
 1. 调用 grix_invoke(action="session_send", params={"session_id": "<回调目标会话 id>", "content": "<仅下方结构块>"})（见 grix-owner-relay 技能）
 2. session_id = "<回调目标会话 id（即派发本任务的调度方会话）>"
-3. content 只放下面这个结构块（字段名用 Markdown 加粗），块外不要附加任何文字：
+3. content 只放下面这个结构块（字段名 Markdown 加粗；每个字段的值各自放进独立的 ```text 代码块，便于气泡里一键复制），块外不要附加任何文字：
 
 [dispatch-result]
-**status**: completed|failed|blocked
-**summary**: <一句话结论>
-**detail**: <关键证据/路径/命令结果，尽量短>
-**session**: <本工作会话 id（你被派来干活的这个会话）>
+**status**:
+```text
+completed|failed|blocked
+```
+**summary**:
+```text
+<一句话结论>
+```
+**detail**:
+```text
+<关键证据/路径/命令结果，尽量短>
+```
+**session**:
+```text
+<本工作会话 id（你被派来干活的这个会话）>
+```
 [/dispatch-result]
 
 要求：
@@ -76,22 +90,35 @@ stable. Chinese example:
 - completed / failed 终态各回写一次，回写成功后本会话可以正常结束。
 - 同一状态不要重复回写。
 - 不要轮询、不要指望我来查你。
-```
+````
 
 English example (same structure; use when the user conversation is English):
 
-```text
+````text
 [Required callback — do not only wrap up in this session]
 1. Call grix_invoke(action="session_send", params={"session_id": "<callback target session id>", "content": "<block only>"}) (see grix-owner-relay)
 2. session_id = "<callback target session id (the dispatcher session)>"
-3. Put ONLY the block below in content (bold the field names with Markdown);
+3. Put ONLY the block below in content (bold field names; put each field
+   value in its own ```text fence so the chat bubble shows a copy button);
    no text outside the block:
 
 [dispatch-result]
-**status**: completed|failed|blocked
-**summary**: <one-line conclusion>
-**detail**: <key evidence/paths/command results, keep short>
-**session**: <this work session id (the session you were dispatched into)>
+**status**:
+```text
+completed|failed|blocked
+```
+**summary**:
+```text
+<one-line conclusion>
+```
+**detail**:
+```text
+<key evidence/paths/command results, keep short>
+```
+**session**:
+```text
+<this work session id (the session you were dispatched into)>
+```
 [/dispatch-result]
 
 Rules:
@@ -102,7 +129,7 @@ Rules:
   session may end normally.
 - Do not write back the same status twice.
 - Do not poll; do not expect me to check on you.
-```
+````
 
 ### Step 3 — end your turn; do NOT poll
 
@@ -175,7 +202,8 @@ local connector/Hermes config entry names.
 4. The `task` body is delivered AS THE OWNER: write it in the owner's
    first-person voice **and in the same language as the current user
    conversation** (title and callback wrapper instructions too; keep
-   `[dispatch-result]` tags/field names fixed), and always append the callback
+   `[dispatch-result]` tags/field names fixed; each field value in its
+   own ```text fence), and always append the callback
    protocol block with your resolved session id. A task without the callback
    block is incomplete.
 5. Default to the event loop: dispatch, end turn, wait for the

@@ -59,6 +59,18 @@ def test_requires_dispatched_task_language_to_match_user_conversation():
     assert "Do not default to Chinese or English" in DISPATCH
 
 
+def test_puts_each_dispatch_result_field_value_in_its_own_text_fence():
+    assert "Put each field **value** in its own" in DISPATCH
+    assert "not inline backticks" in DISPATCH
+    assert "**status**:\n```text\ncompleted|failed|blocked\n```" in DISPATCH
+    assert "**summary**:\n```text\n<一句话结论>\n```" in DISPATCH
+    assert "**detail**:\n```text\n<关键证据/路径/命令结果，尽量短>\n```" in DISPATCH
+    assert (
+        "**session**:\n```text\n<本工作会话 id（你被派来干活的这个会话）>\n```"
+        in DISPATCH
+    )
+
+
 def test_uses_hermes_invoke_actions_not_connector_mcp_names():
     assert 'action="dispatch_agent"' in DISPATCH
     assert 'action="agent_introduction_update"' in DISPATCH
