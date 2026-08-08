@@ -1,7 +1,7 @@
 ---
 name: grix-agent-dispatch
-description: Dispatch one of the owner's other agents to do work in a given directory (`dispatch_agent`), and update an agent's display name and/or text introduction (`agent_introduction_update`), through the Python Hermes tool grix_invoke. Dispatched agents write back via the skill procedure `report_dispatch_result` (not a grix_invoke action; wire format `[dispatch-result]` via `session_send`). Trigger when the user asks to hand a task to another agent, run work in a specific directory via a sibling agent, or rename an agent / change an agent's introduction.
-trigger: 当用户要把任务派发给 owner 名下的另一个 Agent、让某个 Agent 在指定目录干活、或修改某个 Agent 的名字/简介时
+description: Dispatch one of the owner's other agents to do work in a given directory (`dispatch_agent`), and update an agent's display name and/or text introduction (`agent_introduction_update`), through the Python Hermes tool grix_invoke. Dispatched agents write back via the skill procedure `report_dispatch_result` (not a grix_invoke action; wire format `[dispatch-result]` via `session_send`). Trigger when the user asks to hand a task to another agent, run work in a specific directory via a sibling agent, rename an agent / change an agent's introduction, or when you were dispatched and must report via `report_dispatch_result`.
+trigger: 当用户要把任务派发给 owner 名下的另一个 Agent、让某个 Agent 在指定目录干活、修改某个 Agent 的名字/简介时；或当你自己被派发、需按 report_dispatch_result 规程回写时
 ---
 
 # Grix Agent Dispatch
@@ -54,17 +54,21 @@ grix_invoke(action="chat_state_query", params={})
 Every dispatched `task` MUST end with a short pointer to the skill procedure
 `report_dispatch_result` (keep the task body itself in the owner's voice; this
 pointer may be its own section). Write the pointer in the **same language as
-the user conversation**. Pass only `callback_session_id` here — the other four
-parameters are filled by the dispatched agent when it reports. Name it as a
-**procedure** (not a grix_invoke action): the real send is `session_send`.
+the user conversation**. Fill only `callback_session_id` here; **name** the
+other four (`status` / `summary` / `detail` / `work_session_id`) so the
+callee knows them, but leave those values for the dispatched agent to fill
+when it reports. Name it as a **procedure** (not a grix_invoke action): the
+real send is `session_send`.
 
 Chinese example:
 
 ```text
 完成后、或进入 blocked（等待审批/提问）时，按 grix-agent-dispatch 技能规程
-report_dispatch_result 回写（不是工具名/不是 grix_invoke action；共 5 个入参，
+report_dispatch_result 回写（不是工具名/不是 grix_invoke action；共 5 个入参：
+callback_session_id / status / summary / detail / work_session_id；
 底层调 session_send），
-callback_session_id = "<回调目标会话 id（即派发本任务的调度方会话）>"。
+callback_session_id = "<回调目标会话 id（即派发本任务的调度方会话）>"
+（其余 4 个由你回写时填写）。
 不要只在本会话收尾。
 ```
 
@@ -73,9 +77,10 @@ English example (use when the user conversation is English):
 ```text
 When done, or when blocked (waiting for approval/a question), follow the
 grix-agent-dispatch skill procedure report_dispatch_result (not a tool name
-and not a grix_invoke action; exactly 5 parameters; underneath call
-session_send) with
-callback_session_id = "<callback target session id (the dispatcher session)>".
+and not a grix_invoke action; exactly 5 parameters: callback_session_id /
+status / summary / detail / work_session_id; underneath call session_send)
+with callback_session_id = "<callback target session id (the dispatcher
+session)>" (you fill the other four when reporting).
 Do not only wrap up in this session.
 ```
 

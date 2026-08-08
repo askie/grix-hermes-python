@@ -41,12 +41,27 @@ def test_embeds_only_short_callback_pointer_in_dispatched_tasks():
         in DISPATCH
     )
     assert "不是工具名/不是 grix_invoke action" in DISPATCH
+    assert (
+        "共 5 个入参：\ncallback_session_id / status / summary / detail / work_session_id"
+        in DISPATCH
+    )
+    assert "底层调 session_send" in DISPATCH
+    assert "其余 4 个由你回写时填写" in DISPATCH
     assert "when blocked (waiting for approval/a question)" in DISPATCH
+    assert "you fill the other four when reporting" in DISPATCH
     assert "do **not** paste the" in DISPATCH
     assert "`[dispatch-result]` wire template into `task`" in DISPATCH
     # Old long-form task embed must not return.
     assert "【完成后必须回写，不要只在本会话收尾】" not in DISPATCH
     assert "1. 调用 grix_invoke(action=\"session_send\"" not in DISPATCH
+
+
+def test_triggers_for_both_dispatcher_and_dispatched_write_back():
+    assert (
+        "or when you were dispatched and must report via `report_dispatch_result`"
+        in DISPATCH
+    )
+    assert "或当你自己被派发、需按 report_dispatch_result 规程回写时" in DISPATCH
 
 
 def test_keeps_wire_format_inside_report_dispatch_result():
