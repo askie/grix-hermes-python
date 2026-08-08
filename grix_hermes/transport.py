@@ -16,6 +16,7 @@ from .contract import (
     CMD_AGENT_INVOKE_RESULT,
     CMD_AUTH,
     CMD_AUTH_ACK,
+    CMD_AUDIT_STATE,
     CMD_EDIT_MSG,
     CMD_ERROR,
     CMD_EVENT_ACK,
@@ -859,6 +860,13 @@ class GrixTransportClient:
         if extra:
             payload.update(extra)
         await self.send_packet(CMD_EVENT_STATE, payload)
+
+    async def send_audit_state(self, payload: Dict[str, Any]) -> None:
+        """Report audit lifecycle metadata; replay content stays local."""
+        await self.send_packet(
+            CMD_AUDIT_STATE,
+            {key: value for key, value in payload.items() if value is not None},
+        )
 
     async def send_queue_snapshot(
         self,

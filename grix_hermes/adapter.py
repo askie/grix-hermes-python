@@ -28,6 +28,13 @@ from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageTyp
 from gateway.session import build_session_key
 
 from .card_links import build_agent_question_card
+from .audit import (
+    AUDIT_LOCAL_ACTIONS,
+    HermesAuditStore,
+    new_audit_id,
+    new_turn_id,
+    parse_audit_options,
+)
 from .compat import build_card_action_user_text, build_exec_approval_message
 from .exec_command import parse_exec_command, handle_skills_command
 from .question_command import parse_grix_question_command
@@ -240,6 +247,8 @@ class _OwnerState:
     busy_ack_msg_ids: Dict[str, Tuple[str, str, Any]] = field(default_factory=dict)
     tool_progress_msg_ids: Set[str] = field(default_factory=set)
     session_connector_hints: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    audit_sessions: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    audit_turns: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # 正在处理中的任务的最终应答目标（session_key → chat_id / 触发消息 / 事件 / 来源
     # client / 主循环 loop）。grix_reply 工具据此自动补引用并路由回事件来源连接；
     # on_processing_start 写入、on_processing_complete 清除。
@@ -896,6 +905,10 @@ class GrixAdapter(BasePlatformAdapter):
         self._provider_quota: Optional[Dict[str, Any]] = None
         self._provider_quota_sampled_at_ms: int = 0
         self._provider_quota_task: Optional[asyncio.Task] = None
+        # Keep the non-audit path free of audit-store I/O.  The root is only
+        # materialized when the first audit turn or query is actually used.
+        self._audit_storage_root = config.extra.get("audit_storage_root")
+        self._audit_store: Optional[HermesAuditStore] = None
         self._client: Optional[GrixTransportClient] = None
         self._connector = None
         self._disconnect_requested = False
@@ -1029,6 +1042,11 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return None
         return ctx
+
+    def _get_audit_store(self) -> HermesAuditStore:
+        if self._audit_store is None:
+            self._audit_store = HermesAuditStore(self._audit_storage_root)
+        return self._audit_store
 
     def _bind_packet_handler(self, client: GrixTransportClient) -> None:
         """把 packet handler 绑定到 client，回调时携带 client 引用（让 _handle_protocol_packet
@@ -1741,6 +1759,11 @@ class GrixAdapter(BasePlatformAdapter):
 
         await self._enforce_send_rate()
 
+        # 审计只采集最终应答（is_final_reply / notify 标记），过程心跳、工具卡片
+        # 等中间消息不进回放正文，保证 replay 的 final_response 干净可读。
+        audit_session_key = _CURRENT_REPLY_SESSION_KEY.get()
+        audit_capture_final = is_final_reply or (metadata or {}).get("notify") is True
+
         source_hint = self._active_state().latest_sources.get(str(chat_id))
         session_id, thread_id = await resolve_grix_target(
             client,
@@ -1785,6 +1808,8 @@ class GrixAdapter(BasePlatformAdapter):
                     biz_card=biz_card if is_first else None,
                     channel_data=channel_data if is_first else None,
                 )
+                if receipt and receipt.get("ok") and audit_capture_final:
+                    self._capture_audit_output(audit_session_key, chunk)
                 if len(chunks) > 1 and index < len(chunks) - 1:
                     await asyncio.sleep(0.2)
             result = SendResult(
@@ -2269,6 +2294,116 @@ class GrixAdapter(BasePlatformAdapter):
         finally:
             _CURRENT_CLIENT_CTX.reset(token)
 
+    async def _send_audit_state(self, payload: Dict[str, Any]) -> None:
+        client = self._active_client()
+        if client is None or not hasattr(client, "send_audit_state"):
+            return
+        try:
+            await client.send_audit_state({**payload, "updated_at": int(time.time() * 1000)})
+        except Exception as exc:
+            logger.debug("[%s] audit_state send failed: %s", self.name, exc)
+
+    def _capture_audit_output(self, session_key: Optional[str], content: str) -> None:
+        if not session_key or not content:
+            return
+        for turn in self._active_state().audit_turns.values():
+            if turn.get("session_key") == session_key:
+                existing = str(turn.get("output_text") or "")
+                turn["output_text"] = f"{existing}\n{content}" if existing else str(content)
+
+    async def _begin_audit_turn(self, event: MessageEvent, session_key: str) -> None:
+        raw = event.raw_message if isinstance(event.raw_message, dict) else {}
+        parsed = parse_audit_options(raw.get("extra"))
+        if parsed.get("state") != "enabled":
+            return
+        options = parsed["options"]
+        state = self._active_state()
+        session = state.audit_sessions.get(session_key)
+        if options["scope"] == "session" and session is None:
+            session = {"audit_id": new_audit_id(), "options": options}
+            state.audit_sessions[session_key] = session
+        audit_id = session["audit_id"] if session else new_audit_id()
+        turn_id = new_turn_id()
+        turn = {
+            "audit_id": audit_id,
+            "turn_id": turn_id,
+            "session_id": str(raw.get("session_id") or getattr(event.source, "chat_id", "") or ""),
+            "event_id": str(raw.get("event_id") or ""),
+            "session_key": session_key,
+            "msg_id": str(event.message_id or "") or None,
+            "provider": "hermes",
+            "started_at": int(time.time() * 1000),
+            "input_text": str(raw.get("content") or event.text or ""),
+            "output_text": "",
+            "options": options,
+        }
+        state.audit_turns[turn["event_id"]] = turn
+        await self._send_audit_state({
+            "event_id": turn["event_id"],
+            "session_id": turn["session_id"],
+            "state": "accepted",
+            "msg_id": turn["msg_id"],
+            "audit_id": audit_id,
+            "turn_id": turn_id,
+        })
+        await self._send_audit_state({
+            "event_id": turn["event_id"],
+            "session_id": turn["session_id"],
+            "state": "recording",
+            "msg_id": turn["msg_id"],
+            "audit_id": audit_id,
+            "turn_id": turn_id,
+        })
+
+    async def _finish_audit_turn(self, event_id: str, status: str) -> None:
+        turn = self._active_state().audit_turns.pop(event_id, None)
+        if not turn:
+            return
+        await self._send_audit_state({
+            "event_id": event_id,
+            "session_id": turn["session_id"],
+            "state": "finalizing",
+            "msg_id": turn["msg_id"],
+            "audit_id": turn["audit_id"],
+            "turn_id": turn["turn_id"],
+        })
+        try:
+            replay = await asyncio.to_thread(
+                self._get_audit_store().finalize,
+                audit_id=turn["audit_id"],
+                turn_id=turn["turn_id"],
+                session_id=turn["session_id"],
+                event_id=event_id,
+                msg_id=turn["msg_id"],
+                provider=turn["provider"],
+                started_at=turn["started_at"],
+                input_text=turn["input_text"],
+                output_text=turn["output_text"],
+                outcome=status,
+            )
+            await self._send_audit_state({
+                "event_id": event_id,
+                "session_id": turn["session_id"],
+                "state": "partial",
+                "msg_id": turn["msg_id"],
+                "audit_id": turn["audit_id"],
+                "turn_id": turn["turn_id"],
+                "revision": replay["revision"],
+                "quality": replay["quality"]["status"],
+                "truncated": False,
+            })
+        except Exception as exc:
+            await self._send_audit_state({
+                "event_id": event_id,
+                "session_id": turn["session_id"],
+                "state": "failed",
+                "msg_id": turn["msg_id"],
+                "audit_id": turn["audit_id"],
+                "turn_id": turn["turn_id"],
+                "error_code": "audit_finalize_failed",
+                "error_message": str(exc)[:256],
+            })
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
         if raw_message.get("_grix_kind") not in ("message", "card_action"):
@@ -2403,6 +2538,7 @@ class GrixAdapter(BasePlatformAdapter):
         raw_event_id = str(raw_message.get("event_id") or "").strip()
         if raw_event_id and raw_event_id not in running:
             running.append(raw_event_id)
+        await self._begin_audit_turn(event, session_key)
         for eid in running:
             self._discard_open_event(session_key, eid)
         if running:
@@ -3109,6 +3245,10 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return
 
+        if action.action_type in AUDIT_LOCAL_ACTIONS:
+            await self._handle_audit_local_action(action)
+            return
+
         if action.action_type == LOCAL_ACTION_FILE_LIST:
             await self._handle_file_list(action)
             return
@@ -3536,6 +3676,19 @@ class GrixAdapter(BasePlatformAdapter):
         except ImportError:
             return os.path.join(os.path.expanduser("~"), ".hermes")
 
+    async def _handle_audit_local_action(self, action: GrixLocalAction) -> None:
+        client = self._active_client()
+        if client is None:
+            return
+        result = self._get_audit_store().action(action.action_type, action.params)
+        await client.send_local_action_result(
+            action_id=action.action_id,
+            status=result.get("status", STATUS_FAILED),
+            result=result.get("result"),
+            error_code=result.get("error_code"),
+            error_message=result.get("error_msg"),
+        )
+
     async def _start_upgrade_checker(self) -> None:
         try:
             from .upgrade_checker import UpgradeChecker
@@ -3643,6 +3796,29 @@ class GrixAdapter(BasePlatformAdapter):
 
     async def _handle_message_packet(self, payload: Dict[str, Any]) -> None:
         message = normalize_inbound_message(payload)
+        audit_parse = parse_audit_options(payload.get("extra"))
+        if audit_parse.get("error"):
+            client = self._active_client()
+            if client is not None:
+                await client.acknowledge_event(
+                    event_id=message.event_id,
+                    session_id=message.session_id,
+                    message_id=message.message_id,
+                )
+                await client.complete_event(
+                    event_id=message.event_id,
+                    status=STATUS_FAILED,
+                    code="audit_config_invalid",
+                    message=audit_parse["error"],
+                )
+                await self._send_audit_state({
+                    "event_id": message.event_id,
+                    "session_id": message.session_id,
+                    "state": "failed",
+                    "error_code": "audit_config_invalid",
+                    "error_message": audit_parse["error"],
+                })
+            return
         source = self.build_source(
             chat_id=message.session_id,
             chat_name=message.chat_name,
@@ -5521,6 +5697,11 @@ class GrixAdapter(BasePlatformAdapter):
             finally:
                 if own_bucket:
                     self._sync_deliver_bucket = None
+
+        # 审计收口挂在事件终态的统一汇聚点上：无论终态从哪条路径到达
+        # （responded/canceled/failed、shutdown drain、撤回等），都在这里
+        # finalize 本地回放并回传 audit_state 终态；未审计事件 pop 为空操作。
+        await self._finish_audit_turn(event_id, status)
 
         if not self._client or not event_id or event_id in self._active_state().completed_event_ids:
             return

@@ -52,6 +52,7 @@ CMD_EVENT_HOLD_RESULT = "event_hold_result"
 CMD_QUEUE_EDIT = "queue_edit"
 CMD_QUEUE_EDIT_RESULT = "queue_edit_result"
 CMD_EVENT_STATE = "event_state"
+CMD_AUDIT_STATE = "audit_state"
 CMD_QUEUE_SNAPSHOT = "queue_snapshot"
 CMD_QUEUE_SNAPSHOT_QUERY = "queue_snapshot_query"
 
@@ -96,6 +97,7 @@ STABLE_PUBLIC_COMMANDS = (
     {"cmd": CMD_QUEUE_EDIT, "direction": "server_to_client", "purpose": "edit_queued_event_request"},
     {"cmd": CMD_QUEUE_EDIT_RESULT, "direction": "client_to_server", "purpose": "edit_queued_event_result"},
     {"cmd": CMD_EVENT_STATE, "direction": "client_to_server", "purpose": "report_event_state"},
+    {"cmd": CMD_AUDIT_STATE, "direction": "client_to_server", "purpose": "report_audit_lifecycle"},
     {"cmd": CMD_QUEUE_SNAPSHOT, "direction": "client_to_server", "purpose": "report_event_queue_snapshot"},
     {"cmd": CMD_QUEUE_SNAPSHOT_QUERY, "direction": "server_to_client", "purpose": "query_event_queue_snapshot"},
     {"cmd": CMD_EVENT_EDIT, "direction": "server_to_client", "purpose": "message_edit_event"},
@@ -146,6 +148,7 @@ CAP_STREAM_CHUNK = "stream_chunk"
 # stop-token，再升级本 Hermes 版本；勿另起一套协议。
 CAP_EVENT_RESULT_ACK = "event_result_ack"
 CAP_TERMINAL_COMMIT_V1 = "terminal_commit_v1"
+CAP_AUDIT_REPLAY_V2 = "audit_replay_v2"
 
 REQUIRED_AUTH_CAPABILITIES = (CAP_LOCAL_ACTION_V1,)
 STABLE_AUTH_CAPABILITIES = (
@@ -157,6 +160,7 @@ STABLE_AUTH_CAPABILITIES = (
     CAP_AGENT_INVOKE_V1,
     CAP_EVENT_RESULT_ACK,
     CAP_TERMINAL_COMMIT_V1,
+    CAP_AUDIT_REPLAY_V2,
 )
 
 # 本地动作（exec_approve/exec_reject/file_list 与后端 hermesSupportedLocalActions
@@ -172,6 +176,26 @@ LOCAL_ACTION_SKILL_UPLOAD = "skill_upload"  # docs/architecture/39，工具栏�
 LOCAL_ACTION_SKILL_ENABLE = "skill_enable"  # 技能库启用到 Agent v2
 LOCAL_ACTION_SKILL_DISABLE = "skill_disable"
 LOCAL_ACTION_SKILL_REFRESH = "skill_refresh"  # 技能弹窗下拉刷新：重扫并重新上报 skills + library_skills
+LOCAL_ACTION_AUDIT_GET_MANIFEST = "audit_get_manifest"
+LOCAL_ACTION_AUDIT_LIST_SPANS = "audit_list_spans"
+LOCAL_ACTION_AUDIT_LIST_TOOL_CALLS = "audit_list_tool_calls"
+LOCAL_ACTION_AUDIT_GET_CONTENT_CHUNK = "audit_get_content_chunk"
+AUDIT_LOCAL_ACTION_TYPES = (
+    LOCAL_ACTION_AUDIT_GET_MANIFEST,
+    LOCAL_ACTION_AUDIT_LIST_SPANS,
+    LOCAL_ACTION_AUDIT_LIST_TOOL_CALLS,
+    LOCAL_ACTION_AUDIT_GET_CONTENT_CHUNK,
+)
+AUDIT_LOCAL_ACTION_ERROR_CODES = {
+    "invalidParams": "AUDIT_INVALID_PARAMS",
+    "notFound": "AUDIT_NOT_FOUND",
+    "revisionNotFound": "AUDIT_REVISION_NOT_FOUND",
+    "cursorInvalid": "AUDIT_CURSOR_INVALID",
+    "contentForbidden": "AUDIT_CONTENT_FORBIDDEN",
+    "contentNotFound": "AUDIT_CONTENT_NOT_FOUND",
+    "contentCorrupt": "AUDIT_CONTENT_CORRUPT",
+    "internal": "AUDIT_INTERNAL",
+}
 STABLE_LOCAL_ACTIONS = (
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
@@ -184,6 +208,10 @@ STABLE_LOCAL_ACTIONS = (
     LOCAL_ACTION_SKILL_ENABLE,
     LOCAL_ACTION_SKILL_DISABLE,
     LOCAL_ACTION_SKILL_REFRESH,
+    LOCAL_ACTION_AUDIT_GET_MANIFEST,
+    LOCAL_ACTION_AUDIT_LIST_SPANS,
+    LOCAL_ACTION_AUDIT_LIST_TOOL_CALLS,
+    LOCAL_ACTION_AUDIT_GET_CONTENT_CHUNK,
 )
 
 # 状态值
