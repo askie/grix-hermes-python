@@ -13,6 +13,7 @@ from .contract import (
     AIBOT_DEFAULT_CONTRACT_VERSION,
     AIBOT_PROTOCOL_VERSION,
     CAP_EVENT_RESULT_ACK,
+    CAP_SESSION_SEND_QUOTE_V1,
     CAP_TERMINAL_COMMIT_V1,
     REQUIRED_AUTH_CAPABILITIES,
     STABLE_AUTH_CAPABILITIES,
@@ -165,7 +166,8 @@ def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> Gr
     else:
         capabilities = _ensure_names(capabilities, REQUIRED_AUTH_CAPABILITIES)
         capabilities = _ensure_names(
-            capabilities, (CAP_EVENT_RESULT_ACK, CAP_TERMINAL_COMMIT_V1)
+            capabilities,
+            (CAP_EVENT_RESULT_ACK, CAP_TERMINAL_COMMIT_V1, CAP_SESSION_SEND_QUOTE_V1),
         )
 
     local_actions = normalize_names(raw_local_actions)
@@ -338,7 +340,8 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     if capabilities:
         capabilities = _ensure_names(capabilities, REQUIRED_AUTH_CAPABILITIES)
         capabilities = _ensure_names(
-            capabilities, (CAP_EVENT_RESULT_ACK, CAP_TERMINAL_COMMIT_V1)
+            capabilities,
+            (CAP_EVENT_RESULT_ACK, CAP_TERMINAL_COMMIT_V1, CAP_SESSION_SEND_QUOTE_V1),
         )
     else:
         capabilities = list(STABLE_AUTH_CAPABILITIES)

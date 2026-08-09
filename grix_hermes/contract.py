@@ -149,6 +149,10 @@ CAP_STREAM_CHUNK = "stream_chunk"
 CAP_EVENT_RESULT_ACK = "event_result_ack"
 CAP_TERMINAL_COMMIT_V1 = "terminal_commit_v1"
 CAP_AUDIT_REPLAY_V2 = "audit_replay_v2"
+# Rolling-upgrade gate for quote-based report_dispatch_result callbacks.
+# Must stay aligned with aibot AgentAPISessionSendQuoteCapability /
+# grix-connector session_send_quote_v1.
+CAP_SESSION_SEND_QUOTE_V1 = "session_send_quote_v1"
 
 REQUIRED_AUTH_CAPABILITIES = (CAP_LOCAL_ACTION_V1,)
 STABLE_AUTH_CAPABILITIES = (
@@ -161,6 +165,7 @@ STABLE_AUTH_CAPABILITIES = (
     CAP_EVENT_RESULT_ACK,
     CAP_TERMINAL_COMMIT_V1,
     CAP_AUDIT_REPLAY_V2,
+    CAP_SESSION_SEND_QUOTE_V1,
 )
 
 # 本地动作（exec_approve/exec_reject/file_list 与后端 hermesSupportedLocalActions

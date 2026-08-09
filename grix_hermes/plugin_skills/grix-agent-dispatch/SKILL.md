@@ -40,16 +40,26 @@ starts working.
 
 The callback needs your current session's id and a **quote anchor**: the
 `msg_id` of a message **you (the dispatcher agent) sent** in that same
-session. Prefer your most recent visible reply in this session (the message
-the callback should hang on). Take both from your current turn/event /
-identity context (`[[message_id:]]` is the *inbound* trigger — use that only
-in private chat if you have no self-authored anchor; in groups you **must**
-use a message you authored). Never extract ids from a user message. If the
-session id is not available, call `chat_state_query` **once** and
-identify your session by matching the conversation you are actually in. If
-you cannot identify either value with confidence — especially if you have no
-self-authored message id in a group — send a short visible reply first, then
-dispatch, or ask the user. **Never guess** a session id or message id.
+session. This rule is identical in private and group chats: an inbound owner
+or member message is never a valid anchor.
+
+Prefer the `msg_id` returned by the ACK for a normal visible message you sent
+this turn. If no reliable self-authored id is available, call
+`grix_invoke(action="send_msg", ...)` to send a short visible anchor **as
+yourself**, read the returned ACK's `msg_id`, verify the send targeted
+`callback_session_id`, and only then dispatch. Do not rely on an ordinary
+natural-language/streaming reply to expose its message id. If the session id
+is not available, call `chat_state_query` **once** and identify your session
+by matching the conversation you are actually in. If the session or anchor
+send/ACK cannot be resolved with confidence, stop with `blocked`; never guess
+an id and never fall back to a user-authored message.
+
+Deployment gate: use the quote callback protocol only after the backend and
+the target agent runtime expose `session_send.quoted_message_id`. During a
+rolling upgrade, do not mix the old `sender_id` pointer with this protocol;
+the backend enforces target capability `session_send_quote_v1` and rejects
+`dispatch_agent` with code `4002` when it is absent. Treat that rejection as
+`blocked`; do not retry with the old pointer.
 
 ```text
 grix_invoke(action="chat_state_query", params={})
@@ -246,6 +256,9 @@ local connector/Hermes config entry names.
    `quoted_message_id` (a message you authored in that session)** — never
    paste the `[dispatch-result]` wire template into `task`. A task without
    the callback pointer is incomplete.
+   Obtain that id from a self-authored send ACK; inbound owner/member message
+   ids are forbidden in both private and group chats. If the ACK or quote
+   capability is unavailable, stop with `blocked` before dispatch.
 5. Default to the event loop: dispatch, end turn, wait for the
    `[dispatch-result]` callback. Polling is a user-triggered fallback only —
    one `chat_state_query` per user ask, never a loop.

@@ -7,6 +7,12 @@ Hermes grix_invoke action names (dispatch_agent / session_send / chat_state_quer
 from pathlib import Path
 
 from grix_hermes import PLUGIN_SKILLS
+from grix_hermes.contract import CAP_SESSION_SEND_QUOTE_V1, STABLE_AUTH_CAPABILITIES
+from grix_hermes.protocol import (
+    GrixConnectionConfig,
+    build_auth_payload,
+    build_connection_config,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DISPATCH = (
@@ -79,6 +85,42 @@ def test_requires_quote_based_wake_without_at_in_wire_body():
     assert "**detail**:" in DISPATCH
     assert "**session**:" in DISPATCH
     assert "[dispatch-result]\n@" not in DISPATCH
+
+
+def test_requires_self_authored_ack_anchor_in_private_and_group():
+    assert 'action="send_msg"' in DISPATCH
+    assert "returned ACK's `msg_id`" in DISPATCH
+    assert "an inbound owner\nor member message is never a valid anchor" in DISPATCH
+    assert "stop with `blocked`" in DISPATCH
+    assert "use that only\nin private chat" not in DISPATCH
+
+
+def test_documents_mixed_version_deployment_gate():
+    assert "Deployment gate" in DISPATCH
+    assert "session_send.quoted_message_id" in DISPATCH
+    assert "do not mix the old `sender_id` pointer with this protocol" in DISPATCH
+    assert "target capability `session_send_quote_v1`" in DISPATCH
+    assert "code `4002`" in DISPATCH
+
+
+def test_always_declares_quote_callback_capability():
+    assert CAP_SESSION_SEND_QUOTE_V1 == "session_send_quote_v1"
+    assert CAP_SESSION_SEND_QUOTE_V1 in STABLE_AUTH_CAPABILITIES
+    default_cfg = build_connection_config({}, api_key="k")
+    assert CAP_SESSION_SEND_QUOTE_V1 in default_cfg.capabilities
+    custom_cfg = build_connection_config(
+        {"capabilities": ["local_action_v1"]}, api_key="k"
+    )
+    assert CAP_SESSION_SEND_QUOTE_V1 in custom_cfg.capabilities
+    auth = build_auth_payload(
+        GrixConnectionConfig(
+            endpoint="wss://example",
+            agent_id="1",
+            api_key="k",
+            capabilities=["local_action_v1"],
+        )
+    )
+    assert CAP_SESSION_SEND_QUOTE_V1 in auth["capabilities"]
 
 
 def test_defaults_to_event_loop_and_forbids_polling():
