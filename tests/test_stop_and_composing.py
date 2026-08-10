@@ -220,7 +220,33 @@ def test_toolbar_stop_keeps_bg_hold_when_process_kill_fails(monkeypatch):
     _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
 
     assert DM_KEY in inst._state_for("").toolbar_active_work
-    assert inst.confirmations == []
+    assert inst.confirmations == [
+        "⚠️ A background process could not be stopped and is still running. Please try again."
+    ]
+
+
+def test_toolbar_stop_active_turn_reports_partial_failure_and_restores_bg_hold(monkeypatch):
+    """活跃轮次已停但后台 kill 失败时，必须保留运行态并明确提示部分失败。"""
+    client = FakeTransportClient()
+    inst = _prepare_stop_adapter(monkeypatch, client, [DM_KEY])
+    inst._state_for("").toolbar_active_work[DM_KEY] = {
+        "session_id": SESSION_ID,
+        "title": "active turn",
+    }
+    inst._kill_session_bg_processes = lambda session_key: (0, 1)
+
+    _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
+
+    assert inst.stopped_keys == [DM_KEY]
+    assert inst._state_for("").toolbar_active_work[DM_KEY] == {
+        "session_id": SESSION_ID,
+        "title": "active turn",
+        "bg_hold": True,
+    }
+    assert inst.confirmations == [
+        "⚠️ Active task stopped, but a background process is still running. "
+        "Please try stopping again."
+    ]
 
 
 # ── 2. session_key 归属判定 ─────────────────────────────────────────────────

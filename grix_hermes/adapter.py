@@ -3930,27 +3930,34 @@ class GrixAdapter(BasePlatformAdapter):
             )
             stopped_any = False
             for stop_key in stop_keys:
-                # 多路并发时全停，但只给用户一条停止确认。
+                # 多路并发时全停，后台清理完成后再统一给用户一条结果确认。
                 if await self._force_stop_session(
-                    source, stop_key, reply_to=message.message_id, notify=not stopped_any,
+                    source, stop_key, reply_to=message.message_id, notify=False,
                     cleanup_background=False,
                 ):
                     stopped_any = True
-            cleared_bg = await self._cleanup_session_background(
+            cleared_bg, cleanup_failed = await self._cleanup_session_background(
                 message.session_id, cleanup_keys,
             )
-            if cleared_bg and not stopped_any:
-                await self._notify_session_stopped(
+            if cleanup_failed:
+                await self._notify_session_stop_result(
+                    source,
+                    reply_to=message.message_id,
+                    background_failed=True,
+                    active_stopped=stopped_any,
+                )
+            elif stopped_any or cleared_bg:
+                await self._notify_session_stop_result(
                     source, reply_to=message.message_id,
                 )
-                stopped_any = True
             if self._client:
                 await self._complete_event_if_needed(
                     message.event_id, status=STATUS_RESPONDED,
                 )
             logger.info(
-                "[%s] GRIX /stop command handled event_id=%s stopped=%s cleared_bg=%s",
-                self.name, message.event_id, stopped_any, cleared_bg,
+                "[%s] GRIX /stop command handled event_id=%s stopped=%s "
+                "cleared_bg=%s cleanup_failed=%s",
+                self.name, message.event_id, stopped_any, cleared_bg, cleanup_failed,
             )
             return
 
@@ -5537,9 +5544,10 @@ class GrixAdapter(BasePlatformAdapter):
             if cleanup_background:
                 session_id = str(getattr(source, "chat_id", "") or "").strip()
                 if session_id:
-                    return await self._cleanup_session_background(
+                    cleaned, _failed = await self._cleanup_session_background(
                         session_id, [session_key],
                     )
+                    return cleaned
             return False
 
         await self.cancel_session_processing(
@@ -5570,26 +5578,49 @@ class GrixAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+        cleanup_failed = False
         if cleanup_background:
             session_id = str(getattr(source, "chat_id", "") or "").strip()
             if session_id:
-                await self._cleanup_session_background(session_id, [session_key])
+                _cleaned, cleanup_failed = await self._cleanup_session_background(
+                    session_id, [session_key],
+                )
 
         if notify:
-            await self._notify_session_stopped(source, reply_to=reply_to)
+            await self._notify_session_stop_result(
+                source,
+                reply_to=reply_to,
+                background_failed=cleanup_failed,
+                active_stopped=True,
+            )
 
         logger.info("[%s] Locally stopped active GRIX session %s", self.name, session_key)
         return True
 
-    async def _notify_session_stopped(
-        self, source: Any, *, reply_to: Optional[str] = None,
+    async def _notify_session_stop_result(
+        self,
+        source: Any,
+        *,
+        reply_to: Optional[str] = None,
+        background_failed: bool = False,
+        active_stopped: bool = True,
     ) -> None:
         thread_id = getattr(source, "thread_id", None)
         thread_meta = {"thread_id": thread_id} if thread_id else None
+        if background_failed:
+            content = (
+                "⚠️ Active task stopped, but a background process is still running. "
+                "Please try stopping again."
+                if active_stopped
+                else "⚠️ A background process could not be stopped and is still running. "
+                "Please try again."
+            )
+        else:
+            content = "⚡ Stopped. You can continue this session."
         try:
             await self._send_with_retry(
                 chat_id=source.chat_id,
-                content="⚡ Stopped. You can continue this session.",
+                content=content,
                 reply_to=reply_to,
                 metadata=thread_meta,
             )
@@ -5657,6 +5688,9 @@ class GrixAdapter(BasePlatformAdapter):
         key = str(session_key or "").strip()
         if not key:
             return 0, 0
+        known_bg_hold = bool(
+            (self._active_state().toolbar_active_work.get(key) or {}).get("bg_hold")
+        )
         try:
             from tools.process_registry import process_registry
         except Exception as exc:
@@ -5664,7 +5698,7 @@ class GrixAdapter(BasePlatformAdapter):
                 "[%s] stop bg-kill unavailable (process_registry import failed): %s",
                 self.name, exc,
             )
-            return 0, 1
+            return 0, int(known_bg_hold)
         try:
             sessions = process_registry.list_sessions(session_key=key)
         except Exception as exc:
@@ -5672,7 +5706,7 @@ class GrixAdapter(BasePlatformAdapter):
                 "[%s] stop bg-kill list_sessions failed session_key=%s: %s",
                 self.name, key, exc,
             )
-            return 0, 1
+            return 0, int(known_bg_hold)
         resolved = 0
         failed = 0
         for entry in sessions:
@@ -5745,27 +5779,61 @@ class GrixAdapter(BasePlatformAdapter):
         await self._refresh_bg_hold_activity(sid, owner_key, active=False)
         return True
 
+    async def _retain_failed_bg_hold_ui(
+        self, session_id: str, session_keys: List[str], failed_keys: List[str],
+    ) -> None:
+        """终止失败时只保留仍可能运行的 key，并恢复 bg-hold/composing。"""
+        sid = str(session_id or "").strip()
+        failed = {str(key or "").strip() for key in failed_keys if str(key or "").strip()}
+        if not sid or not failed:
+            return
+        owner_key = self._active_owner_key()
+        state = self._state_for(owner_key)
+        for key in session_keys:
+            if key not in failed:
+                state.toolbar_active_work.pop(key, None)
+        for key, work in list(state.toolbar_active_work.items()):
+            if work.get("session_id") == sid and work.get("bg_hold") and key not in failed:
+                state.toolbar_active_work.pop(key, None)
+        for key in failed:
+            prior = state.toolbar_active_work.get(key) or {}
+            state.toolbar_active_work[key] = {
+                "session_id": sid,
+                "title": self._bg_hold_label(key)
+                or prior.get("title")
+                or "Background process still running",
+                "bg_hold": True,
+            }
+        await self._push_queue_snapshot(sid, owner_key)
+        await self._refresh_bg_hold_activity(sid, owner_key, active=True)
+        self._ensure_bg_hold_sweep()
+
     async def _cleanup_session_background(
         self, session_id: str, session_keys: List[str],
-    ) -> bool:
-        """停会话时清理后台进程 + bg-hold UI。有任一清理动作则返回 True。"""
+    ) -> Tuple[bool, bool]:
+        """清理后台进程和 UI，返回 ``(有清理动作, 清理失败)``。"""
         sid = str(session_id or "").strip()
         if not sid:
-            return False
+            return False, False
         resolved = 0
         failed = 0
+        failed_keys: List[str] = []
         for key in session_keys:
             key_resolved, key_failed = self._kill_session_bg_processes(key)
             resolved += key_resolved
             failed += key_failed
+            if key_failed:
+                failed_keys.append(key)
         if failed:
-            # 终止失败时保留 bg-hold 与 composing，不能向前端谎报已经停止。
+            # 取消钩子会清 toolbar 项；终止失败时必须恢复 bg-hold/composing，
+            # 让前端状态与仍在运行的后台进程一致。
+            await self._retain_failed_bg_hold_ui(sid, session_keys, failed_keys)
             logger.warning(
                 "[%s] stop background cleanup incomplete session=%s "
                 "resolved=%s failed=%s keys=%s",
                 self.name, sid, resolved, failed, session_keys,
             )
-            return False
+            return False, True
         cleared = False
         for key in session_keys:
             if await self._clear_bg_hold_ui(key, sid):
@@ -5781,7 +5849,7 @@ class GrixAdapter(BasePlatformAdapter):
                 "cleared_ui=%s keys=%s",
                 self.name, sid, resolved, cleared, session_keys,
             )
-        return bool(resolved or cleared)
+        return bool(resolved or cleared), False
 
     def _resolve_stop_source(self, stop: GrixStopEvent):
         source = self._active_state().latest_sources.get(stop.session_id)
