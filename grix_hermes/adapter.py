@@ -5652,11 +5652,11 @@ class GrixAdapter(BasePlatformAdapter):
                 _add(key)
         return keys
 
-    def _kill_session_bg_processes(self, session_key: str) -> int:
-        """杀掉 process_registry 中挂在该 Hermes session_key 下的后台进程。"""
+    def _kill_session_bg_processes(self, session_key: str) -> Tuple[int, int]:
+        """杀后台进程，返回 ``(已收口数, 失败数)``。"""
         key = str(session_key or "").strip()
         if not key:
-            return 0
+            return 0, 0
         try:
             from tools.process_registry import process_registry
         except Exception as exc:
@@ -5664,7 +5664,7 @@ class GrixAdapter(BasePlatformAdapter):
                 "[%s] stop bg-kill unavailable (process_registry import failed): %s",
                 self.name, exc,
             )
-            return 0
+            return 0, 1
         try:
             sessions = process_registry.list_sessions(session_key=key)
         except Exception as exc:
@@ -5672,13 +5672,20 @@ class GrixAdapter(BasePlatformAdapter):
                 "[%s] stop bg-kill list_sessions failed session_key=%s: %s",
                 self.name, key, exc,
             )
-            return 0
-        killed = 0
+            return 0, 1
+        resolved = 0
+        failed = 0
         for entry in sessions:
             if not isinstance(entry, dict) or entry.get("status") != "running":
                 continue
             proc_id = str(entry.get("session_id") or "").strip()
             if not proc_id:
+                failed += 1
+                logger.warning(
+                    "[%s] stop bg-kill ignored running entry without session_id "
+                    "session_key=%s",
+                    self.name, key,
+                )
                 continue
             try:
                 result = process_registry.kill_process(proc_id, source="grix_stop")
@@ -5691,21 +5698,30 @@ class GrixAdapter(BasePlatformAdapter):
                         "[%s] stop bg-kill failed proc=%s session_key=%s: %s",
                         self.name, proc_id, key, exc,
                     )
+                    failed += 1
                     continue
             except Exception as exc:
                 logger.warning(
                     "[%s] stop bg-kill failed proc=%s session_key=%s: %s",
                     self.name, proc_id, key, exc,
                 )
+                failed += 1
                 continue
-            status = str((result or {}).get("status") or "")
-            if status in ("killed", "already_exited"):
-                killed += 1
+            status = str(result.get("status") or "") if isinstance(result, dict) else ""
+            if status in ("killed", "already_exited", "not_found"):
+                resolved += 1
                 logger.info(
                     "[%s] stop bg-kill proc=%s status=%s session_key=%s",
                     self.name, proc_id, status, key,
                 )
-        return killed
+                continue
+            failed += 1
+            error = result.get("error") if isinstance(result, dict) else repr(result)
+            logger.warning(
+                "[%s] stop bg-kill rejected proc=%s status=%s session_key=%s error=%s",
+                self.name, proc_id, status or "invalid_result", key, error,
+            )
+        return resolved, failed
 
     async def _clear_bg_hold_ui(self, session_key: str, session_id: str) -> bool:
         """清掉该会话相关的 bg-hold 虚拟 running 与 composing。"""
@@ -5736,24 +5752,36 @@ class GrixAdapter(BasePlatformAdapter):
         sid = str(session_id or "").strip()
         if not sid:
             return False
-        killed = 0
+        resolved = 0
+        failed = 0
         for key in session_keys:
-            killed += self._kill_session_bg_processes(key)
+            key_resolved, key_failed = self._kill_session_bg_processes(key)
+            resolved += key_resolved
+            failed += key_failed
+        if failed:
+            # 终止失败时保留 bg-hold 与 composing，不能向前端谎报已经停止。
+            logger.warning(
+                "[%s] stop background cleanup incomplete session=%s "
+                "resolved=%s failed=%s keys=%s",
+                self.name, sid, resolved, failed, session_keys,
+            )
+            return False
         cleared = False
         for key in session_keys:
             if await self._clear_bg_hold_ui(key, sid):
                 cleared = True
-        if killed and not cleared:
+        if resolved and not cleared:
             # 进程已杀但 toolbar 无记录：仍推空快照，清前端残留虚拟 running。
             owner_key = self._active_owner_key()
             await self._push_queue_snapshot(sid, owner_key)
             await self._refresh_bg_hold_activity(sid, owner_key, active=False)
-        if killed or cleared:
+        if resolved or cleared:
             logger.info(
-                "[%s] stop background cleanup session=%s killed=%s cleared_ui=%s keys=%s",
-                self.name, sid, killed, cleared, session_keys,
+                "[%s] stop background cleanup session=%s resolved=%s "
+                "cleared_ui=%s keys=%s",
+                self.name, sid, resolved, cleared, session_keys,
             )
-        return bool(killed or cleared)
+        return bool(resolved or cleared)
 
     def _resolve_stop_source(self, stop: GrixStopEvent):
         source = self._active_state().latest_sources.get(stop.session_id)

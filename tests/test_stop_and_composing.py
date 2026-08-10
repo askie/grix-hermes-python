@@ -154,7 +154,7 @@ def test_toolbar_stop_clears_bg_hold_when_no_active_turn(monkeypatch):
 
     def _kill(session_key):
         inst.killed_keys.append(session_key)
-        return 1
+        return 1, 0
 
     inst._kill_session_bg_processes = _kill
 
@@ -180,7 +180,7 @@ def test_toolbar_stop_kills_bg_even_with_active_turn(monkeypatch):
     }
     inst.killed_keys = []
     inst._kill_session_bg_processes = lambda session_key: (
-        inst.killed_keys.append(session_key) or 1
+        inst.killed_keys.append(session_key) or (1, 0)
     )
 
     _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
@@ -195,7 +195,7 @@ def test_toolbar_stop_does_not_confirm_when_nothing_to_clear(monkeypatch):
     """无活跃轮次、无 bg-hold、无后台进程：不发停止确认。"""
     client = FakeTransportClient()
     inst = _prepare_stop_adapter(monkeypatch, client, [])
-    inst._kill_session_bg_processes = lambda session_key: 0
+    inst._kill_session_bg_processes = lambda session_key: (0, 0)
 
     _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
 
@@ -204,6 +204,23 @@ def test_toolbar_stop_does_not_confirm_when_nothing_to_clear(monkeypatch):
     assert client.completed == [
         {"event_id": "toolbar_cmd_1784293963630321971", "status": "responded", "message": None}
     ]
+
+
+def test_toolbar_stop_keeps_bg_hold_when_process_kill_fails(monkeypatch):
+    """后台进程终止失败时不能清 UI 或谎报停止成功。"""
+    client = FakeTransportClient()
+    inst = _prepare_stop_adapter(monkeypatch, client, [])
+    inst._state_for("").toolbar_active_work[DM_KEY] = {
+        "session_id": SESSION_ID,
+        "title": "node dist/grix.js",
+        "bg_hold": True,
+    }
+    inst._kill_session_bg_processes = lambda session_key: (0, 1)
+
+    _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
+
+    assert DM_KEY in inst._state_for("").toolbar_active_work
+    assert inst.confirmations == []
 
 
 # ── 2. session_key 归属判定 ─────────────────────────────────────────────────
