@@ -3688,12 +3688,25 @@ class GrixAdapter(BasePlatformAdapter):
         if client is None:
             return
         result = self._get_audit_store().action(action.action_type, action.params)
+        status = result.get("status", STATUS_FAILED)
+        error_code = result.get("error_code")
+        error_message = result.get("error_msg")
+        if status == STATUS_FAILED:
+            logger.warning(
+                "[%s] audit local_action failed action_type=%s action_id=%s "
+                "error_code=%s error_msg=%s",
+                self.name,
+                action.action_type,
+                action.action_id,
+                error_code,
+                error_message,
+            )
         await client.send_local_action_result(
             action_id=action.action_id,
-            status=result.get("status", STATUS_FAILED),
+            status=status,
             result=result.get("result"),
-            error_code=result.get("error_code"),
-            error_message=result.get("error_msg"),
+            error_code=error_code,
+            error_message=error_message,
         )
 
     async def _start_upgrade_checker(self) -> None:

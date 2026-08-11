@@ -12,12 +12,21 @@ from .compat import sanitize_card_action_tag
 from .contract import (
     AIBOT_DEFAULT_CONTRACT_VERSION,
     AIBOT_PROTOCOL_VERSION,
+    CAP_AUDIT_REPLAY_V2,
     CAP_EVENT_RESULT_ACK,
     CAP_SESSION_SEND_QUOTE_V1,
     CAP_TERMINAL_COMMIT_V1,
     REQUIRED_AUTH_CAPABILITIES,
     STABLE_AUTH_CAPABILITIES,
     STABLE_LOCAL_ACTIONS,
+)
+
+# Connector withRequiredCapabilities always appends these on every auth handshake.
+_FORCED_AUTH_CAPABILITIES = (
+    CAP_EVENT_RESULT_ACK,
+    CAP_TERMINAL_COMMIT_V1,
+    CAP_AUDIT_REPLAY_V2,
+    CAP_SESSION_SEND_QUOTE_V1,
 )
 
 DEFAULT_HEARTBEAT_SEC = 30
@@ -165,10 +174,7 @@ def build_connection_config(extra: Dict[str, Any], api_key: Optional[str]) -> Gr
         capabilities = list(STABLE_AUTH_CAPABILITIES)
     else:
         capabilities = _ensure_names(capabilities, REQUIRED_AUTH_CAPABILITIES)
-        capabilities = _ensure_names(
-            capabilities,
-            (CAP_EVENT_RESULT_ACK, CAP_TERMINAL_COMMIT_V1, CAP_SESSION_SEND_QUOTE_V1),
-        )
+        capabilities = _ensure_names(capabilities, _FORCED_AUTH_CAPABILITIES)
 
     local_actions = normalize_names(raw_local_actions)
     if not local_actions:
@@ -339,10 +345,7 @@ def build_auth_payload(config: GrixConnectionConfig) -> Dict[str, Any]:
     local_actions = normalize_names(config.local_actions)
     if capabilities:
         capabilities = _ensure_names(capabilities, REQUIRED_AUTH_CAPABILITIES)
-        capabilities = _ensure_names(
-            capabilities,
-            (CAP_EVENT_RESULT_ACK, CAP_TERMINAL_COMMIT_V1, CAP_SESSION_SEND_QUOTE_V1),
-        )
+        capabilities = _ensure_names(capabilities, _FORCED_AUTH_CAPABILITIES)
     else:
         capabilities = list(STABLE_AUTH_CAPABILITIES)
     if local_actions:

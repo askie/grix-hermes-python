@@ -101,6 +101,101 @@ def _bool(value: Any, field: str, fallback: bool) -> tuple[Optional[bool], Optio
     return value, None
 
 
+def _coerce_int(value: Any) -> Optional[int]:
+    """Accept JSON numbers the way connector ``parseInteger`` + ``Number.isSafeInteger`` do.
+
+    Connector rejects non-numbers (including digit strings). Python JSON may decode
+    whole values as ``float`` (``1.0``), so those are accepted; bools are rejected
+    because ``isinstance(True, int)`` is true in Python.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if abs(value) <= 2**53 else None
+    if isinstance(value, float) and value.is_integer():
+        as_int = int(value)
+        return as_int if abs(as_int) <= 2**53 else None
+    return None
+
+
+def _normalize_usage_input_wire(usage_input: Any) -> Any:
+    """Map legacy snake_case cache_* keys onto connector wire camelCase."""
+    if not isinstance(usage_input, dict):
+        return usage_input
+    out = dict(usage_input)
+    for camel, snake in (("cacheRead", "cache_read"), ("cacheWrite", "cache_write")):
+        if out.get(camel) is None and snake in out:
+            out[camel] = out[snake]
+        out.pop(snake, None)
+    return out
+
+
+def _prepare_wire_replay(replay: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize on-disk replays to the connector wire shape before serving.
+
+    Older Hermes writes used snake_case usage nests and only a ``turn`` span.
+    The App timeline is driven by ``llm_request`` / ``tool_call`` children, so
+    synthesize a reconstructed llm_request under the turn when missing.
+    """
+    statistics = replay.get("statistics")
+    if not isinstance(statistics, dict):
+        statistics = {}
+        replay["statistics"] = statistics
+
+    total_usage = statistics.get("total_usage")
+    if isinstance(total_usage, dict) and "input" in total_usage:
+        total_usage["input"] = _normalize_usage_input_wire(total_usage.get("input"))
+
+    spans = list(replay.get("spans") or [])
+    has_llm = any(isinstance(span, dict) and span.get("kind") == "llm_request" for span in spans)
+    turn = next(
+        (span for span in spans if isinstance(span, dict) and span.get("kind") == "turn"),
+        None,
+    )
+    if not has_llm and turn is not None:
+        turn_id = turn.get("turn_id") or replay.get("turn_id") or "turn"
+        llm_span = {
+            **turn,
+            "span_id": f"{turn_id}:llm",
+            "parent_span_id": turn.get("span_id"),
+            "kind": "llm_request",
+            "name": "Hermes model turn (reconstructed)",
+            "sequence": 1,
+        }
+        spans = spans + [llm_span]
+        replay["spans"] = spans
+        statistics["span_count"] = len(spans)
+        span_counts = list(statistics.get("span_counts") or [])
+        if not any(isinstance(row, dict) and row.get("kind") == "llm_request" for row in span_counts):
+            span_counts.append({
+                "kind": "llm_request",
+                "name": "Hermes model turn (reconstructed)",
+                "count": 1,
+            })
+        statistics["span_counts"] = span_counts
+        statistics["llm_request_count"] = max(int(statistics.get("llm_request_count") or 0), 1)
+        llm_requests = list(statistics.get("llm_requests") or [])
+        if not llm_requests:
+            llm_requests.append({
+                "span_id": llm_span["span_id"],
+                "name": llm_span["name"],
+                "sequence": llm_span.get("sequence", 1),
+                "started_at": llm_span.get("started_at"),
+                "ended_at": llm_span.get("ended_at"),
+                "duration_ms": llm_span.get("duration_ms"),
+                "status": llm_span.get("status"),
+            })
+        statistics["llm_requests"] = llm_requests
+
+    manifest = replay.get("manifest")
+    if isinstance(manifest, dict):
+        manifest["statistics"] = statistics
+        if spans:
+            manifest["has_spans"] = True
+
+    return replay
+
+
 def parse_audit_options(extra: Any) -> Dict[str, Any]:
     """Parse the connector audit option shape, including nested ``extra``."""
     raw = _record(extra)
@@ -269,10 +364,11 @@ class HermesAuditStore:
                 raise AuditReplayError(AUDIT_ERROR_CODES["invalid_params"], f"{field} is required")
             result[field] = value.strip()
         revision = record.get("revision")
-        if revision is not None and (not isinstance(revision, int) or isinstance(revision, bool) or revision < 1):
-            raise AuditReplayError(AUDIT_ERROR_CODES["invalid_params"], "revision is invalid")
         if revision is not None:
-            result["revision"] = revision
+            coerced = _coerce_int(revision)
+            if coerced is None or coerced < 1:
+                raise AuditReplayError(AUDIT_ERROR_CODES["invalid_params"], "revision is invalid")
+            result["revision"] = coerced
         return result
 
     def action(self, action_type: str, params: Any) -> Dict[str, Any]:
@@ -281,6 +377,7 @@ class HermesAuditStore:
             replay = self._load(coordinates["audit_id"], coordinates["turn_id"], coordinates.get("revision"))
             if replay.get("session_id") != coordinates["session_id"]:
                 raise AuditReplayError(AUDIT_ERROR_CODES["not_found"], "Audit turn was not found for this session")
+            replay = _prepare_wire_replay(replay)
             if action_type == "audit_get_manifest":
                 return {"status": "ok", "result": replay["manifest"]}
             if action_type == "audit_list_spans":
@@ -302,8 +399,10 @@ class HermesAuditStore:
     ) -> Dict[str, Any]:
         record = _record(params) or {}
         limit = record.get("limit", 100)
-        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+        coerced_limit = _coerce_int(limit)
+        if coerced_limit is None or not 1 <= coerced_limit <= 200:
             raise AuditReplayError(AUDIT_ERROR_CODES["invalid_params"], "limit is invalid")
+        limit = coerced_limit
         cursor = _untoken(record.get("cursor"))
         if record.get("cursor") not in (None, "") and (
             cursor is None
@@ -346,8 +445,10 @@ class HermesAuditStore:
         if not isinstance(content_id, str) or content_id not in refs:
             raise AuditReplayError(AUDIT_ERROR_CODES["content_forbidden"], "Requested content does not belong to this audit turn")
         max_bytes = record.get("max_bytes", 131072)
-        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or not 4 <= max_bytes <= 131072:
+        coerced_max = _coerce_int(max_bytes)
+        if coerced_max is None or not 4 <= coerced_max <= 131072:
             raise AuditReplayError(AUDIT_ERROR_CODES["invalid_params"], "max_bytes is invalid")
+        max_bytes = coerced_max
         raw = refs[content_id].encode("utf-8")
         if hashlib.sha256(raw).hexdigest() != content_id:
             raise AuditReplayError(
@@ -434,23 +535,49 @@ class HermesAuditStore:
             refs[output_id] = output_text
         input_ref = _content_ref(input_id, "user_input", input_text) if input_text else None
         output_ref = _content_ref(output_id, "final_response", output_text) if output_text else None
-        spans = [{
-            "span_id": f"{turn_id}:turn",
-            "trace_id": audit_id,
-            "turn_id": turn_id,
-            "session_id": session_id,
-            "kind": "turn",
-            "name": "Hermes audited turn",
-            "sequence": 0,
-            "status": outcome,
-            "started_at": _iso(started_at),
-            "ended_at": _iso(now),
-            "duration_ms": max(0, now - started_at),
-            "input_refs": [input_ref] if input_ref else [],
-            "output_refs": [output_ref] if output_ref else [],
-            "provider": {"provider": provider, "native_ids": {}},
-            "provenance": dict(PROVENANCE),
-        }]
+        turn_span_id = f"{turn_id}:turn"
+        llm_span_id = f"{turn_id}:llm"
+        duration_ms = max(0, now - started_at)
+        # App timeline is built around llm_request/tool_call nodes. Hermes has no
+        # provider logs, so emit one reconstructed llm_request under the turn so
+        # the detail page is not an empty shell of zeros with a single turn row.
+        spans = [
+            {
+                "span_id": turn_span_id,
+                "trace_id": audit_id,
+                "turn_id": turn_id,
+                "session_id": session_id,
+                "kind": "turn",
+                "name": "Hermes audited turn",
+                "sequence": 0,
+                "status": outcome,
+                "started_at": _iso(started_at),
+                "ended_at": _iso(now),
+                "duration_ms": duration_ms,
+                "input_refs": [input_ref] if input_ref else [],
+                "output_refs": [output_ref] if output_ref else [],
+                "provider": {"provider": provider, "native_ids": {}},
+                "provenance": dict(PROVENANCE),
+            },
+            {
+                "span_id": llm_span_id,
+                "trace_id": audit_id,
+                "turn_id": turn_id,
+                "session_id": session_id,
+                "parent_span_id": turn_span_id,
+                "kind": "llm_request",
+                "name": "Hermes model turn (reconstructed)",
+                "sequence": 1,
+                "status": outcome,
+                "started_at": _iso(started_at),
+                "ended_at": _iso(now),
+                "duration_ms": duration_ms,
+                "input_refs": [input_ref] if input_ref else [],
+                "output_refs": [output_ref] if output_ref else [],
+                "provider": {"provider": provider, "native_ids": {}},
+                "provenance": dict(PROVENANCE),
+            },
+        ]
         # 缺失证据必须显式标注，原因枚举与 connector CaptureGap 对齐。
         gaps = [
             {"category": "tool_calls", "reason": "source_log_missing"},
@@ -482,17 +609,30 @@ class HermesAuditStore:
             "raw_request_capture": raw_api_capture,
             "gaps": gaps,
         }
+        # Nested usage keys follow connector wire DTOs (TS interface spread):
+        # cacheRead/cacheWrite camelCase; top-level total_processed snake_case.
         statistics = {
-            "span_count": 1,
-            "span_counts": [{"kind": "turn", "name": "Hermes audited turn", "count": 1}],
-            "llm_request_count": 0,
+            "span_count": 2,
+            "span_counts": [
+                {"kind": "turn", "name": "Hermes audited turn", "count": 1},
+                {"kind": "llm_request", "name": "Hermes model turn (reconstructed)", "count": 1},
+            ],
+            "llm_request_count": 1,
             "tool_call_count": 0,
             "tool_calls_complete_count": 0,
             "tool_call_status_counts": {},
             "tool_calls_returned_count": 0,
             "tool_calls_has_more": False,
             "subagent_call_count": 0,
-            "llm_requests": [],
+            "llm_requests": [{
+                "span_id": llm_span_id,
+                "name": "Hermes model turn (reconstructed)",
+                "sequence": 1,
+                "started_at": _iso(started_at),
+                "ended_at": _iso(now),
+                "duration_ms": duration_ms,
+                "status": outcome,
+            }],
             "tool_calls": [],
             "input_token_attribution": {
                 "accuracy": "estimated_from_captured_content_refs",
@@ -505,14 +645,24 @@ class HermesAuditStore:
                         "boundary and adapter-observed text are replayed.",
             },
             "total_usage": {
-                "input": {"total": 0, "uncached": None, "cache_read": None, "cache_write": None, "other": None},
+                "input": {
+                    "total": 0,
+                    "uncached": None,
+                    "cacheRead": None,
+                    "cacheWrite": None,
+                    "other": None,
+                },
                 "output": {"total": 0, "reasoning": None, "visible": None},
                 "total_processed": 0,
                 "request_count": 0,
                 "accuracy": "estimated",
                 "completeness": "partial",
                 "provider": provider,
-                "normalization": {"adapter": "hermes", "version": 1, "formula": "provider usage unavailable"},
+                "normalization": {
+                    "adapter": "hermes",
+                    "version": 1,
+                    "formula": "provider usage unavailable",
+                },
             },
         }
         replay = {
