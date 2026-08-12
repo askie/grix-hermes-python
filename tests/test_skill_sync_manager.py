@@ -1,7 +1,8 @@
 """SkillSyncManager（进程级按 owner 分桶的技能同步，docs/architecture/38）单元测试。
 
 覆盖：同 owner 多 adapter 共享一个 syncer 且聚合凭证、重复注册幂等、异 owner
-各自独立台账、on_change 按 owner 扇出、unregister 至零停 syncer、trigger 透传。
+各自独立台账、on_change 按 owner 扇出、unregister 至零停 syncer、trigger 透传、
+锁外 start 不串行化并发注册、start 期间注销的兜底停止、桶 key 与台账同名净化。
 """
 
 import asyncio
@@ -184,3 +185,103 @@ def test_owner_manifest_file_sanitizes_unsafe_chars():
     assert owner_manifest_file("42") == ".grix-sync-42.json"
     assert "/" not in owner_manifest_file("../evil")
     assert ".." not in owner_manifest_file("../evil")
+
+
+def test_concurrent_registers_start_in_parallel_not_serialized():
+    """锁外 start：多 owner 同时注册不被 manager 锁串行化（22 agent 重连场景）。"""
+    async def run():
+        events: List[Tuple[str, str]] = []
+        gate = asyncio.Event()
+
+        class SlowSyncer(FakeSyncer):
+            async def start(self):
+                self.started += 1
+                events.append(("begin", self.manifest_file))
+                await gate.wait()
+                events.append(("end", self.manifest_file))
+
+        created: List[SlowSyncer] = []
+
+        def factory(credentials, manifest_file, on_change):
+            syncer = SlowSyncer(credentials, manifest_file, on_change)
+            created.append(syncer)
+            return syncer
+
+        manager = SkillSyncManager(syncer_factory=factory)
+        regs = [
+            asyncio.ensure_future(
+                manager.register(
+                    object(), owner_id=str(i), endpoint=f"ws://h/{i}",
+                    api_key="k", on_change=noop_on_change(),
+                )
+            )
+            for i in range(3)
+        ]
+        # 让三个 register 都越过锁进入 start。锁内 start 的话此刻只有首个 begin。
+        await asyncio.sleep(0.05)
+        assert [e[0] for e in events] == ["begin", "begin", "begin"]
+        gate.set()
+        await asyncio.gather(*regs)
+        assert all(s.started == 1 for s in created)
+        assert len(created) == 3
+
+    asyncio.run(run())
+
+
+def test_unregister_during_start_stops_syncer_no_leak():
+    """start 期间最后一个 adapter 注销：start 完成后兜底再停，轮询不泄漏。"""
+    async def run():
+        gate = asyncio.Event()
+
+        class SlowSyncer(FakeSyncer):
+            async def start(self):
+                self.started += 1
+                await gate.wait()
+
+        created: List[SlowSyncer] = []
+
+        def factory(credentials, manifest_file, on_change):
+            syncer = SlowSyncer(credentials, manifest_file, on_change)
+            created.append(syncer)
+            return syncer
+
+        manager = SkillSyncManager(syncer_factory=factory)
+        adapter = object()
+        reg = asyncio.ensure_future(
+            manager.register(
+                adapter, owner_id="7", endpoint="ws://h/1",
+                api_key="k", on_change=noop_on_change(),
+            )
+        )
+        await asyncio.sleep(0.05)  # start 卡在 gate（模拟首轮同步在途）
+        await manager.unregister(adapter)  # 桶删、停一次
+        assert manager._buckets == {}
+        gate.set()
+        await reg
+        # unregister 停一次 + register 收尾发现桶已删兜底再停一次。
+        assert created[0].stopped == 2
+        assert manager._buckets == {}
+
+    asyncio.run(run())
+
+
+def test_sanitized_owner_key_shared_bucket_and_trigger():
+    """桶 key 与台账文件名用同一净化值：净化后相同的 owner_id 共享一桶。"""
+    async def run():
+        manager, created = make_manager()
+        await manager.register(
+            object(), owner_id="a/b", endpoint="ws://h/1", api_key="k1", on_change=noop_on_change()
+        )
+        await manager.register(
+            object(), owner_id="a?b", endpoint="ws://h/2", api_key="k2", on_change=noop_on_change()
+        )
+        # 两者净化后同为 a_b：同一桶一个 syncer、一份台账（避免桶分开但台账同名互覆）。
+        assert len(created) == 1
+        assert created[0].manifest_file == ".grix-sync-a_b.json"
+        assert created[0].credentials == [("ws://h/1", "k1"), ("ws://h/2", "k2")]
+        # trigger 用原始/净化值都命中同一桶。
+        manager.trigger("a/b")
+        manager.trigger("a?b")
+        assert created[0].triggers == 2
+
+    asyncio.run(run())

@@ -25,6 +25,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -119,6 +120,7 @@ class SkillSyncer:
     async def start(self) -> None:
         self._stopped = False
         self._maybe_migrate()
+        self._adopt_legacy_manifest()
         try:
             await self.sync_once()
         except Exception as exc:
@@ -153,6 +155,44 @@ class SkillSyncer:
             migrate_legacy_hermes_library(library_dir=self._skills_dir)
         except Exception as exc:
             logger.warning("[skill-sync] legacy migrate failed: %s", exc)
+
+    def _adopt_legacy_manifest(self) -> None:
+        """收养旧版 .grix-sync.json 台账（owner 隔离前的存量），并删除旧文件。
+
+        仅本 syncer 使用 owner 隔离台账（manifest_file 非旧文件名）时生效。
+        旧台账若滞留：其引用会让"平台已删除"的技能在合并读取（library/enable/
+        sync-state）下永久可见、目录因跨台账删除保护永不清理，且 glob 排序使
+        旧台账后读覆盖同名新条目。首个 start 的 owner syncer 把旧台账整体收下：
+        本 owner 远端仍在的技能下一轮 digest 命中无需重拉；误收他 owner 的条目
+        代价有界——摘条目（其目录仍有他 owner 台账引用保护），至多一次重拉。
+        migrate_legacy_hermes_library 迁入库目录的旧文件名台账也经此处被收养。
+        """
+        if self._manifest_file == MANIFEST_FILE:
+            return
+        legacy = self._skills_dir / MANIFEST_FILE
+        own = self._skills_dir / self._manifest_file
+        try:
+            if not legacy.exists():
+                return
+            if not own.exists():
+                # 本 owner 尚无台账：直接改名收养。os.replace 原子，多 owner
+                # 并发 start 时只有一个改得成，其余拿 FileNotFoundError 跳过。
+                os.replace(legacy, own)
+                logger.info("[skill-sync] adopted legacy manifest -> %s", own)
+                return
+            # 本 owner 已有台账：旧条目只补缺（不覆盖新数据），然后删旧文件。
+            parsed = json.loads(legacy.read_text(encoding="utf-8"))
+            skills = parsed.get("skills") if isinstance(parsed, dict) else None
+            if isinstance(skills, dict) and skills:
+                manifest = self._read_manifest()
+                for name, entry in skills.items():
+                    if isinstance(entry, dict):
+                        manifest["skills"].setdefault(name, entry)
+                self._write_manifest(manifest)
+            legacy.unlink()
+            logger.info("[skill-sync] merged legacy manifest into %s and removed it", own)
+        except Exception as exc:
+            logger.warning("[skill-sync] adopt legacy manifest failed: %s", exc)
 
     async def _loop(self) -> None:
         try:
@@ -351,9 +391,18 @@ class SkillSyncer:
         return {"skills": {}}
 
     def _write_manifest(self, manifest: Dict[str, Any]) -> None:
-        (self._skills_dir / self._manifest_file).write_text(
+        """原子写台账：先写同目录临时文件再 rename。
+
+        跨台账删除保护（_dir_shared_by_others）与合并读取会扫这些文件，直接
+        write_text 的截断窗口内可能读到半个 JSON 被当成"无引用"而误删目录。
+        临时文件名不以 .json 结尾，不会被 .grix-sync*.json 匹配式扫到。
+        """
+        target = self._skills_dir / self._manifest_file
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        os.replace(tmp, target)
 
 
 def _log_task_error(task: "asyncio.Task[Any]") -> None:

@@ -4,16 +4,19 @@
 首次同步落盘、digest 不变不重拉、平台删除清理、不可达不删本地、
 非法名净化与碰撞哈希、缺 content 字段跳过、触发补轮、stop 清位。
 owner 级改造新增：多凭证取首个可达、台账无变化不写盘不回调、
-digest 命中回填后不振荡、跨 owner 台账隔离与删除保护。
+digest 命中回填后不振荡、跨 owner 台账隔离与删除保护、
+owner syncer 首次 start 收养并删除旧版 .grix-sync.json、台账原子写。
 """
 
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -536,27 +539,139 @@ def test_cross_owner_manifests_isolated_no_mutual_delete():
         assert not (tmp / "shared").exists()
 
 
-def test_legacy_manifest_reference_protects_dir():
-    """旧版 .grix-sync.json 仍引用的目录，新台账 syncer 不得删。"""
+def test_legacy_manifest_adopted_on_first_start_and_removed():
+    """owner syncer 首次 start 收养旧 .grix-sync.json（改名）并删除旧文件。
+
+    旧台账滞留会让平台已删除的技能在合并读取（library/enable/sync-state）
+    下永久可见、目录因跨台账删除保护永不清理——删除语义在存量机器失效。
+    """
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         (tmp / "x").mkdir()
         (tmp / "x" / "SKILL.md").write_text("c", encoding="utf-8")
-        # 旧版台账（升级前/connector 写入）引用目录 x。
+        # 旧版台账（升级前写入）引用目录 x；平台侧该技能已删除。
         (tmp / ".grix-sync.json").write_text(
             json.dumps({"skills": {"legacy": {"id": "1", "version": "1", "digest": "d", "dir": "x"}}}),
             encoding="utf-8",
         )
-        # 某 owner 的台账也记着同目录技能；平台侧已删除 → 摘条目但目录须保留。
-        (tmp / ".grix-sync-9.json").write_text(
-            json.dumps({"skills": {"mine": {"id": "2", "version": "1", "digest": "d", "dir": "x"}}}),
-            encoding="utf-8",
-        )
-        s = SkillSyncer(
-            [(ENDPOINT, "k9")], skills_dir=tmp, fetch_json=make_fetch([], {}),
-            manifest_file=".grix-sync-9.json",
-        )
-        asyncio.run(s.sync_once())
+
+        async def scenario():
+            s = SkillSyncer(
+                [(ENDPOINT, "k9")], skills_dir=tmp, fetch_json=make_fetch([], {}),
+                manifest_file=".grix-sync-9.json",
+            )
+            await s.start()
+            s.stop()
+
+        asyncio.run(scenario())
+        # 旧文件已消亡；收养条目并入本 owner 台账后，本轮远端为空 → 摘条目并
+        # 清掉不再被任何台账引用的目录。
+        assert not (tmp / ".grix-sync.json").exists()
         m9 = json.loads((tmp / ".grix-sync-9.json").read_text(encoding="utf-8"))
         assert m9["skills"] == {}
-        assert (tmp / "x" / "SKILL.md").exists()
+        assert not (tmp / "x").exists()
+
+
+def test_adopted_entry_digest_hit_no_refetch():
+    """收养的条目 digest 命中远端：直接沿用目录，无需重拉 content。"""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        (tmp / "a").mkdir()
+        (tmp / "a" / "SKILL.md").write_text("c1", encoding="utf-8")
+        (tmp / ".grix-sync.json").write_text(
+            json.dumps({"skills": {"a": {"id": "10", "version": "1", "digest": "d1", "dir": "a"}}}),
+            encoding="utf-8",
+        )
+        fetch = make_fetch(
+            [{"id": "10", "name": "a", "version": "1", "digest": "d1"}], {"10": "c1"}
+        )
+
+        async def scenario():
+            s = SkillSyncer(
+                [(ENDPOINT, "k9")], skills_dir=tmp, fetch_json=fetch,
+                manifest_file=".grix-sync-9.json",
+            )
+            await s.start()
+            s.stop()
+
+        asyncio.run(scenario())
+        assert not (tmp / ".grix-sync.json").exists()
+        m9 = json.loads((tmp / ".grix-sync-9.json").read_text(encoding="utf-8"))
+        assert m9["skills"]["a"]["digest"] == "d1"
+        # 只拉了清单，没有拉 content。
+        assert fetch.calls and all("/content" not in u for u in fetch.calls)
+        assert (tmp / "a" / "SKILL.md").read_text(encoding="utf-8") == "c1"
+
+
+def test_adoption_merge_keeps_own_entry_and_bounds_foreign_cost():
+    """本 owner 已有台账时合并收养：旧条目只补缺不覆盖新数据；误收他 owner
+    条目的代价有界——摘条目时其目录仍受他 owner 台账引用保护，不会被误删。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        (tmp / "m").mkdir()
+        (tmp / "m" / "SKILL.md").write_text("mine", encoding="utf-8")
+        (tmp / "y").mkdir()
+        (tmp / "y" / "SKILL.md").write_text("theirs", encoding="utf-8")
+        # 旧台账：含与本 owner 同名但 digest 陈旧的条目，以及他 owner 的条目。
+        (tmp / ".grix-sync.json").write_text(
+            json.dumps({"skills": {
+                "mine": {"id": "1", "version": "0", "digest": "stale", "dir": "m"},
+                "yours": {"id": "2", "version": "1", "digest": "d2", "dir": "y"},
+            }}),
+            encoding="utf-8",
+        )
+        # 本 owner（9）的新台账已有 mine 的最新条目。
+        (tmp / ".grix-sync-9.json").write_text(
+            json.dumps({"skills": {
+                "mine": {"id": "1", "version": "1", "digest": "d1", "dir": "m"},
+            }}),
+            encoding="utf-8",
+        )
+        # 他 owner（2）的台账仍引用目录 y。
+        (tmp / ".grix-sync-2.json").write_text(
+            json.dumps({"skills": {
+                "theirs": {"id": "20", "version": "1", "digest": "d2", "dir": "y"},
+            }}),
+            encoding="utf-8",
+        )
+        # owner 9 远端只有 mine。
+        fetch = make_fetch(
+            [{"id": "1", "name": "mine", "version": "1", "digest": "d1"}], {"1": "mine"}
+        )
+
+        async def scenario():
+            s = SkillSyncer(
+                [(ENDPOINT, "k9")], skills_dir=tmp, fetch_json=fetch,
+                manifest_file=".grix-sync-9.json",
+            )
+            await s.start()
+            s.stop()
+
+        asyncio.run(scenario())
+        assert not (tmp / ".grix-sync.json").exists()
+        m9 = json.loads((tmp / ".grix-sync-9.json").read_text(encoding="utf-8"))
+        # 同名条目保留新台账数据（旧台账 digest 未覆盖）；误收条目已摘除。
+        assert m9["skills"]["mine"]["digest"] == "d1"
+        assert "yours" not in m9["skills"]
+        # 目录 y 仍被他 owner 台账引用 → 只摘条目不删目录。
+        assert (tmp / "y" / "SKILL.md").read_text(encoding="utf-8") == "theirs"
+
+
+def test_write_manifest_atomic_via_tmp_and_rename():
+    """台账原子写：临时文件 + os.replace，无 tmp 残留、glob 只命中正式台账。"""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        s = new_syncer(tmp, make_fetch([], {}))
+        with mock.patch(
+            "grix_hermes.skill_syncer.os.replace", wraps=os.replace
+        ) as replace_spy:
+            s._write_manifest({"skills": {"a": {"id": "1", "digest": "d", "dir": "a"}}})
+        assert replace_spy.called
+        src, dst = replace_spy.call_args[0]
+        # 临时文件与正式台账同目录；临时名不以 .json 结尾，不会被扫描命中。
+        assert str(src).endswith(".grix-sync.json.tmp")
+        assert str(dst).endswith(".grix-sync.json")
+        assert [p.name for p in tmp.glob(".grix-sync*")] == [".grix-sync.json"]
+        written = json.loads((tmp / ".grix-sync.json").read_text(encoding="utf-8"))
+        assert written["skills"]["a"]["digest"] == "d"

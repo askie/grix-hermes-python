@@ -12,7 +12,8 @@ pickReachable）；台账按 owner 隔离为 ``.grix-sync-<owner_id>.json``。�
 回调该 owner 所有已注册 adapter 的 on_change（真实变更很罕见，不做单 reporter
 去重，不依赖服务端扇入行为）。
 
-假设运行在同一事件循环；register/unregister 用 asyncio.Lock 串行化。
+假设运行在同一事件循环；register/unregister 的桶登记用 asyncio.Lock 串行化，
+syncer.start（含首轮同步）在锁外执行，多 agent 同时重连互不阻塞。
 """
 
 from __future__ import annotations
@@ -35,10 +36,18 @@ OnChange = Callable[[], Awaitable[None]]
 SyncerFactory = Callable[[List[Credential], str, OnChange], SkillSyncer]
 
 
+def sanitize_owner_id(owner_id: str) -> str:
+    """owner_id 净化值（来自服务端 auth_ack，防御性净化）。
+
+    桶 key 与台账文件名统一用它：避免净化碰撞（如 "a/b" 与 "a?b"）时桶按
+    原始值分开、台账文件却同名互相覆盖。
+    """
+    return _OWNER_ID_UNSAFE.sub("_", str(owner_id).strip())
+
+
 def owner_manifest_file(owner_id: str) -> str:
-    """按 owner 隔离的台账文件名（owner_id 来自服务端 auth_ack，防御性净化）。"""
-    safe = _OWNER_ID_UNSAFE.sub("_", str(owner_id).strip())
-    return f".grix-sync-{safe}.json"
+    """按 owner 隔离的台账文件名。"""
+    return f".grix-sync-{sanitize_owner_id(owner_id)}.json"
 
 
 class _OwnerBucket:
@@ -78,9 +87,11 @@ class SkillSyncManager:
         """把 adapter 登记进其 owner 的桶；首个注册启动 syncer。
 
         以 adapter 实例为 key，幂等：connect() 重入（宿主重连）重复注册只更新
-        回调与凭证，不会起第二个 syncer。
+        回调与凭证，不会起第二个 syncer。锁内只做建桶/登记，syncer.start（含
+        首轮同步，每凭证 15s 超时）在锁外 await——多 agent 同时重连不被串行化。
         """
-        owner_key = str(owner_id).strip()
+        owner_key = sanitize_owner_id(owner_id)
+        start_syncer: Optional[SkillSyncer] = None
         async with self._lock:
             bucket = self._buckets.get(owner_key)
             if bucket is None:
@@ -93,14 +104,24 @@ class SkillSyncManager:
                 bucket.syncer = self._syncer_factory(
                     creds, owner_manifest_file(owner_key), self._make_dispatch(bucket)
                 )
-                await bucket.syncer.start()
-                logger.info(
-                    "[skill-sync] owner=%s syncer started (%d adapter(s))",
-                    owner_key,
-                    len(bucket.adapters),
-                )
+                start_syncer = bucket.syncer
             else:
                 bucket.syncer.update_credentials(creds)
+        if start_syncer is None:
+            return
+        await start_syncer.start()
+        async with self._lock:
+            # start 期间最后一个 adapter 可能已 unregister：桶被整个删掉（或同
+            # owner 重新注册换了新桶）。unregister 已停过该 syncer 一次，但 start
+            # 尾声才建起轮询 task，这里兜底再停一次（幂等），杜绝泄漏。
+            if self._buckets.get(owner_key) is not bucket:
+                start_syncer.stop()
+                return
+            logger.info(
+                "[skill-sync] owner=%s syncer started (%d adapter(s))",
+                owner_key,
+                len(bucket.adapters),
+            )
 
     async def unregister(self, adapter: Any) -> None:
         """注销 adapter；其 owner 桶空时停止 syncer 并清理。"""
@@ -121,7 +142,7 @@ class SkillSyncManager:
 
     def trigger(self, owner_id: str) -> None:
         """skill_sync 下行指令：触发该 owner 立即补一轮（透传 syncer.trigger_sync()）。"""
-        bucket = self._buckets.get(str(owner_id).strip())
+        bucket = self._buckets.get(sanitize_owner_id(owner_id))
         if bucket is not None and bucket.syncer is not None:
             bucket.syncer.trigger_sync()
 
