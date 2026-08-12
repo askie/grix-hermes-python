@@ -66,7 +66,7 @@ CMD_KICKED = "kicked"
 
 # 技能库变更提醒（beta 契约，docs/architecture/38 §6.2）：后端 → 主连接下行，
 # 载荷 {owner_id: str, name?: str, version?: str}（name/version 仅供日志观测）。
-# 收到即触发 SkillSyncer 立即下拉同步；轮询兜底仍在。
+# 这是技能同步的主通道：收到即触发 SkillSyncer 立即下拉；6h 周期同步仅作丢事件兜底。
 CMD_SKILL_SYNC = "skill_sync"
 
 # auth_ack 错误码：agent 已删除或不存在（fatal，应永久停止重连；与 connector 语义一致）。

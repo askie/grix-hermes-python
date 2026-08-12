@@ -3101,7 +3101,7 @@ class GrixAdapter(BasePlatformAdapter):
             elif cmd == CMD_KICKED:
                 await self._handle_kicked_packet(payload, source_client)
             elif cmd == CMD_SKILL_SYNC:
-                # 技能库变更提醒：立即触发本机下拉同步（轮询兜底仍在）。
+                # 技能库变更提醒（事件主通道）：立即触发本机下拉同步；6h 周期同步兜底。
                 sync_owner = str(payload.get("owner_id") or "").strip()
                 logger.info(
                     "[%s] skill_sync received owner=%s name=%s",

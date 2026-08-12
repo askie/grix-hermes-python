@@ -21,9 +21,18 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from grix_hermes.skill_syncer import SkillSyncer, safe_dir_name  # noqa: E402
+from grix_hermes.skill_syncer import (  # noqa: E402
+    DEFAULT_INTERVAL_S,
+    SkillSyncer,
+    safe_dir_name,
+)
 
 ENDPOINT = "ws://127.0.0.1:27189/v1/agent-api/ws?agent_id=1"
+
+
+def test_default_interval_is_six_hour_safety_net():
+    """事件驱动改造：周期同步只是丢事件兜底，默认 6h 而非分钟级轮询。"""
+    assert DEFAULT_INTERVAL_S == 6 * 3600
 
 
 def make_fetch(list_items: List[Dict[str, Any]], contents: Dict[str, str]):
@@ -312,7 +321,7 @@ def test_dir_rule_migration_cleans_old_dir():
 
 
 def test_unchanged_manifest_skips_write_and_on_change():
-    """台账无变化：不写盘、不触发 on_change（防每分钟轮询扇出全量上报）。"""
+    """台账无变化：不写盘、不触发 on_change（防周期同步扇出全量上报）。"""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         hits = []

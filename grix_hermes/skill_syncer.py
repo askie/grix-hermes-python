@@ -36,7 +36,10 @@ from .upgrade_checker import ws_to_http
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_INTERVAL_S = 60
+# 技能同步以事件驱动为主：平台 skill_sync 下行触发 trigger_sync 立即补拉，
+# connect 首轮 sync_once 对齐离线期变更。周期循环只是防丢事件的低频安全网
+#（长连接下 Redis 广播万一丢失时的自愈手段），6h 一次、流量可忽略。
+DEFAULT_INTERVAL_S = 6 * 3600
 REQUEST_TIMEOUT_S = 15
 
 # (endpoint, api_key) 凭证对；一台机器上同 owner 多个 agent 的凭证聚成列表，
@@ -102,7 +105,7 @@ class SkillSyncer:
         self._interval_s = interval_s
         self._fetch_json = fetch_json or _default_fetch_json
         # 仅当同步台账真变化后回调（对齐 connector manifestChanged 语义）：
-        # 相同清单的分钟轮询不得放大为每个 adapter 一次全量 skills 上报。
+        # 相同清单的周期同步不得放大为每个 adapter 一次全量 skills 上报。
         self._on_change = on_change
         # 台账文件名：默认旧版 .grix-sync.json；SkillSyncManager 按 owner 传
         # .grix-sync-<owner_id>.json 实现多 owner 隔离。
@@ -220,7 +223,7 @@ class SkillSyncer:
 
             self._skills_dir.mkdir(parents=True, exist_ok=True)
             manifest = self._read_manifest()
-            # 台账前后快照比对：无实际变化则不写盘、不回调（防每分钟全量上报扇出）。
+            # 台账前后快照比对：无实际变化则不写盘、不回调（防周期同步扇出全量上报）。
             manifest_before = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
             remote_names = {s["name"] for s in remote}
 
@@ -232,7 +235,7 @@ class SkillSyncer:
                     owner_id = str(owner_id)
                 if local and local.get("digest") == s.get("digest"):
                     # digest 命中：仅当 id/version/owner_id/system 真变化才改写条目
-                    # （对齐 connector）——否则每分钟把缺失字段盖来盖去会让 JSON
+                    # （对齐 connector）——否则每轮把缺失字段盖来盖去会让 JSON
                     # 振荡，manifest_changed 恒为 true，扇出全量 agent_skills_update。
                     # digest 相同也必须回填 owner_id/system（升级前存量台账可能缺
                     # 字段），否则平台系统技能（owner_id=0）会长期可被 enable。
