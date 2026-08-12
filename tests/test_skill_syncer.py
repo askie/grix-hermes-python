@@ -3,6 +3,8 @@
 与 grix-connector tests/skill-syncer.test.ts 的覆盖面逐条对齐：
 首次同步落盘、digest 不变不重拉、平台删除清理、不可达不删本地、
 非法名净化与碰撞哈希、缺 content 字段跳过、触发补轮、stop 清位。
+owner 级改造新增：多凭证取首个可达、台账无变化不写盘不回调、
+digest 命中回填后不振荡、跨 owner 台账隔离与删除保护。
 """
 
 import asyncio
@@ -40,7 +42,7 @@ def make_fetch(list_items: List[Dict[str, Any]], contents: Dict[str, str]):
 
 
 def new_syncer(tmp: Path, fetch, **kw) -> SkillSyncer:
-    return SkillSyncer(ENDPOINT, "k", skills_dir=tmp, fetch_json=fetch, **kw)
+    return SkillSyncer([(ENDPOINT, "k")], skills_dir=tmp, fetch_json=fetch, **kw)
 
 
 def read_manifest(tmp: Path) -> Dict[str, Any]:
@@ -306,10 +308,12 @@ def test_dir_rule_migration_cleans_old_dir():
         assert not old_dir.exists()
 
 
-def test_on_change_fires_on_every_successful_sync():
+def test_unchanged_manifest_skips_write_and_on_change():
+    """台账无变化：不写盘、不触发 on_change（防每分钟轮询扇出全量上报）。"""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         hits = []
+        writes = []
 
         async def on_change():
             hits.append(1)
@@ -318,11 +322,27 @@ def test_on_change_fires_on_every_successful_sync():
             [{"id": "10", "name": "a", "version": "1", "digest": "d1"}], {"10": "c1"}
         )
         s = new_syncer(tmp, fetch, on_change=on_change)
+        orig_write = s._write_manifest
+
+        def spy_write(manifest):
+            writes.append(1)
+            orig_write(manifest)
+
+        s._write_manifest = spy_write
         asyncio.run(s.sync_once())
-        assert hits == [1]
-        # 第二轮无内容变化也回调（对齐 connector onSyncSuccess / library_skills 刷新）。
+        assert hits == [1] and writes == [1]
+        # 第二轮清单完全相同：不写盘、不回调。
         asyncio.run(s.sync_once())
-        assert hits == [1, 1]
+        assert hits == [1] and writes == [1]
+        # 第三轮元数据真变化（version 升、digest 不变）：写盘 + 回调。
+        fetch2 = make_fetch(
+            [{"id": "10", "name": "a", "version": "2", "digest": "d1"}], {"10": "c1"}
+        )
+        s2 = new_syncer(tmp, fetch2, on_change=on_change)
+        s2._write_manifest = spy_write
+        asyncio.run(s2.sync_once())
+        assert hits == [1, 1] and writes == [1, 1]
+        assert read_manifest(tmp)["skills"]["a"]["version"] == "2"
 
 
 def test_digest_hit_backfills_owner_id_and_system():
@@ -358,3 +378,185 @@ def test_numeric_owner_id_zero_marks_system():
         m = read_manifest(tmp)
         assert m["skills"]["a"]["owner_id"] == "0"
         assert m["skills"]["a"]["system"] is True
+
+
+def test_digest_hit_backfill_then_stable_no_oscillation():
+    """存量台账缺 owner_id/system：首轮回填一次，下轮不再判变化（不振荡）。"""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        (tmp / "a").mkdir()
+        (tmp / "a" / "SKILL.md").write_text("c1", encoding="utf-8")
+        (tmp / ".grix-sync.json").write_text(
+            json.dumps({"skills": {"a": {"id": "10", "version": "1", "digest": "d1", "dir": "a"}}}),
+            encoding="utf-8",
+        )
+        hits = []
+        writes = []
+
+        async def on_change():
+            hits.append(1)
+
+        fetch = make_fetch(
+            [{"id": "10", "name": "a", "version": "1", "digest": "d1", "owner_id": "0"}],
+            {"10": "c1"},
+        )
+        s = new_syncer(tmp, fetch, on_change=on_change)
+        orig_write = s._write_manifest
+
+        def spy_write(manifest):
+            writes.append(1)
+            orig_write(manifest)
+
+        s._write_manifest = spy_write
+        asyncio.run(s.sync_once())
+        m = read_manifest(tmp)
+        assert m["skills"]["a"]["owner_id"] == "0"
+        assert m["skills"]["a"]["system"] is True
+        assert writes == [1] and hits == [1]
+        # 第二轮字段已齐：不再写盘、不再回调；digest 命中不拉 content。
+        asyncio.run(s.sync_once())
+        assert writes == [1] and hits == [1]
+        assert all("/content" not in u for u in fetch.calls)
+
+
+def test_pick_first_reachable_credential():
+    """多凭证：首个不可达时取下一个；全部不可达则跳过本轮、不动本地。"""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        tried = []
+
+        async def fetch(url: str, api_key: str):
+            tried.append(api_key)
+            if api_key == "bad":
+                return None
+            if url.endswith("/v1/agent-api/skills"):
+                return {"code": 0, "data": {"items": [
+                    {"id": "10", "name": "a", "version": "1", "digest": "d1"},
+                ]}}
+            return {"code": 0, "data": {"content": "c1"}}
+
+        s = SkillSyncer(
+            [(ENDPOINT, "bad"), (ENDPOINT, "good")], skills_dir=tmp, fetch_json=fetch
+        )
+        asyncio.run(s.sync_once())
+        assert tried[:2] == ["bad", "good"]
+        assert (tmp / "a" / "SKILL.md").read_text(encoding="utf-8") == "c1"
+
+        async def unreachable(url: str, api_key: str):
+            return None
+
+        s2 = SkillSyncer(
+            [(ENDPOINT, "bad"), (ENDPOINT, "also-bad")], skills_dir=tmp, fetch_json=unreachable
+        )
+        asyncio.run(s2.sync_once())
+        assert (tmp / "a" / "SKILL.md").exists()
+        assert read_manifest(tmp)["skills"]["a"]["digest"] == "d1"
+
+
+def test_update_credentials_takes_effect_next_round():
+    """运行期更新凭证（manager 增删 agent）：下一轮用新凭证拉取。"""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+
+        async def unreachable(url: str, api_key: str):
+            return None
+
+        s = SkillSyncer([(ENDPOINT, "bad")], skills_dir=tmp, fetch_json=unreachable)
+        asyncio.run(s.sync_once())
+        assert not (tmp / "a").exists()
+
+        tried = []
+
+        async def fetch(url: str, api_key: str):
+            tried.append(api_key)
+            if url.endswith("/v1/agent-api/skills"):
+                return {"code": 0, "data": {"items": [
+                    {"id": "10", "name": "a", "version": "1", "digest": "d1"},
+                ]}}
+            return {"code": 0, "data": {"content": "c1"}}
+
+        s._fetch_json = fetch
+        s.update_credentials([(ENDPOINT, "good")])
+        asyncio.run(s.sync_once())
+        assert (tmp / "a" / "SKILL.md").exists()
+        assert tried and all(k == "good" for k in tried)
+        assert read_manifest(tmp)["skills"]["a"]["digest"] == "d1"
+
+
+def test_cross_owner_manifests_isolated_no_mutual_delete():
+    """多 owner 共用库目录：各自独立台账；删目录前校验其它 owner 台账引用。
+
+    复现线上互删场景的防护：owner B 的台账仍引用某目录时，owner A 摘条目不删目录。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        fetch_a = make_fetch(
+            [{"id": "10", "name": "shared", "version": "1", "digest": "d1", "owner_id": "1"}],
+            {"10": "from-a"},
+        )
+        fetch_b = make_fetch(
+            [{"id": "20", "name": "shared", "version": "1", "digest": "d2", "owner_id": "2"}],
+            {"20": "from-b"},
+        )
+        sa = SkillSyncer(
+            [(ENDPOINT, "ka")], skills_dir=tmp, fetch_json=fetch_a,
+            manifest_file=".grix-sync-1.json",
+        )
+        sb = SkillSyncer(
+            [(ENDPOINT, "kb")], skills_dir=tmp, fetch_json=fetch_b,
+            manifest_file=".grix-sync-2.json",
+        )
+        asyncio.run(sa.sync_once())
+        asyncio.run(sb.sync_once())
+        # 各自独立台账；同名技能共享同一目录、后写覆盖（已知限制）。
+        ma = json.loads((tmp / ".grix-sync-1.json").read_text(encoding="utf-8"))
+        mb = json.loads((tmp / ".grix-sync-2.json").read_text(encoding="utf-8"))
+        assert ma["skills"]["shared"]["owner_id"] == "1"
+        assert mb["skills"]["shared"]["owner_id"] == "2"
+        assert (tmp / "shared" / "SKILL.md").read_text(encoding="utf-8") == "from-b"
+
+        # owner A 平台删掉该技能：A 摘条目，但 B 的台账仍引用该目录 → 目录保留。
+        sa2 = SkillSyncer(
+            [(ENDPOINT, "ka")], skills_dir=tmp, fetch_json=make_fetch([], {}),
+            manifest_file=".grix-sync-1.json",
+        )
+        asyncio.run(sa2.sync_once())
+        ma2 = json.loads((tmp / ".grix-sync-1.json").read_text(encoding="utf-8"))
+        assert ma2["skills"] == {}
+        assert (tmp / "shared" / "SKILL.md").exists()
+        mb2 = json.loads((tmp / ".grix-sync-2.json").read_text(encoding="utf-8"))
+        assert "shared" in mb2["skills"]
+
+        # owner B 也删掉后：无任何台账引用，目录才被清掉。
+        sb2 = SkillSyncer(
+            [(ENDPOINT, "kb")], skills_dir=tmp, fetch_json=make_fetch([], {}),
+            manifest_file=".grix-sync-2.json",
+        )
+        asyncio.run(sb2.sync_once())
+        assert not (tmp / "shared").exists()
+
+
+def test_legacy_manifest_reference_protects_dir():
+    """旧版 .grix-sync.json 仍引用的目录，新台账 syncer 不得删。"""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        (tmp / "x").mkdir()
+        (tmp / "x" / "SKILL.md").write_text("c", encoding="utf-8")
+        # 旧版台账（升级前/connector 写入）引用目录 x。
+        (tmp / ".grix-sync.json").write_text(
+            json.dumps({"skills": {"legacy": {"id": "1", "version": "1", "digest": "d", "dir": "x"}}}),
+            encoding="utf-8",
+        )
+        # 某 owner 的台账也记着同目录技能；平台侧已删除 → 摘条目但目录须保留。
+        (tmp / ".grix-sync-9.json").write_text(
+            json.dumps({"skills": {"mine": {"id": "2", "version": "1", "digest": "d", "dir": "x"}}}),
+            encoding="utf-8",
+        )
+        s = SkillSyncer(
+            [(ENDPOINT, "k9")], skills_dir=tmp, fetch_json=make_fetch([], {}),
+            manifest_file=".grix-sync-9.json",
+        )
+        asyncio.run(s.sync_once())
+        m9 = json.loads((tmp / ".grix-sync-9.json").read_text(encoding="utf-8"))
+        assert m9["skills"] == {}
+        assert (tmp / "x" / "SKILL.md").exists()

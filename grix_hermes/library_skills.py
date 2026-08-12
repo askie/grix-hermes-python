@@ -8,21 +8,12 @@ from typing import Any, Dict, List, Optional
 from .exec_command import _parse_skill_frontmatter
 from .skill_enable import compute_enable_scope, is_system_skill_entry
 from .skill_enable_roots import resolve_enable_roots
-from .skill_paths import MANIFEST_FILE, resolve_library_skills_dir
+from .skill_paths import read_merged_manifest_skills, resolve_library_skills_dir
 
 
 def _read_manifest(skills_dir: Path) -> Dict[str, dict]:
-    try:
-        import json
-
-        raw = (skills_dir / MANIFEST_FILE).read_text(encoding="utf-8")
-        parsed = json.loads(raw)
-        skills = parsed.get("skills") if isinstance(parsed, dict) else None
-        if isinstance(skills, dict):
-            return {k: v for k, v in skills.items() if isinstance(v, dict)}
-    except Exception:
-        pass
-    return {}
+    # 合并全部 owner 的同步台账（.grix-sync*.json）：库上报对多 owner 技能取并集。
+    return read_merged_manifest_skills(skills_dir)
 
 
 def _read_description(skills_dir: Path, dir_name: str) -> str:

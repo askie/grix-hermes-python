@@ -127,6 +127,9 @@ class GrixAuthSession:
     protocol: Optional[str] = None
     supported_capabilities: tuple[str, ...] = ()
     ack_policy: Optional[Dict[str, Any]] = None
+    # 字符串化 int64（aibot AuthAckPayload.OwnerID json:"owner_id,string,omitempty"），
+    # 旧服务端可能不携带；SkillSyncManager 按它给技能同步分桶。
+    owner_id: Optional[str] = None
 
 
 @dataclass
@@ -233,6 +236,11 @@ class GrixTransportClient:
     @property
     def ack_policy(self) -> Optional[Dict[str, Any]]:
         return dict(self._ack_policy) if self._ack_policy else None
+
+    @property
+    def owner_id(self) -> Optional[str]:
+        """auth_ack 携带的 owner_id（未连接或旧服务端未下发时为 None）。"""
+        return self._auth_session.owner_id if self._auth_session else None
 
     @property
     def is_ready_for_outbound(self) -> bool:
@@ -401,11 +409,15 @@ class GrixTransportClient:
                 self._ack_policy.get("timeout_action", "default"),
             )
 
+        raw_owner_id = payload.get("owner_id")
+        owner_id = str(raw_owner_id).strip() if raw_owner_id is not None else ""
+
         auth_session = GrixAuthSession(
             heartbeat_sec=parse_heartbeat_sec(payload),
             protocol=(str(payload.get("protocol") or "").strip() or None),
             supported_capabilities=tuple(sorted(negotiated)),
             ack_policy=self._ack_policy,
+            owner_id=owner_id or None,
         )
         self._update_status({"authed": True, "last_error": None})
         return auth_session

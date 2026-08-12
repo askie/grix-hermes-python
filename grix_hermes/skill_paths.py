@@ -11,12 +11,43 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 GRIX_HOME_ENV = "GRIX_CONNECTOR_HOME"
 MANIFEST_FILE = ".grix-sync.json"
+
+# 技能目录下所有同步台账的匹配式：旧版 .grix-sync.json + 按 owner 隔离的
+# .grix-sync-<owner_id>.json（多 owner 宿主机每 owner 一份，见 skill_sync_manager）。
+OWNER_MANIFEST_GLOB = ".grix-sync*.json"
+
+
+def read_merged_manifest_skills(skills_dir: Path) -> Dict[str, dict]:
+    """合并读取技能目录下所有同步台账的技能条目（name -> entry）。
+
+    多 owner 机器上每个 owner 一份台账；消费方（library_skills / skill_enable /
+    skill_sync_state）看到的是全部平台同步技能的并集。同名技能（多 owner 各自
+    拥有）后读到的覆盖先读到的——与同步器"同名共享目录、后写覆盖"的已知限制
+    一致。单份损坏只跳过该份，不影响其它台账。
+    """
+    merged: Dict[str, dict] = {}
+    try:
+        paths = sorted(skills_dir.glob(OWNER_MANIFEST_GLOB))
+    except Exception:
+        return merged
+    for path in paths:
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        skills = parsed.get("skills") if isinstance(parsed, dict) else None
+        if not isinstance(skills, dict):
+            continue
+        for name, entry in skills.items():
+            if isinstance(entry, dict):
+                merged[name] = entry
+    return merged
 
 
 def resolve_grix_home() -> Path:

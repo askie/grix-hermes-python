@@ -942,7 +942,8 @@ class GrixAdapter(BasePlatformAdapter):
         self._shutting_down = False
         # 自升级检查器
         self._upgrade_checker: Optional["UpgradeChecker"] = None
-        self._skill_syncer: Optional["SkillSyncer"] = None
+        # 自定义技能同步由进程级 SkillSyncManager 按 owner 分桶托管（register/
+        # unregister 以本实例为 key），adapter 不再各自持有 SkillSyncer。
         # 正在 handle_message 派发途中的事件（session_key → event_id 集合）。
         # 收口扫尾/排队归属都跳过这些事件：它们可能马上会入队/被认领，
         # 提前定归属就回到"任务没结束先报完成"的老毛病。
@@ -1504,11 +1505,14 @@ class GrixAdapter(BasePlatformAdapter):
         if self._upgrade_checker:
             self._upgrade_checker.stop()
             self._upgrade_checker = None
-        # getattr 防御：部分测试用 __new__ 构造 adapter 跳过 __init__（同 _event_queue 先例）。
-        skill_syncer = getattr(self, "_skill_syncer", None)
-        if skill_syncer:
-            skill_syncer.stop()
-            self._skill_syncer = None
+        # 进程级技能同步按 owner 分桶：注销本 adapter；其 owner 桶空时管理器
+        # 自停 syncer。try 防御：部分测试用 __new__ 构造 adapter 跳过 __init__。
+        try:
+            from .skill_sync_manager import SkillSyncManager
+
+            await SkillSyncManager.instance().unregister(self)
+        except Exception as exc:
+            logger.debug("[%s] Skill sync unregister failed: %s", self.name, exc)
         # agent 共享：置位 shutting_down,串行等在途 share-set 同步结束,避免关停后泄漏。
         self._shutting_down = True
         getattr(self, "_desired_shared_owner_ids", set()).clear()
@@ -3098,14 +3102,20 @@ class GrixAdapter(BasePlatformAdapter):
                 await self._handle_kicked_packet(payload, source_client)
             elif cmd == CMD_SKILL_SYNC:
                 # 技能库变更提醒：立即触发本机下拉同步（轮询兜底仍在）。
+                sync_owner = str(payload.get("owner_id") or "").strip()
                 logger.info(
                     "[%s] skill_sync received owner=%s name=%s",
                     self.name,
                     payload.get("owner_id", ""),
                     payload.get("name", ""),
                 )
-                if self._skill_syncer:
-                    self._skill_syncer.trigger_sync()
+                if not sync_owner and self._client:
+                    # 旧服务端 payload 可能不带 owner_id：回退本连接的归属。
+                    sync_owner = self._client.owner_id or ""
+                if sync_owner:
+                    from .skill_sync_manager import SkillSyncManager
+
+                    SkillSyncManager.instance().trigger(sync_owner)
             elif cmd == CMD_CONTROL_SHARE_SET:
                 # 共享名单仅主连接处理：共享子连接虽然也可能收到，但 diff 须由主实例统一做。
                 if source_client is None or source_client is self._client:
@@ -3726,35 +3736,41 @@ class GrixAdapter(BasePlatformAdapter):
             logger.warning("[%s] Failed to start upgrade checker: %s", self.name, exc)
 
     async def _start_skill_syncer(self) -> None:
-        """启动自定义技能下拉同步器（docs/architecture/38）。
+        """注册进程级自定义技能下拉同步（docs/architecture/38）。
 
-        落盘 ~/.grix/skills（与 connector 共用库目录）；同步成功后强制刷新
-        skills + library_skills 上报。启动失败不影响主链路。
+        同步器由 SkillSyncManager 按 owner 分桶托管：同 owner 多个 agent 共享一个
+        syncer、台账按 owner 隔离；台账真变化时回调本 adapter 强制刷新 skills +
+        library_skills 上报。auth_ack 缺 owner_id（旧服务端）时跳过技能同步，
+        不影响主链路。注册失败同样不影响主链路。
         """
         try:
-            from .skill_syncer import SkillSyncer
+            from .skill_sync_manager import SkillSyncManager
 
-            # connect() 重入（宿主重连场景）时先停旧实例，避免双 loop 并行。
-            if self._skill_syncer:
-                self._skill_syncer.stop()
-                self._skill_syncer = None
+            owner_id = self._client.owner_id if self._client else None
+            if not owner_id:
+                logger.warning(
+                    "[%s] auth_ack 未携带 owner_id，跳过自定义技能同步", self.name
+                )
+                return
 
             async def _on_sync_success() -> None:
                 # 对齐 connector forceRefreshSkills：不看 fingerprint。
                 await self._report_skills(force=True)
 
-            self._skill_syncer = SkillSyncer(
+            # 以本实例为 key 幂等注册：connect() 重入（宿主重连）不会起第二个 syncer。
+            await SkillSyncManager.instance().register(
+                self,
+                owner_id=owner_id,
                 endpoint=self.connection.endpoint,
                 api_key=self.connection.api_key,
                 on_change=_on_sync_success,
             )
-            await self._skill_syncer.start()
-            # migrate / 首轮 sync 无论成败都强制刷一次：升级后库台账迁完若平台不可达，
-            # on_change 不会触发，否则工具栏可能长时间看不到 library_skills。
+            # 连接后无论台账是否变化都强制刷一次（保留原行为）：升级后库台账迁完
+            # 若平台不可达，on_change 不会触发，否则工具栏可能长时间看不到 library_skills。
             await self._report_skills(force=True)
-            logger.info("[%s] Skill syncer started", self.name)
+            logger.info("[%s] Skill sync registered (owner=%s)", self.name, owner_id)
         except Exception as exc:
-            logger.warning("[%s] Failed to start skill syncer: %s", self.name, exc)
+            logger.warning("[%s] Failed to register skill sync: %s", self.name, exc)
 
     def _gateway_is_busy(self) -> bool:
         """Whether the hosting gateway has agent runs in flight.

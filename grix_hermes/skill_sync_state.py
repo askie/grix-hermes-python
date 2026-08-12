@@ -1,23 +1,21 @@
 """Skill sync-state identification for the toolbar upload button (docs/architecture/39).
 
 Mirrors grix-connector's ``src/core/skill-sync/sync-state.ts``. Compares a skill's
-local content digest against the ``.grix-sync.json`` manifest that
-``skill_syncer.py`` maintains under ``~/.grix/skills`` to classify each
-non-managed skill as synced / modified / unsynced. Digest algorithm matches the
-backend's ``skillDigest`` exactly: sha256 over the raw SKILL.md text, no
-normalization — so a byte-identical local copy always compares equal.
+local content digest against the sync manifests (``.grix-sync*.json``，按 owner
+隔离，合并读取） that ``skill_syncer.py`` maintains under ``~/.grix/skills`` to
+classify each non-managed skill as synced / modified / unsynced. Digest algorithm
+matches the backend's ``skillDigest`` exactly: sha256 over the raw SKILL.md text,
+no normalization — so a byte-identical local copy always compares equal.
 """
 
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from .exec_command import SkillEntry
-
-MANIFEST_FILE = ".grix-sync.json"
+from .skill_paths import read_merged_manifest_skills
 
 
 def compute_content_digest(content: str) -> str:
@@ -26,19 +24,12 @@ def compute_content_digest(content: str) -> str:
 
 
 def _read_manifest_digests(skills_dir: Path) -> Dict[str, str]:
-    try:
-        raw = (skills_dir / MANIFEST_FILE).read_text(encoding="utf-8")
-        parsed = json.loads(raw)
-        skills = parsed.get("skills") if isinstance(parsed, dict) else None
-        if not isinstance(skills, dict):
-            return {}
-        out: Dict[str, str] = {}
-        for name, entry in skills.items():
-            if isinstance(entry, dict) and isinstance(entry.get("digest"), str):
-                out[name] = entry["digest"]
-        return out
-    except Exception:
-        return {}
+    # 合并全部 owner 的同步台账取 digest 并集（多 owner 宿主机每 owner 一份台账）。
+    out: Dict[str, str] = {}
+    for name, entry in read_merged_manifest_skills(skills_dir).items():
+        if isinstance(entry.get("digest"), str):
+            out[name] = entry["digest"]
+    return out
 
 
 def annotate_sync_states(skills: List[SkillEntry], skills_dir: Path) -> List[dict]:
