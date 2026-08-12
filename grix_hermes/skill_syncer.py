@@ -138,7 +138,7 @@ class SkillSyncer:
         self._task = None
 
     def trigger_sync(self) -> None:
-        """主动触发一次同步（平台下发 skill_sync 变更指令后调用）。"""
+        """主动触发一次同步（平台 skill_sync 变更指令、WS 重连补拉两条路径调用）。"""
         if self._stopped:
             return
         if self._running:

@@ -87,8 +87,11 @@ class SkillSyncManager:
         """把 adapter 登记进其 owner 的桶；首个注册启动 syncer。
 
         以 adapter 实例为 key，幂等：connect() 重入（宿主重连）重复注册只更新
-        回调与凭证，不会起第二个 syncer。锁内只做建桶/登记，syncer.start（含
-        首轮同步，每凭证 15s 超时）在锁外 await——多 agent 同时重连不被串行化。
+        回调与凭证，不会起第二个 syncer；但会 trigger_sync 补拉一轮——事件驱动
+        下断线窗口错过的 skill_sync 无补偿推送，重连是 6h 周期兜底之前的唯一
+        自愈点（syncer 防重入，多 agent 同机重连只收敛为 1-2 轮实际拉取）。
+        锁内只做建桶/登记，syncer.start（含首轮同步，每凭证 15s 超时）在锁外
+        await——多 agent 同时重连不被串行化。
         """
         owner_key = sanitize_owner_id(owner_id)
         start_syncer: Optional[SkillSyncer] = None
@@ -107,6 +110,8 @@ class SkillSyncManager:
                 start_syncer = bucket.syncer
             else:
                 bucket.syncer.update_credentials(creds)
+                # 重连/新 agent 入桶：补拉一轮对齐断线窗口错过的变更。
+                bucket.syncer.trigger_sync()
         if start_syncer is None:
             return
         await start_syncer.start()

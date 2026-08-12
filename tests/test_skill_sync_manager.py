@@ -94,6 +94,8 @@ def test_register_idempotent_on_reconnect():
         assert created[0].started == 1
         # 第二次注册只刷新凭证，不重启。
         assert created[0].cred_updates == [[("ws://h/1", "k1")]]
+        # 但会触发一次补拉：事件驱动下断线窗口错过的 skill_sync 靠重连收敛。
+        assert created[0].triggers == 1
 
     asyncio.run(run())
 
@@ -279,9 +281,9 @@ def test_sanitized_owner_key_shared_bucket_and_trigger():
         assert len(created) == 1
         assert created[0].manifest_file == ".grix-sync-a_b.json"
         assert created[0].credentials == [("ws://h/1", "k1"), ("ws://h/2", "k2")]
-        # trigger 用原始/净化值都命中同一桶。
+        # trigger 用原始/净化值都命中同一桶。（另 1 次来自第二个 adapter 入桶时的重连补拉）
         manager.trigger("a/b")
         manager.trigger("a?b")
-        assert created[0].triggers == 2
+        assert created[0].triggers == 3
 
     asyncio.run(run())
