@@ -86,6 +86,7 @@ from .contract import (
     LOCAL_ACTION_FILE_LIST,
     LOCAL_ACTION_GET_RATE_LIMITS,
     LOCAL_ACTION_GET_SESSION_USAGE,
+    LOCAL_ACTION_SET_MODEL,
     LOCAL_ACTION_SKILL_DISABLE,
     LOCAL_ACTION_SKILL_ENABLE,
     LOCAL_ACTION_SKILL_REFRESH,
@@ -377,21 +378,23 @@ def build_shared_connection_config(
     )
 
 
-def resolve_configured_model(hermes_home: Optional[str] = None) -> str:
-    """Read the immutable gateway model from the active Hermes profile."""
+def _load_hermes_config(hermes_home: Optional[str] = None) -> Dict[str, Any]:
     home = Path(hermes_home or os.environ.get("HERMES_HOME", "") or "~/.hermes").expanduser()
     try:
         import yaml
     except ImportError:
-        return ""
+        return {}
     try:
         with (home / "config.yaml").open("r", encoding="utf-8") as handle:
             config = yaml.safe_load(handle) or {}
     except (OSError, yaml.YAMLError, ValueError, TypeError):
-        return ""
+        return {}
+    return config if isinstance(config, dict) else {}
 
-    if not isinstance(config, dict):
-        return ""
+
+def resolve_configured_model(hermes_home: Optional[str] = None) -> str:
+    """Read the immutable gateway model from the active Hermes profile."""
+    config = _load_hermes_config(hermes_home)
     raw_model = config.get("model")
     if isinstance(raw_model, str):
         return raw_model.strip()
@@ -401,6 +404,121 @@ def resolve_configured_model(hermes_home: Optional[str] = None) -> str:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return ""
+
+
+def resolve_configured_provider(hermes_home: Optional[str] = None) -> str:
+    """Read the configured provider slug from the active Hermes profile."""
+    config = _load_hermes_config(hermes_home)
+    raw_model = config.get("model")
+    if isinstance(raw_model, dict):
+        value = raw_model.get("provider")
+        if isinstance(value, str):
+            return value.strip()
+    return ""
+
+
+def _toolbar_model_entry(model: str, provider: str = "", provider_label: str = "") -> Dict[str, Any]:
+    entry: Dict[str, Any] = {"id": model, "displayName": model}
+    if provider:
+        entry["provider"] = provider
+        entry["selectionCommand"] = f"/model {model} --provider {provider}"
+    if provider_label:
+        entry["providerLabel"] = provider_label
+    return entry
+
+
+def _fallback_toolbar_models(
+    model: str,
+    provider: str = "",
+    provider_label: str = "",
+) -> List[Dict[str, Any]]:
+    model = (model or "").strip()
+    return [_toolbar_model_entry(model, provider, provider_label)] if model else []
+
+
+def resolve_toolbar_available_models(
+    hermes_home: Optional[str] = None,
+    *,
+    max_models: int = 300,
+) -> List[Dict[str, Any]]:
+    """Return model choices for the Grix toolbar from Hermes' live inventory."""
+    configured_model = resolve_configured_model(hermes_home)
+    configured_provider = resolve_configured_provider(hermes_home)
+
+    try:
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+    except Exception:
+        return _fallback_toolbar_models(configured_model, configured_provider)
+
+    try:
+        ctx = load_picker_context()
+        payload = build_models_payload(
+            ctx,
+            explicit_only=True,
+            include_unconfigured=False,
+            picker_hints=True,
+            for_picker=True,
+            max_models=max_models,
+        )
+    except Exception as exc:
+        logger.debug("Hermes model inventory unavailable: %s", exc)
+        return _fallback_toolbar_models(configured_model, configured_provider)
+
+    rows = payload.get("providers") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return _fallback_toolbar_models(configured_model, configured_provider)
+
+    current_provider = str(payload.get("provider") or configured_provider or "").strip()
+    entries: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+
+    def add_entry(model_id: str, provider_slug: str, provider_label: str) -> None:
+        model_id = str(model_id or "").strip()
+        provider_slug = str(provider_slug or "").strip()
+        provider_label = str(provider_label or "").strip()
+        if not model_id:
+            return
+        key = (provider_slug, model_id)
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(_toolbar_model_entry(model_id, provider_slug, provider_label))
+
+    ordered_rows = sorted(
+        (row for row in rows if isinstance(row, dict)),
+        key=lambda row: 0
+        if str(row.get("slug") or row.get("id") or "").strip() == current_provider
+        else 1,
+    )
+    for row in ordered_rows:
+        provider_slug = str(row.get("slug") or row.get("id") or row.get("provider") or "").strip()
+        provider_label = str(row.get("name") or provider_slug).strip()
+        models = row.get("models")
+        if not isinstance(models, list):
+            continue
+        for item in models:
+            if isinstance(item, str):
+                add_entry(item, provider_slug, provider_label)
+            elif isinstance(item, dict):
+                add_entry(
+                    str(item.get("id") or item.get("name") or item.get("model") or ""),
+                    provider_slug,
+                    provider_label,
+                )
+
+    if configured_model:
+        current_key = (configured_provider, configured_model)
+        if current_key in seen:
+            for idx, entry in enumerate(entries):
+                if (
+                    entry.get("id") == configured_model
+                    and entry.get("provider", "") == configured_provider
+                ):
+                    entries.insert(0, entries.pop(idx))
+                    break
+        else:
+            entries.insert(0, _toolbar_model_entry(configured_model, configured_provider))
+    return entries or _fallback_toolbar_models(configured_model, configured_provider)
 
 
 _PLACEHOLDER_API_KEYS = frozenset(
@@ -896,10 +1014,16 @@ class GrixAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform(_PLATFORM_VALUE))
         self.connection = build_grix_connection_config(config)
-        # Hermes gateway sessions share one profile-level model. Freeze it at
-        # adapter construction: unlike switchable CLI adapters, Hermes exposes
-        # only this configured model in toolbar metadata.
+        # Toolbar starts with the configured model, then refreshes Hermes'
+        # provider/model inventory in the background after the transport is up.
         self._toolbar_model_id = resolve_configured_model()
+        self._toolbar_model_provider = resolve_configured_provider()
+        self._toolbar_available_models = _fallback_toolbar_models(
+            self._toolbar_model_id,
+            self._toolbar_model_provider,
+        )
+        self._toolbar_session_models: Dict[str, Dict[str, str]] = {}
+        self._toolbar_models_task: Optional[asyncio.Task] = None
         # 厂商用量限额缓存（对齐 connector provider-quota）：后台 30s 巡检刷新，
         # 随 _push_queue_snapshot 的工具栏绑定卡下发 provider_quota/rate_limits。
         self._provider_quota: Optional[Dict[str, Any]] = None
@@ -1430,6 +1554,7 @@ class GrixAdapter(BasePlatformAdapter):
         await self._report_skills()
         await self._start_upgrade_checker()
         await self._start_skill_syncer()
+        self._ensure_toolbar_models_refresh()
         self._ensure_provider_quota_refresh()
         return True
 
@@ -1502,6 +1627,10 @@ class GrixAdapter(BasePlatformAdapter):
         if quota_task is not None:
             quota_task.cancel()
             self._provider_quota_task = None
+        model_task = getattr(self, "_toolbar_models_task", None)
+        if model_task is not None:
+            model_task.cancel()
+            self._toolbar_models_task = None
         if self._upgrade_checker:
             self._upgrade_checker.stop()
             self._upgrade_checker = None
@@ -3278,6 +3407,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_upgrade_push(action)
             return
 
+        if action.action_type == LOCAL_ACTION_SET_MODEL:
+            await self._handle_set_model(action)
+            return
+
         if action.action_type == LOCAL_ACTION_GET_SESSION_USAGE:
             await self._handle_get_session_usage(action)
             return
@@ -3404,6 +3537,141 @@ class GrixAdapter(BasePlatformAdapter):
             error_code=result.get("error_code"),
             error_message=result.get("error_msg"),
         )
+
+    @staticmethod
+    def _toolbar_session_model_key(owner_key: str, session_id: str) -> str:
+        return f"{owner_key}\0{session_id}"
+
+    def _find_toolbar_model_entry(self, model_id: str) -> Optional[Dict[str, Any]]:
+        target = str(model_id or "").strip()
+        if not target:
+            return None
+        for entry in getattr(self, "_toolbar_available_models", None) or ():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("id") or "").strip() == target:
+                return entry
+        return None
+
+    async def _handle_set_model(self, action: GrixLocalAction) -> None:
+        client = self._active_client()
+        if client is None:
+            return
+        model_id = str(action.params.get("model_id") or "").strip()
+        session_id = str(action.params.get("session_id") or "").strip()
+        if not model_id or not session_id:
+            await client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="invalid_params",
+                error_message="session_id and model_id are required",
+            )
+            return
+        if re.search(r"\s", model_id):
+            await client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="invalid_model",
+                error_message="model_id must not contain whitespace",
+            )
+            return
+
+        entry = self._find_toolbar_model_entry(model_id)
+        if entry is None and getattr(self, "_toolbar_available_models", None):
+            await client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="unknown_model",
+                error_message=f"model is not available: {model_id}",
+            )
+            return
+
+        provider = str(
+            action.params.get("provider")
+            or action.params.get("model_provider")
+            or ((entry or {}).get("provider") if isinstance(entry, dict) else "")
+            or ""
+        ).strip()
+        if re.search(r"\s", provider):
+            await client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="invalid_provider",
+                error_message="provider must not contain whitespace",
+            )
+            return
+
+        command = f"/model {model_id}"
+        if provider:
+            command = f"{command} --provider {provider}"
+        handler = getattr(self, "_message_handler", None)
+        if handler is None:
+            await client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="gateway_unavailable",
+                error_message="Hermes gateway message handler is unavailable",
+            )
+            return
+
+        source = self._active_state().latest_sources.get(session_id)
+        if source is None:
+            source = self.build_source(chat_id=session_id, chat_type="dm")
+        event_fields = {
+            "text": command,
+            "message_type": MessageType.TEXT,
+            "source": source,
+            "raw_message": {
+                "_grix_kind": "toolbar_local_action",
+                "action_id": action.action_id,
+                "action_type": action.action_type,
+            },
+        }
+        try:
+            event = MessageEvent(**event_fields)
+        except TypeError:
+            event = MessageEvent()
+            for key, value in event_fields.items():
+                setattr(event, key, value)
+
+        try:
+            await handler(event)
+        except Exception as exc:
+            logger.debug("[%s] set_model local action failed: %s", self.name, exc)
+            await client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="model_switch_failed",
+                error_message=str(exc),
+            )
+            return
+
+        owner_key = self._active_owner_key()
+        label = str(
+            action.params.get("display_label")
+            or ((entry or {}).get("displayName") if isinstance(entry, dict) else "")
+            or model_id
+        ).strip()
+        session_models = getattr(self, "_toolbar_session_models", None)
+        if session_models is None:
+            session_models = {}
+            self._toolbar_session_models = session_models
+        session_models[self._toolbar_session_model_key(owner_key, session_id)] = {
+            "model_id": model_id,
+            "provider": provider,
+            "display_label": label,
+        }
+        await client.send_local_action_result(
+            action_id=action.action_id,
+            status=STATUS_OK,
+            result={
+                "session_id": session_id,
+                "model_id": model_id,
+                "provider": provider,
+                "display_label": label,
+            },
+        )
+        await self._push_queue_snapshot(session_id, owner_key)
 
     async def _handle_get_session_usage(self, action: GrixLocalAction) -> None:
         from .session_usage import handle_session_usage_action
@@ -5194,6 +5462,38 @@ class GrixAdapter(BasePlatformAdapter):
             return
         self._provider_quota_task = loop.create_task(self._provider_quota_refresh_loop())
 
+    def _ensure_toolbar_models_refresh(self) -> None:
+        """Fetch Hermes' model picker inventory once without blocking connect."""
+        if getattr(self, "_shutting_down", False) or getattr(self, "_disconnect_requested", False):
+            return
+        task = getattr(self, "_toolbar_models_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._toolbar_models_task = loop.create_task(self._refresh_toolbar_models_once())
+
+    async def _refresh_toolbar_models_once(self) -> None:
+        try:
+            models = await asyncio.to_thread(resolve_toolbar_available_models)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[%s] toolbar model inventory refresh failed: %s", self.name, exc)
+            return
+        if not models:
+            return
+
+        old_models = getattr(self, "_toolbar_available_models", None)
+        self._toolbar_available_models = models
+        self._toolbar_model_id = resolve_configured_model()
+        self._toolbar_model_provider = resolve_configured_provider()
+        logger.info("[%s] toolbar model inventory refreshed: %d model(s)", self.name, len(models))
+        if old_models != models:
+            await self._push_all_queue_snapshots()
+
     async def _provider_quota_refresh_loop(self) -> None:
         """30s 巡检：查询当前生效 provider 配额，成功后补推工具栏快照。"""
         interval = float(getattr(self, "_PROVIDER_QUOTA_REFRESH_INTERVAL_S", 30.0) or 30.0)
@@ -5419,19 +5719,27 @@ class GrixAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] send_queue_snapshot failed for %s: %s", self.name, session_id, exc)
 
-        model_id = getattr(self, "_toolbar_model_id", "")
-        if model_id:
+        session_model = (
+            getattr(self, "_toolbar_session_models", {}) or {}
+        ).get(self._toolbar_session_model_key(owner_key, session_id), {})
+        model_id = session_model.get("model_id") or getattr(self, "_toolbar_model_id", "")
+        model_provider = session_model.get("provider") or getattr(self, "_toolbar_model_provider", "")
+        available_models = getattr(self, "_toolbar_available_models", None)
+        if not available_models:
+            available_models = _fallback_toolbar_models(model_id, model_provider)
+        if model_id or available_models:
             try:
+                meta: Dict[str, Any] = {
+                    "model_id": model_id,
+                    "available_models": list(available_models),
+                    **self._provider_quota_toolbar_meta(),
+                }
+                if model_provider:
+                    meta["model_provider"] = model_provider
                 await client.send_update_binding_card(
                     session_id=session_id,
                     worker_status="busy" if running else "ready",
-                    meta={
-                        "model_id": model_id,
-                        "available_models": [
-                            {"id": model_id, "displayName": model_id}
-                        ],
-                        **self._provider_quota_toolbar_meta(),
-                    },
+                    meta=meta,
                 )
             except Exception as exc:
                 logger.debug(

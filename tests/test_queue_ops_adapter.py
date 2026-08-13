@@ -282,6 +282,38 @@ def test_snapshot_reports_single_immutable_configured_model():
     }
 
 
+def test_snapshot_reports_switchable_toolbar_models():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._toolbar_model_id = "deepseek-v4-flash"
+    inst._toolbar_model_provider = "opencode-go"
+    inst._toolbar_available_models = [
+        {
+            "id": "deepseek-v4-pro",
+            "displayName": "deepseek-v4-pro",
+            "provider": "opencode-go",
+            "providerLabel": "OpenCode Go",
+            "selectionCommand": "/model deepseek-v4-pro --provider opencode-go",
+        },
+        {
+            "id": "deepseek-v4-flash",
+            "displayName": "deepseek-v4-flash",
+            "provider": "opencode-go",
+            "providerLabel": "OpenCode Go",
+            "selectionCommand": "/model deepseek-v4-flash --provider opencode-go",
+        },
+    ]
+
+    _run_with_ctx(
+        inst, client, inst._handle_queue_snapshot_query_packet({"session_id": "s1"})
+    )
+
+    meta = client.binding_cards[-1]["meta"]
+    assert meta["model_id"] == "deepseek-v4-flash"
+    assert meta["model_provider"] == "opencode-go"
+    assert meta["available_models"] == inst._toolbar_available_models
+
+
 # 回归锚：provider-quota 平移后，缓存的厂商配额必须随工具栏绑定卡下发
 # （provider_quota + rate_limits），否则服务端工具栏拿不到 5h/周限额。
 def test_snapshot_binding_card_enriches_provider_quota():
@@ -324,6 +356,56 @@ def test_resolve_configured_model_supports_current_and_legacy_shapes(tmp_path):
 
     config_path.write_text("model: [unterminated\n")
     assert adapter_mod.resolve_configured_model(str(tmp_path)) == ""
+
+
+def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "model:\n  default: deepseek-v4-flash\n  provider: opencode-go\n",
+        encoding="utf-8",
+    )
+    hermes_pkg = types.ModuleType("hermes_cli")
+    inventory = types.ModuleType("hermes_cli.inventory")
+    inventory.load_picker_context = lambda: object()
+
+    def _build_models_payload(*args, **kwargs):
+        return {
+            "provider": "opencode-go",
+            "model": "deepseek-v4-flash",
+            "providers": [
+                {"slug": "zai", "name": "Z.AI", "models": ["glm-5"]},
+                {
+                    "slug": "opencode-go",
+                    "name": "OpenCode Go",
+                    "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
+                },
+            ],
+        }
+
+    inventory.build_models_payload = _build_models_payload
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.inventory", inventory)
+
+    models = adapter_mod.resolve_toolbar_available_models(str(tmp_path))
+
+    assert models[:2] == [
+        {
+            "id": "deepseek-v4-flash",
+            "displayName": "deepseek-v4-flash",
+            "provider": "opencode-go",
+            "selectionCommand": "/model deepseek-v4-flash --provider opencode-go",
+            "providerLabel": "OpenCode Go",
+        },
+        {
+            "id": "deepseek-v4-pro",
+            "displayName": "deepseek-v4-pro",
+            "provider": "opencode-go",
+            "selectionCommand": "/model deepseek-v4-pro --provider opencode-go",
+            "providerLabel": "OpenCode Go",
+        },
+    ]
+    assert models[2]["id"] == "glm-5"
+    assert models[2]["provider"] == "zai"
 
 
 def test_snapshot_query_reports_running_and_queued():

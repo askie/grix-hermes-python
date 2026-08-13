@@ -18,6 +18,7 @@ from grix_hermes.adapter import GrixAdapter, _CURRENT_CLIENT_CTX, _OwnerState
 from grix_hermes.contract import (
     ERR_APPROVAL_NOT_FOUND,
     LOCAL_ACTION_EXEC_APPROVE,
+    LOCAL_ACTION_SET_MODEL,
     STATUS_FAILED,
     STATUS_OK,
 )
@@ -86,3 +87,46 @@ def test_handle_local_action_fails_when_approval_mapping_missing():
         error_code=ERR_APPROVAL_NOT_FOUND,
         error_message="unknown or expired approval id",
     )
+
+
+def test_handle_set_model_dispatches_hermes_model_command():
+    adapter = _adapter()
+    adapter._message_handler = AsyncMock(return_value="switched")
+    adapter._push_queue_snapshot = AsyncMock()
+    adapter._toolbar_available_models = [
+        {
+            "id": "deepseek-v4-pro",
+            "displayName": "DeepSeek Pro",
+            "provider": "opencode-go",
+        }
+    ]
+    source = SimpleNamespace(chat_id="s1", chat_type="dm", thread_id=None)
+
+    payload = {
+        "action_id": "act-model",
+        "action_type": LOCAL_ACTION_SET_MODEL,
+        "params": {
+            "session_id": "s1",
+            "model_id": "deepseek-v4-pro",
+            "display_label": "DeepSeek Pro",
+        },
+    }
+
+    with _packet_ctx(adapter):
+        adapter._active_state().latest_sources["s1"] = source
+        asyncio.run(GrixAdapter._handle_local_action_packet(adapter, payload))
+
+    event = adapter._message_handler.await_args.args[0]
+    assert event.text == "/model deepseek-v4-pro --provider opencode-go"
+    assert event.source is source
+    adapter._client.send_local_action_result.assert_awaited_once_with(
+        action_id="act-model",
+        status=STATUS_OK,
+        result={
+            "session_id": "s1",
+            "model_id": "deepseek-v4-pro",
+            "provider": "opencode-go",
+            "display_label": "DeepSeek Pro",
+        },
+    )
+    adapter._push_queue_snapshot.assert_awaited_once_with("s1", "")
