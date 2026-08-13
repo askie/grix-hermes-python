@@ -89,6 +89,7 @@ class FakeTransportClient:
         self.event_states = []
         self.snapshots = []
         self.binding_cards = []
+        self.packet_order = []
         self.reorder_results = []
         self.clear_results = []
         self.cancel_results = []
@@ -108,11 +109,13 @@ class FakeTransportClient:
         )
 
     async def send_queue_snapshot(self, *, session_id, running, running_items, queued):
+        self.packet_order.append("queue_snapshot")
         self.snapshots.append(
             {"session_id": session_id, "running": running, "queued": queued}
         )
 
     async def send_update_binding_card(self, *, session_id, worker_status, cwd="", meta=None):
+        self.packet_order.append("binding_card")
         self.binding_cards.append(
             {
                 "session_id": session_id,
@@ -195,6 +198,10 @@ def _make_adapter(client=None):
 
     inst._dispatch_grix_event = _fake_dispatch
     inst._bg_hold_sweep_task = None
+    inst._toolbar_pending_model_sessions = set()
+    inst._toolbar_models_loaded = False
+    inst._toolbar_models_task = None
+    inst._ensure_toolbar_models_refresh = lambda: None
     inst._BG_HOLD_MAX_AGE_S = adapter_mod.GrixAdapter._BG_HOLD_MAX_AGE_S
     inst._BG_HOLD_SWEEP_INTERVAL_S = adapter_mod.GrixAdapter._BG_HOLD_SWEEP_INTERVAL_S
     inst._BG_HOLD_COMPOSING_TTL_MS = adapter_mod.GrixAdapter._BG_HOLD_COMPOSING_TTL_MS
@@ -280,6 +287,7 @@ def test_snapshot_reports_single_immutable_configured_model():
             ],
         },
     }
+    assert client.packet_order[-2:] == ["binding_card", "queue_snapshot"]
 
 
 def test_snapshot_reports_switchable_toolbar_models():
@@ -312,6 +320,35 @@ def test_snapshot_reports_switchable_toolbar_models():
     assert meta["model_id"] == "deepseek-v4-flash"
     assert meta["model_provider"] == "opencode-go"
     assert meta["available_models"] == inst._toolbar_available_models
+
+
+def test_inventory_refresh_repushes_empty_new_session_and_releases_tracking(monkeypatch):
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._toolbar_model_id = "deepseek-v4-flash"
+    inst._toolbar_available_models = [
+        {"id": "deepseek-v4-flash", "displayName": "deepseek-v4-flash"}
+    ]
+
+    _run_with_ctx(
+        inst, client, inst._handle_queue_snapshot_query_packet({"session_id": "s1"})
+    )
+    assert ("s1", "") in inst._toolbar_pending_model_sessions
+
+    refreshed_models = [
+        {"id": "deepseek-v4-pro", "displayName": "deepseek-v4-pro"},
+        {"id": "deepseek-v4-flash", "displayName": "deepseek-v4-flash"},
+    ]
+    monkeypatch.setattr(adapter_mod, "resolve_toolbar_available_models", lambda: refreshed_models)
+    monkeypatch.setattr(adapter_mod, "resolve_configured_model", lambda: "deepseek-v4-flash")
+    monkeypatch.setattr(adapter_mod, "resolve_configured_provider", lambda: "opencode-go")
+    client.binding_cards.clear()
+    _run_with_ctx(inst, client, inst._refresh_toolbar_models_once())
+
+    assert client.binding_cards[-1]["session_id"] == "s1"
+    assert len(client.binding_cards[-1]["meta"]["available_models"]) == 2
+    assert inst._toolbar_pending_model_sessions == set()
+    assert inst._toolbar_models_loaded is True
 
 
 # 回归锚：provider-quota 平移后，缓存的厂商配额必须随工具栏绑定卡下发
@@ -361,7 +398,9 @@ def test_resolve_configured_model_supports_current_and_legacy_shapes(tmp_path):
 def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
-        "model:\n  default: deepseek-v4-flash\n  provider: opencode-go\n",
+        "model:\n  default: deepseek-v4-flash\n  provider: opencode-go\n"
+        "providers:\n  deepseek-api:\n    default_model: deepseek-v4-flash\n"
+        "  nvidia:\n    name: NVIDIA\n    default_model: openai/gpt-oss-120b\n",
         encoding="utf-8",
     )
     hermes_pkg = types.ModuleType("hermes_cli")
@@ -374,6 +413,11 @@ def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkey
             "model": "deepseek-v4-flash",
             "providers": [
                 {"slug": "zai", "name": "Z.AI", "models": ["glm-5"]},
+                {
+                    "slug": "deepseek-api",
+                    "name": "DeepSeek API",
+                    "models": ["deepseek-v4-flash"],
+                },
                 {
                     "slug": "opencode-go",
                     "name": "OpenCode Go",
@@ -388,13 +432,13 @@ def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkey
 
     models = adapter_mod.resolve_toolbar_available_models(str(tmp_path))
 
-    assert models[:2] == [
+    assert models == [
         {
-            "id": "deepseek-v4-flash",
-            "displayName": "deepseek-v4-flash",
-            "provider": "opencode-go",
-            "selectionCommand": "/model deepseek-v4-flash --provider opencode-go",
-            "providerLabel": "OpenCode Go",
+            "id": "openai/gpt-oss-120b",
+            "displayName": "openai/gpt-oss-120b",
+            "provider": "nvidia",
+            "selectionCommand": "/model openai/gpt-oss-120b --provider nvidia",
+            "providerLabel": "NVIDIA",
         },
         {
             "id": "deepseek-v4-pro",
@@ -403,9 +447,80 @@ def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkey
             "selectionCommand": "/model deepseek-v4-pro --provider opencode-go",
             "providerLabel": "OpenCode Go",
         },
+        {
+            "id": "deepseek-v4-flash",
+            "displayName": "deepseek-v4-flash",
+            "provider": "opencode-go",
+            "selectionCommand": "/model deepseek-v4-flash --provider opencode-go",
+            "providerLabel": "OpenCode Go",
+        },
+        {
+            "id": "deepseek-v4-flash",
+            "displayName": "deepseek-v4-flash",
+            "provider": "deepseek-api",
+            "selectionCommand": "/model deepseek-v4-flash --provider deepseek-api",
+            "providerLabel": "DeepSeek API",
+        },
     ]
-    assert models[2]["id"] == "glm-5"
-    assert models[2]["provider"] == "zai"
+
+
+def test_resolve_toolbar_models_maps_configured_custom_provider(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  default: z-model\n  provider: custom:local\n"
+        "custom_providers:\n  local:\n    name: Local\n"
+        "    models:\n      - z-model\n      - a-model\n",
+        encoding="utf-8",
+    )
+    hermes_pkg = types.ModuleType("hermes_cli")
+    inventory = types.ModuleType("hermes_cli.inventory")
+    inventory.load_picker_context = lambda: object()
+    inventory.build_models_payload = lambda *args, **kwargs: {
+        "provider": "custom:local",
+        "providers": [
+            {"slug": "openai-codex", "models": ["gpt-5.4"]},
+            {
+                "slug": "custom:local",
+                "name": "Local",
+                "models": ["z-model", "m-model"],
+            },
+        ],
+    }
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.inventory", inventory)
+
+    models = adapter_mod.resolve_toolbar_available_models(str(tmp_path))
+
+    assert [entry["id"] for entry in models] == ["z-model", "m-model", "a-model"]
+    assert {entry["provider"] for entry in models} == {"custom:local"}
+
+
+def test_resolve_toolbar_models_uses_configured_defaults_when_inventory_fails(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.yaml").write_text(
+        "model:\n  default: deepseek-v4-flash\n  provider: opencode-go\n"
+        "providers:\n  nvidia:\n    name: NVIDIA\n"
+        "    default_model: openai/gpt-oss-120b\n",
+        encoding="utf-8",
+    )
+    hermes_pkg = types.ModuleType("hermes_cli")
+    inventory = types.ModuleType("hermes_cli.inventory")
+    inventory.load_picker_context = lambda: object()
+
+    def _failed_inventory(*args, **kwargs):
+        raise RuntimeError("inventory unavailable")
+
+    inventory.build_models_payload = _failed_inventory
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.inventory", inventory)
+
+    models = adapter_mod.resolve_toolbar_available_models(str(tmp_path))
+
+    assert [entry["id"] for entry in models] == [
+        "openai/gpt-oss-120b",
+        "deepseek-v4-flash",
+    ]
+    assert [entry["provider"] for entry in models] == ["nvidia", "opencode-go"]
 
 
 def test_snapshot_query_reports_running_and_queued():

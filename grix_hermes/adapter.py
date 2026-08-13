@@ -436,19 +436,118 @@ def _fallback_toolbar_models(
     return [_toolbar_model_entry(model, provider, provider_label)] if model else []
 
 
+def _configured_toolbar_providers(config: Dict[str, Any]) -> Set[str]:
+    """Return provider slugs explicitly present in the active Hermes config."""
+    configured: Set[str] = set()
+    raw_model = config.get("model")
+    if isinstance(raw_model, dict):
+        provider = str(raw_model.get("provider") or "").strip()
+        if provider:
+            configured.add(provider)
+
+    for section_name in ("providers", "custom_providers"):
+        section = config.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for raw_slug in section:
+            slug = str(raw_slug or "").strip()
+            if not slug:
+                continue
+            configured.add(slug)
+            if section_name == "custom_providers" and not slug.startswith("custom:"):
+                configured.add(f"custom:{slug}")
+    return configured
+
+
+def _configured_toolbar_model_entries(
+    config: Dict[str, Any],
+) -> List[Tuple[str, str, str]]:
+    """Return models named directly in configured provider sections."""
+    entries: List[Tuple[str, str, str]] = []
+    for section_name in ("providers", "custom_providers"):
+        section = config.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for raw_slug, raw_provider in section.items():
+            if not isinstance(raw_provider, dict):
+                continue
+            slug = str(raw_slug or "").strip()
+            if section_name == "custom_providers" and slug and not slug.startswith("custom:"):
+                slug = f"custom:{slug}"
+            label = str(raw_provider.get("name") or slug).strip()
+            raw_models = raw_provider.get("models")
+            if isinstance(raw_models, list):
+                for raw_model in raw_models:
+                    if isinstance(raw_model, str):
+                        entries.append((raw_model, slug, label))
+                    elif isinstance(raw_model, dict):
+                        entries.append(
+                            (
+                                str(
+                                    raw_model.get("id")
+                                    or raw_model.get("name")
+                                    or raw_model.get("model")
+                                    or ""
+                                ),
+                                slug,
+                                label,
+                            )
+                        )
+            for key in ("default_model", "model", "default"):
+                raw_model = raw_provider.get(key)
+                if isinstance(raw_model, str) and raw_model.strip():
+                    entries.append((raw_model, slug, label))
+                    break
+    return entries
+
+
+def _configured_toolbar_fallback_models(
+    config: Dict[str, Any],
+    configured_model: str,
+    configured_provider: str,
+) -> List[Dict[str, Any]]:
+    entries = _fallback_toolbar_models(configured_model, configured_provider)
+    seen = {
+        (str(entry.get("provider") or ""), str(entry.get("id") or ""))
+        for entry in entries
+    }
+    for model_id, provider_slug, provider_label in _configured_toolbar_model_entries(config):
+        model_id = str(model_id or "").strip()
+        key = (provider_slug, model_id)
+        if not model_id or key in seen:
+            continue
+        seen.add(key)
+        entries.append(_toolbar_model_entry(model_id, provider_slug, provider_label))
+    entries.sort(
+        key=lambda entry: (
+            str(entry.get("id") or "").casefold(),
+            str(entry.get("provider") or "").casefold(),
+        ),
+        reverse=True,
+    )
+    return entries
+
+
 def resolve_toolbar_available_models(
     hermes_home: Optional[str] = None,
     *,
     max_models: int = 300,
 ) -> List[Dict[str, Any]]:
-    """Return model choices for the Grix toolbar from Hermes' live inventory."""
+    """Return configured-provider model choices in descending dictionary order."""
+    config = _load_hermes_config(hermes_home)
     configured_model = resolve_configured_model(hermes_home)
     configured_provider = resolve_configured_provider(hermes_home)
+    configured_providers = _configured_toolbar_providers(config)
+    fallback_models = _configured_toolbar_fallback_models(
+        config,
+        configured_model,
+        configured_provider,
+    )
 
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
     except Exception:
-        return _fallback_toolbar_models(configured_model, configured_provider)
+        return fallback_models
 
     try:
         ctx = load_picker_context()
@@ -462,13 +561,12 @@ def resolve_toolbar_available_models(
         )
     except Exception as exc:
         logger.debug("Hermes model inventory unavailable: %s", exc)
-        return _fallback_toolbar_models(configured_model, configured_provider)
+        return fallback_models
 
     rows = payload.get("providers") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
-        return _fallback_toolbar_models(configured_model, configured_provider)
+        return fallback_models
 
-    current_provider = str(payload.get("provider") or configured_provider or "").strip()
     entries: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, str]] = set()
 
@@ -484,14 +582,12 @@ def resolve_toolbar_available_models(
         seen.add(key)
         entries.append(_toolbar_model_entry(model_id, provider_slug, provider_label))
 
-    ordered_rows = sorted(
-        (row for row in rows if isinstance(row, dict)),
-        key=lambda row: 0
-        if str(row.get("slug") or row.get("id") or "").strip() == current_provider
-        else 1,
-    )
-    for row in ordered_rows:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
         provider_slug = str(row.get("slug") or row.get("id") or row.get("provider") or "").strip()
+        if provider_slug not in configured_providers:
+            continue
         provider_label = str(row.get("name") or provider_slug).strip()
         models = row.get("models")
         if not isinstance(models, list):
@@ -506,19 +602,19 @@ def resolve_toolbar_available_models(
                     provider_label,
                 )
 
-    if configured_model:
-        current_key = (configured_provider, configured_model)
-        if current_key in seen:
-            for idx, entry in enumerate(entries):
-                if (
-                    entry.get("id") == configured_model
-                    and entry.get("provider", "") == configured_provider
-                ):
-                    entries.insert(0, entries.pop(idx))
-                    break
-        else:
-            entries.insert(0, _toolbar_model_entry(configured_model, configured_provider))
-    return entries or _fallback_toolbar_models(configured_model, configured_provider)
+    if configured_model and (configured_provider, configured_model) not in seen:
+        add_entry(configured_model, configured_provider, "")
+    for model_id, provider_slug, provider_label in _configured_toolbar_model_entries(config):
+        add_entry(model_id, provider_slug, provider_label)
+
+    entries.sort(
+        key=lambda entry: (
+            str(entry.get("id") or "").casefold(),
+            str(entry.get("provider") or "").casefold(),
+        ),
+        reverse=True,
+    )
+    return entries or fallback_models
 
 
 _PLACEHOLDER_API_KEYS = frozenset(
@@ -1023,6 +1119,8 @@ class GrixAdapter(BasePlatformAdapter):
             self._toolbar_model_provider,
         )
         self._toolbar_session_models: Dict[str, Dict[str, str]] = {}
+        self._toolbar_pending_model_sessions: Set[Tuple[str, str]] = set()
+        self._toolbar_models_loaded = False
         self._toolbar_models_task: Optional[asyncio.Task] = None
         # 厂商用量限额缓存（对齐 connector provider-quota）：后台 30s 巡检刷新，
         # 随 _push_queue_snapshot 的工具栏绑定卡下发 provider_quota/rate_limits。
@@ -5121,6 +5219,7 @@ class GrixAdapter(BasePlatformAdapter):
             logger.warning("[%s] invalid queue_snapshot_query payload: %s", self.name, exc)
             return
 
+        self._ensure_toolbar_models_refresh()
         await self._push_queue_snapshot(query.session_id, self._active_owner_key())
 
     # ── 事件队列接线 ────────────────────────────────────────────────────
@@ -5490,9 +5589,17 @@ class GrixAdapter(BasePlatformAdapter):
         self._toolbar_available_models = models
         self._toolbar_model_id = resolve_configured_model()
         self._toolbar_model_provider = resolve_configured_provider()
+        self._toolbar_models_loaded = True
         logger.info("[%s] toolbar model inventory refreshed: %d model(s)", self.name, len(models))
-        if old_models != models:
-            await self._push_all_queue_snapshots()
+        try:
+            if old_models != models:
+                await self._push_all_queue_snapshots()
+        finally:
+            # Empty sessions are retained only until their initial fallback
+            # picker can be replaced by the refreshed inventory.
+            pending_sessions = getattr(self, "_toolbar_pending_model_sessions", None)
+            if pending_sessions is not None:
+                pending_sessions.clear()
 
     async def _provider_quota_refresh_loop(self) -> None:
         """30s 巡检：查询当前生效 provider 配额，成功后补推工具栏快照。"""
@@ -5641,6 +5748,7 @@ class GrixAdapter(BasePlatformAdapter):
         """
         queue = getattr(self, "_event_queue", None)
         refs = set(queue.session_refs()) if queue is not None else set()
+        refs.update(getattr(self, "_toolbar_pending_model_sessions", set()) or set())
         for owner_key, state in self._owner_states.items():
             refs.update(
                 (work["session_id"], owner_key)
@@ -5655,6 +5763,11 @@ class GrixAdapter(BasePlatformAdapter):
         client = self._client_for_owner(owner_key)
         if client is None:
             return
+        if not getattr(self, "_toolbar_models_loaded", False):
+            pending_sessions = getattr(self, "_toolbar_pending_model_sessions", None)
+            if pending_sessions is None:
+                pending_sessions = self._toolbar_pending_model_sessions = set()
+            pending_sessions.add((session_id, owner_key))
         queue = getattr(self, "_event_queue", None)
         snap = (
             queue.snapshot(session_id, owner_key)
@@ -5709,16 +5822,6 @@ class GrixAdapter(BasePlatformAdapter):
             }
             for entry in snap["queued"]
         ]
-        try:
-            await client.send_queue_snapshot(
-                session_id=session_id,
-                running=running,
-                running_items=running_items,
-                queued=queued,
-            )
-        except Exception as exc:
-            logger.debug("[%s] send_queue_snapshot failed for %s: %s", self.name, session_id, exc)
-
         session_model = (
             getattr(self, "_toolbar_session_models", {}) or {}
         ).get(self._toolbar_session_model_key(owner_key, session_id), {})
@@ -5748,6 +5851,19 @@ class GrixAdapter(BasePlatformAdapter):
                     session_id,
                     exc,
                 )
+
+        # Persist toolbar metadata before the queue snapshot triggers a UI
+        # redraw. Reversing this order can render a fresh session with a
+        # disabled model picker before the binding metadata reaches it.
+        try:
+            await client.send_queue_snapshot(
+                session_id=session_id,
+                running=running,
+                running_items=running_items,
+                queued=queued,
+            )
+        except Exception as exc:
+            logger.debug("[%s] send_queue_snapshot failed for %s: %s", self.name, session_id, exc)
 
     async def _handle_stop_packet(self, payload: Dict[str, Any]) -> None:
         stop = normalize_stop_event(payload)
