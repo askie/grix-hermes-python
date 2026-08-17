@@ -119,6 +119,9 @@ async def _grix_invoke_handler(args: dict, **kwargs) -> str:
             timeout_ms = int(timeout_ms)
         except (TypeError, ValueError):
             return tool_error("timeout_ms must be an integer")
+    elif action == "dispatch_agent":
+        # Backend session_bind waits 60s; leave headroom for create + send.
+        timeout_ms = 75_000
 
     try:
         from gateway.run import _gateway_runner_ref

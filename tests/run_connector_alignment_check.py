@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 # ── Stub host modules the handlers lazy-import ──────────────────────────────
 
 calls = []  # captured (action, params) sent to the fake adapter
+timeouts = []  # captured timeout_ms for each agent_invoke
 
 
 class _FakeAdapter:
@@ -26,6 +27,7 @@ class _FakeAdapter:
 
     async def agent_invoke(self, *, action, params=None, timeout_ms=None):
         calls.append((action, params))
+        timeouts.append(timeout_ms)
         return {"code": 0, "echo": {"action": action, "params": params}}
 
 
@@ -83,11 +85,13 @@ for a in NEW:
 
 # handler forwards action+params verbatim
 calls.clear()
+timeouts.clear()
 res = asyncio.run(invoke_tool._grix_invoke_handler(
     {"action": "dispatch_agent", "params": {"agent_id": "7", "cwd": "/x", "task": "go"}}))
 check("dispatch_agent forwarded verbatim",
       calls == [("dispatch_agent", {"agent_id": "7", "cwd": "/x", "task": "go"})])
 check("dispatch_agent result ok", res.startswith("OK:"))
+check("dispatch_agent default timeout 75s", timeouts == [75_000])
 
 calls.clear()
 asyncio.run(invoke_tool._grix_invoke_handler({"action": "chat_state_query", "params": {}}))
