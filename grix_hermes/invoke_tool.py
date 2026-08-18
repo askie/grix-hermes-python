@@ -8,7 +8,7 @@ from .contract import CAP_AGENT_INVOKE_V1
 logger = logging.getLogger(__name__)
 
 SUPPORTED_ACTIONS = {
-    "send_msg": "Send a message to a session",
+    "send_msg": "Send a message to a session (not for answering the inbound event being handled — use grix_reply or normal reply text for that)",
     "delete_msg": "Delete (unsend/recall) a message",
     "contact_search": "Search contacts by keyword or ID",
     "session_search": "Search sessions by keyword",
@@ -58,7 +58,10 @@ GRIX_INVOKE_SCHEMA = {
         "  Owner relay: call_owner, session_send\n"
         "  Chat state: chat_state_query, chat_state_update\n"
         "  Egg marketplace: egg_search, egg_get\n"
-        "  Custom skills (multi-machine synced): skill_set, skill_get"
+        "  Custom skills (multi-machine synced): skill_set, skill_get\n\n"
+        "Do NOT use send_msg to answer the inbound event you are currently handling — "
+        "answer with grix_reply (or normal reply text) instead, otherwise the user "
+        "receives duplicate messages."
     ),
     "parameters": {
         "type": "object",
@@ -155,7 +158,7 @@ def register_invoke_tool(ctx=None) -> None:
             handler=_grix_invoke_handler,
             check_fn=_check_grix_invoke,
             is_async=True,
-            description="Unified Grix API: send/delete messages, query contacts, manage groups, admin agents.",
+            description="Unified Grix API: send/delete messages, query contacts, manage groups, admin agents. Do not answer the current inbound event via send_msg (use grix_reply or plain reply text).",
             emoji="🔗",
         )
     else:
@@ -168,6 +171,6 @@ def register_invoke_tool(ctx=None) -> None:
             handler=_grix_invoke_handler,
             check_fn=_check_grix_invoke,
             is_async=True,
-            description="Unified Grix API: send/delete messages, query contacts, manage groups, admin agents.",
+            description="Unified Grix API: send/delete messages, query contacts, manage groups, admin agents. Do not answer the current inbound event via send_msg (use grix_reply or plain reply text).",
             emoji="🔗",
         )
