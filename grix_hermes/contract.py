@@ -28,6 +28,7 @@ CMD_UPDATE_BINDING_CARD = "update_binding_card"
 CMD_SESSION_ACTIVITY_SET = "session_activity_set"
 CMD_LOCAL_ACTION = "local_action"
 CMD_LOCAL_ACTION_RESULT = "local_action_result"
+CMD_LOCAL_ACTION_ACK = "local_action_ack"
 CMD_EVENT_MSG = "event_msg"
 CMD_EVENT_ACK = "event_ack"
 CMD_EVENT_RESULT = "event_result"
@@ -117,6 +118,7 @@ STABLE_PUBLIC_COMMANDS = (
         "direction": "client_to_server",
         "purpose": "local_action_result",
     },
+    {"cmd": CMD_LOCAL_ACTION_ACK, "direction": "server_to_client", "purpose": "local_action_result_received"},
     {
         "cmd": CMD_SESSION_ROUTE_BIND,
         "direction": "client_to_server",
@@ -142,6 +144,7 @@ CAP_SESSION_ROUTE = "session_route"
 CAP_THREAD_V1 = "thread_v1"
 CAP_INBOUND_MEDIA_V1 = "inbound_media_v1"
 CAP_LOCAL_ACTION_V1 = "local_action_v1"
+CAP_LOCAL_ACTION_RESULT_ACK = "local_action_result_ack"
 CAP_AGENT_INVOKE_V1 = "agent_invoke_v1"
 CAP_STREAM_CHUNK = "stream_chunk"
 # 终态投递持久化：与 grix-connector 同协议。后端须先支持 terminal_commit_v1 /
@@ -161,6 +164,7 @@ STABLE_AUTH_CAPABILITIES = (
     CAP_THREAD_V1,
     CAP_INBOUND_MEDIA_V1,
     CAP_LOCAL_ACTION_V1,
+    CAP_LOCAL_ACTION_RESULT_ACK,
     CAP_AGENT_INVOKE_V1,
     CAP_EVENT_RESULT_ACK,
     CAP_TERMINAL_COMMIT_V1,
@@ -175,6 +179,7 @@ LOCAL_ACTION_EXEC_REJECT = "exec_reject"
 LOCAL_ACTION_FILE_LIST = "file_list"
 LOCAL_ACTION_CREATE_FOLDER = "create_folder"
 LOCAL_ACTION_SET_MODEL = "set_model"
+LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER = "configure_gateway_provider"
 LOCAL_ACTION_GET_SESSION_USAGE = "get_session_usage"
 LOCAL_ACTION_GET_RATE_LIMITS = "get_rate_limits"
 LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH = "connector_upgrade_push"
@@ -208,6 +213,7 @@ STABLE_LOCAL_ACTIONS = (
     LOCAL_ACTION_FILE_LIST,
     LOCAL_ACTION_CREATE_FOLDER,
     LOCAL_ACTION_SET_MODEL,
+    LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER,
     LOCAL_ACTION_GET_SESSION_USAGE,
     LOCAL_ACTION_GET_RATE_LIMITS,
     LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH,

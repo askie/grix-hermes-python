@@ -79,6 +79,7 @@ from .contract import (
     ERR_UNSUPPORTED_DECISION,
     ERR_UNSUPPORTED_LOCAL_ACTION,
     LOCAL_ACTION_CREATE_FOLDER,
+    LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER,
     LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
@@ -1085,6 +1086,110 @@ async def resolve_grix_target(
             return session_id, inline_thread_id
 
     return raw_target, resolved_thread_id
+
+
+def _configure_relay_for_model_switch(hermes_home: str, credentials: Any) -> Tuple[Dict[str, Any], Any]:
+    """Blocking bridge kept outside the adapter to make cancellation explicit."""
+    from .relay_credentials import configure_relay_credentials_for_model_switch
+
+    return configure_relay_credentials_for_model_switch(hermes_home, credentials=credentials)
+
+
+async def _rollback_relay_for_model_switch(
+    hermes_home: str, snapshot: Any, adapter_name: str
+) -> Tuple[bool, bool]:
+    """Restore an in-flight relay profile without allowing cancellation to interrupt it."""
+    from .relay_credentials import restore_relay_configuration
+
+    rollback_task = asyncio.create_task(
+        asyncio.to_thread(restore_relay_configuration, hermes_home, snapshot)
+    )
+    cancelled = False
+    try:
+        while True:
+            try:
+                await asyncio.shield(rollback_task)
+                return True, cancelled
+            except asyncio.CancelledError:
+                # Complete the filesystem restore before any caller can free
+                # the per-profile lock. The caller re-raises cancellation.
+                cancelled = True
+    except Exception:  # noqa: BLE001 - caller keeps its primary outcome
+        logger.error(
+            "[%s] failed to roll back relay profile after model switch",
+            adapter_name,
+        )
+        return False, cancelled
+
+
+async def _await_relay_config_task(task: "asyncio.Task[Any]") -> Tuple[Any, bool]:
+    """Await a relay write to completion while recording repeated cancellation."""
+    cancelled = False
+    while True:
+        try:
+            return await asyncio.shield(task), cancelled
+        except asyncio.CancelledError:
+            # The worker owns an atomic profile write and must finish before a
+            # cancellation handler can decide whether restoration is required.
+            cancelled = True
+
+
+async def _report_relay_rollback_failure(client: Any, action_id: str, adapter_name: str) -> None:
+    """Make a cancelled failed rollback observable before releasing the profile lock."""
+    report_task = asyncio.create_task(
+        client.send_local_action_result_confirmed(
+            action_id=action_id,
+            status=STATUS_FAILED,
+            error_code="relay_rollback_failed",
+            error_message="Hermes could not restore the previous relay profile after model switch failure",
+        )
+    )
+    try:
+        await _await_relay_config_task(report_task)
+    except Exception:
+        logger.error("[%s] failed to report relay rollback failure", adapter_name)
+
+
+async def _report_relay_config_cancelled(client: Any, action_id: str, adapter_name: str) -> None:
+    """Report a cancelled direct configuration after its profile was restored."""
+    report_task = asyncio.create_task(
+        client.send_local_action_result_confirmed(
+            action_id=action_id,
+            status=STATUS_FAILED,
+            error_code="relay_config_cancelled",
+            error_message="Relay configuration was cancelled and the previous Hermes profile was restored",
+        )
+    )
+    try:
+        await _await_relay_config_task(report_task)
+    except Exception:
+        logger.error("[%s] failed to report cancelled relay configuration", adapter_name)
+
+
+async def _report_relay_ack_failure(client: Any, action_id: str, adapter_name: str) -> None:
+    """Report a reverted relay write when its success receipt was unconfirmed."""
+    try:
+        await client.send_local_action_result(
+            action_id=action_id,
+            status=STATUS_FAILED,
+            error_code="relay_result_unconfirmed",
+            error_message="Relay configuration was restored because Grix did not confirm the result",
+        )
+    except Exception:
+        logger.error("[%s] failed to report unconfirmed relay result", adapter_name)
+
+
+_RELAY_PROFILE_LOCKS: Dict[str, asyncio.Lock] = {}
+
+
+def _relay_profile_lock(hermes_home: str) -> asyncio.Lock:
+    """Serialize relay writes and the dependent `/model` command per profile."""
+    home = str(Path(hermes_home).expanduser())
+    lock = _RELAY_PROFILE_LOCKS.get(home)
+    if lock is None:
+        lock = asyncio.Lock()
+        _RELAY_PROFILE_LOCKS[home] = lock
+    return lock
 
 
 class GrixAdapter(BasePlatformAdapter):
@@ -3509,6 +3614,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_set_model(action)
             return
 
+        if action.action_type == LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER:
+            await self._handle_configure_gateway_provider(action)
+            return
+
         if action.action_type == LOCAL_ACTION_GET_SESSION_USAGE:
             await self._handle_get_session_usage(action)
             return
@@ -3698,6 +3807,16 @@ class GrixAdapter(BasePlatformAdapter):
                 error_message="provider must not contain whitespace",
             )
             return
+        credentials = None
+        try:
+            from .relay_credentials import relay_credentials_from_params
+
+            credentials = relay_credentials_from_params(action.params)
+        except Exception as exc:  # noqa: BLE001 - returned error is redacted below
+            await self._send_relay_config_error(action, exc)
+            return
+        if credentials is not None:
+            provider = "grix"
 
         command = f"/model {model_id}"
         if provider:
@@ -3732,44 +3851,262 @@ class GrixAdapter(BasePlatformAdapter):
             for key, value in event_fields.items():
                 setattr(event, key, value)
 
+        relay_snapshot = None
+        relay_home = self._resolve_hermes_home()
+        # All `/model` actions share this lock, not only relay-bearing ones:
+        # a normal switch may otherwise race a relay enable or its rollback.
+        relay_lock = _relay_profile_lock(relay_home)
+        await relay_lock.acquire()
+        model_command_succeeded = False
+        relay_lock_released = False
         try:
-            await handler(event)
-        except Exception as exc:
-            logger.debug("[%s] set_model local action failed: %s", self.name, exc)
-            await client.send_local_action_result(
-                action_id=action.action_id,
-                status=STATUS_FAILED,
-                error_code="model_switch_failed",
-                error_message=str(exc),
-            )
-            return
+            if credentials is not None:
+                relay_config_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        _configure_relay_for_model_switch,
+                        relay_home,
+                        credentials,
+                    )
+                )
+                try:
+                    _, relay_snapshot = await asyncio.shield(relay_config_task)
+                except asyncio.CancelledError:
+                    # `to_thread` cannot be cancelled once started.  Wait for the
+                    # profile write, then undo it before propagating cancellation.
+                    try:
+                        (_, relay_snapshot), _ = await _await_relay_config_task(relay_config_task)
+                        rollback_restored, _ = await _rollback_relay_for_model_switch(
+                            relay_home, relay_snapshot, self.name
+                        )
+                        if not rollback_restored:
+                            await _report_relay_rollback_failure(client, action.action_id, self.name)
+                    except Exception:  # noqa: BLE001 - cancellation still propagates
+                        logger.error("[%s] failed to roll back cancelled relay setup", self.name)
+                    raise
+                except Exception as exc:  # noqa: BLE001 - host config errors must not expose api_key
+                    await self._send_relay_config_error(action, exc)
+                    return
+            try:
+                await handler(event)
+            except asyncio.CancelledError:
+                if relay_snapshot is not None:
+                    rollback_restored, _ = await _rollback_relay_for_model_switch(
+                        relay_home, relay_snapshot, self.name
+                    )
+                    if not rollback_restored:
+                        await _report_relay_rollback_failure(client, action.action_id, self.name)
+                raise
+            except Exception as exc:
+                from .relay_credentials import redact_relay_secret
 
-        owner_key = self._active_owner_key()
-        label = str(
-            action.params.get("display_label")
-            or ((entry or {}).get("displayName") if isinstance(entry, dict) else "")
-            or model_id
-        ).strip()
-        session_models = getattr(self, "_toolbar_session_models", None)
-        if session_models is None:
-            session_models = {}
-            self._toolbar_session_models = session_models
-        session_models[self._toolbar_session_model_key(owner_key, session_id)] = {
-            "model_id": model_id,
-            "provider": provider,
-            "display_label": label,
-        }
-        await client.send_local_action_result(
-            action_id=action.action_id,
-            status=STATUS_OK,
-            result={
+                rollback_restored = True
+                rollback_cancelled = False
+                if relay_snapshot is not None:
+                    rollback_restored, rollback_cancelled = await _rollback_relay_for_model_switch(
+                        relay_home, relay_snapshot, self.name
+                    )
+                if rollback_cancelled:
+                    raise asyncio.CancelledError
+                if not rollback_restored:
+                    await client.send_local_action_result(
+                        action_id=action.action_id,
+                        status=STATUS_FAILED,
+                        error_code="relay_rollback_failed",
+                        error_message="Hermes could not restore the previous relay profile after model switch failure",
+                    )
+                    return
+
+                secret = str(
+                    action.params.get("api_key")
+                    or action.params.get("virtual_key")
+                    or action.params.get("virtualKey")
+                    or ""
+                ).strip()
+                message = redact_relay_secret(exc, secret)
+                logger.debug("[%s] set_model local action failed: %s", self.name, message)
+                # No profile mutation remains (either this was a normal
+                # switch, or relay rollback completed), so do not hold the
+                # profile lock while waiting for a best-effort error receipt.
+                if credentials is None or rollback_restored:
+                    relay_lock.release()
+                    relay_lock_released = True
+                await client.send_local_action_result(
+                    action_id=action.action_id,
+                    status=STATUS_FAILED,
+                    error_code="model_switch_failed",
+                    error_message=message,
+                )
+                return
+            else:
+                model_command_succeeded = True
+        finally:
+            if not model_command_succeeded and not relay_lock_released:
+                relay_lock.release()
+
+        try:
+            owner_key = self._active_owner_key()
+            label = str(
+                action.params.get("display_label")
+                or ((entry or {}).get("displayName") if isinstance(entry, dict) else "")
+                or model_id
+            ).strip()
+            model_result = {
                 "session_id": session_id,
                 "model_id": model_id,
                 "provider": provider,
                 "display_label": label,
-            },
+            }
+            confirmed = False
+            if credentials is not None:
+                try:
+                    confirmed = await client.send_local_action_result_confirmed(
+                        action_id=action.action_id,
+                        status=STATUS_OK,
+                        result=model_result,
+                    )
+                except asyncio.CancelledError:
+                    restored, _ = await _rollback_relay_for_model_switch(relay_home, relay_snapshot, self.name)
+                    if restored:
+                        await _report_relay_config_cancelled(client, action.action_id, self.name)
+                    else:
+                        await _report_relay_rollback_failure(client, action.action_id, self.name)
+                    raise
+                except Exception:
+                    restored, _ = await _rollback_relay_for_model_switch(relay_home, relay_snapshot, self.name)
+                    if restored:
+                        await _report_relay_ack_failure(client, action.action_id, self.name)
+                    else:
+                        await _report_relay_rollback_failure(client, action.action_id, self.name)
+                    return
+            else:
+                await client.send_local_action_result(
+                    action_id=action.action_id,
+                    status=STATUS_OK,
+                    result=model_result,
+                )
+            session_models = getattr(self, "_toolbar_session_models", None)
+            if session_models is None:
+                session_models = {}
+                self._toolbar_session_models = session_models
+            session_models[self._toolbar_session_model_key(owner_key, session_id)] = {
+                "model_id": model_id,
+                "provider": provider,
+                "display_label": label,
+            }
+            await self._push_queue_snapshot(session_id, owner_key)
+            if credentials is not None and confirmed:
+                self._schedule_gateway_restart_after_relay_change()
+        finally:
+            relay_lock.release()
+
+    async def _handle_configure_gateway_provider(self, action: GrixLocalAction) -> None:
+        """Receive relay credentials without requiring grix-connector to be installed."""
+        client = self._active_client()
+        if client is None:
+            return
+        try:
+            from .relay_credentials import configure_relay_credentials_with_snapshot, relay_credentials_from_params
+
+            disable = action.params.get("disable") is True
+            credentials = None if disable else relay_credentials_from_params(action.params)
+            hermes_home = self._resolve_hermes_home()
+            snapshot = None
+            async with _relay_profile_lock(hermes_home):
+                config_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        configure_relay_credentials_with_snapshot,
+                        hermes_home,
+                        credentials=credentials,
+                        disable=disable,
+                    )
+                )
+                try:
+                    result, snapshot = await asyncio.shield(config_task)
+                    confirmed = await client.send_local_action_result_confirmed(
+                        action_id=action.action_id,
+                        status=STATUS_OK,
+                        result=result,
+                    )
+                    if result.get("restart_required") is True and confirmed:
+                        self._schedule_gateway_restart_after_relay_change()
+                except Exception:
+                    # A rejected or timed-out receipt ACK means the server did
+                    # not durably confirm this transition. Revert the profile
+                    # rather than leaving credentials active without restart.
+                    # If configuration itself failed, no snapshot exists and
+                    # its atomic helper has already restored its own state;
+                    # let the normal configuration error path report it.
+                    if snapshot is None:
+                        raise
+                    restored, _ = await _rollback_relay_for_model_switch(hermes_home, snapshot, self.name)
+                    if restored:
+                        await _report_relay_ack_failure(client, action.action_id, self.name)
+                    else:
+                        await _report_relay_rollback_failure(client, action.action_id, self.name)
+                    return
+                except asyncio.CancelledError:
+                    # A cancellation may arrive after the profile write but
+                    # before its receipt ACK.  Restore that exact prior state
+                    # and make the cancelled transition observable.
+                    if snapshot is None:
+                        try:
+                            (_result, snapshot), _ = await _await_relay_config_task(config_task)
+                        except Exception:
+                            snapshot = None
+                    if snapshot is not None:
+                        restored, _ = await _rollback_relay_for_model_switch(hermes_home, snapshot, self.name)
+                        if restored:
+                            await _report_relay_config_cancelled(client, action.action_id, self.name)
+                        else:
+                            await _report_relay_rollback_failure(client, action.action_id, self.name)
+                    raise
+        except Exception as exc:  # noqa: BLE001 - host config errors must not expose api_key
+            await self._send_relay_config_error(action, exc)
+            return
+
+    def _schedule_gateway_restart_after_relay_change(self) -> None:
+        """Restart this profile only after its local-action ACK was queued.
+
+        Relay providers are read while Hermes starts.  Returning only
+        ``restart_required`` leaves a standalone installation permanently on
+        the old provider, so the plugin asks the hosting GatewayRunner for its
+        normal graceful self-restart.  ``call_soon`` lets the local-action
+        result reach Grix before the runner begins draining this connection.
+        """
+        def request_restart() -> None:
+            try:
+                if not self._request_gateway_restart():
+                    logger.error("[%s] relay profile restart is unavailable", self.name)
+            except Exception:
+                logger.exception("[%s] relay profile restart request failed", self.name)
+
+        asyncio.get_running_loop().call_soon(request_restart)
+
+    async def _send_relay_config_error(self, action: GrixLocalAction, exc: Exception) -> None:
+        from .relay_credentials import RelayCredentialError, redact_relay_secret
+
+        client = self._active_client()
+        if client is None:
+            return
+        secret = str(
+            action.params.get("api_key")
+            or action.params.get("virtual_key")
+            or action.params.get("virtualKey")
+            or ""
+        ).strip()
+        code = exc.code if isinstance(exc, RelayCredentialError) else "config_write_failed"
+        message = (
+            redact_relay_secret(exc, secret)
+            if isinstance(exc, RelayCredentialError)
+            else "Hermes could not update the Grix relay configuration"
         )
-        await self._push_queue_snapshot(session_id, owner_key)
+        logger.warning("[%s] Grix relay configuration failed: %s", self.name, message)
+        await client.send_local_action_result(
+            action_id=action.action_id,
+            status=STATUS_FAILED,
+            error_code=code,
+            error_message=message,
+        )
 
     async def _handle_get_session_usage(self, action: GrixLocalAction) -> None:
         from .session_usage import handle_session_usage_action

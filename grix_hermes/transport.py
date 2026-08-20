@@ -27,6 +27,7 @@ from .contract import (
     CMD_EVENT_STOP_ACK,
     CMD_EVENT_STOP_RESULT,
     CMD_LOCAL_ACTION_RESULT,
+    CMD_LOCAL_ACTION_ACK,
     CMD_PING,
     CMD_PONG,
     CMD_QUEUE_CLEAR_RESULT,
@@ -469,18 +470,16 @@ class GrixTransportClient:
                 seq=seq,
                 require_authed=require_authed,
             )
-        except Exception:
+            return await future
+        finally:
+            # A caller can be cancelled either while sending or while awaiting
+            # a server receipt. Do not retain its pending slot or timeout
+            # callback until the normal deadline in either phase.
             pending = self._pending.pop(seq, None)
-            if pending:
+            if pending is not None:
                 pending.timeout_handle.cancel()
                 if not pending.future.done():
-                    pending.future.set_exception(asyncio.CancelledError())
-            raise
-
-        try:
-            return await future
-        except TimeoutError:
-            raise
+                    pending.future.cancel()
 
     async def send_text(
         self,
@@ -657,6 +656,44 @@ class GrixTransportClient:
         if error_message:
             payload["error_msg"] = error_message.strip()
         await self.send_packet(CMD_LOCAL_ACTION_RESULT, payload)
+
+    async def send_local_action_result_confirmed(
+        self,
+        *,
+        action_id: str,
+        status: str,
+        result: Optional[Any] = None,
+        error_code: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        """Send a local-action result and wait for server receipt when negotiated.
+
+        The confirmation gate is used before a self-restart: a local socket
+        write does not prove that the gateway persisted the result.  Older
+        servers remain compatible but return ``False`` so callers must not
+        restart based on an unconfirmed result.
+        """
+        payload: Dict[str, Any] = {"action_id": action_id.strip(), "status": status.strip()}
+        if result is not None:
+            payload["result"] = result
+        if error_code:
+            payload["error_code"] = error_code.strip()
+        if error_message:
+            payload["error_msg"] = error_message.strip()
+        if "local_action_result_ack" not in self._negotiated_capabilities:
+            await self.send_packet(CMD_LOCAL_ACTION_RESULT, payload)
+            return False
+        packet = await self.request(
+            CMD_LOCAL_ACTION_RESULT,
+            payload,
+            expected=(CMD_LOCAL_ACTION_ACK, CMD_ERROR),
+        )
+        if packet["cmd"] != CMD_LOCAL_ACTION_ACK:
+            raise self._packet_error(packet)
+        ack_action_id = str((packet.get("payload") or {}).get("action_id") or "").strip()
+        if ack_action_id != action_id.strip() or (packet.get("payload") or {}).get("received") is not True:
+            raise GrixTransportError("invalid local_action_result acknowledgement")
+        return True
 
     async def acknowledge_event(
         self,

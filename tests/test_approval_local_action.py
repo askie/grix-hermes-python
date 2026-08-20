@@ -4,7 +4,7 @@ import types
 from collections import defaultdict
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 # handler 内 `from tools.approval import resolve_gateway_approval`（host 侧模块）。
 # 测试环境用 stub 承载该子模块，具体返回值由各用例 patch 覆写。
@@ -18,6 +18,7 @@ from grix_hermes.adapter import GrixAdapter, _CURRENT_CLIENT_CTX, _OwnerState
 from grix_hermes.contract import (
     ERR_APPROVAL_NOT_FOUND,
     LOCAL_ACTION_EXEC_APPROVE,
+    LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER,
     LOCAL_ACTION_SET_MODEL,
     STATUS_FAILED,
     STATUS_OK,
@@ -27,7 +28,10 @@ from grix_hermes.contract import (
 def _adapter():
     adapter = object.__new__(GrixAdapter)
     adapter.name = "grix-test"
-    adapter._client = SimpleNamespace(send_local_action_result=AsyncMock())
+    adapter._client = SimpleNamespace(
+        send_local_action_result=AsyncMock(),
+        send_local_action_result_confirmed=AsyncMock(return_value=True),
+    )
     # 审批状态已迁到 per-owner 的 _active_state().approval_state（不再是扁平字段）。
     adapter._owner_states = defaultdict(_OwnerState)
     adapter.resume_typing_for_chat = lambda chat_id: None
@@ -130,3 +134,72 @@ def test_handle_set_model_dispatches_hermes_model_command():
         },
     )
     adapter._push_queue_snapshot.assert_awaited_once_with("s1", "")
+
+
+def test_handle_set_model_rolls_back_relay_when_hermes_command_fails():
+    adapter = _adapter()
+    adapter._resolve_hermes_home = lambda: "/tmp/grix-hermes-profile"
+    adapter._message_handler = AsyncMock(side_effect=RuntimeError("switch rejected"))
+    adapter._toolbar_available_models = [{"id": "deepseek-v4-flash", "provider": "grix"}]
+    source = SimpleNamespace(chat_id="s1", chat_type="dm", thread_id=None)
+    snapshot = object()
+    payload = {
+        "action_id": "act-model-relay",
+        "action_type": LOCAL_ACTION_SET_MODEL,
+        "params": {
+            "session_id": "s1",
+            "model_id": "deepseek-v4-flash",
+            "openai_base_url": "https://relay.example/openai",
+            "api_key": "secret-relay-key",
+        },
+    }
+
+    with _packet_ctx(adapter):
+        adapter._active_state().latest_sources["s1"] = source
+        with patch(
+            "grix_hermes.adapter._configure_relay_for_model_switch",
+            return_value=({"relay": "enabled"}, snapshot),
+        ) as configure, patch(
+            "grix_hermes.relay_credentials.restore_relay_configuration"
+        ) as restore:
+            asyncio.run(GrixAdapter._handle_local_action_packet(adapter, payload))
+
+    configure.assert_called_once()
+    restore.assert_called_once_with("/tmp/grix-hermes-profile", snapshot)
+    result = adapter._client.send_local_action_result.await_args
+    assert result.kwargs["status"] == STATUS_FAILED
+    assert result.kwargs["error_code"] == "model_switch_failed"
+    assert "secret-relay-key" not in str(result)
+
+
+def test_configure_gateway_provider_writes_standalone_hermes_profile():
+    adapter = _adapter()
+    adapter._resolve_hermes_home = lambda: "/tmp/grix-hermes-profile"
+    adapter._schedule_gateway_restart_after_relay_change = Mock()
+    payload = {
+        "action_id": "act-relay",
+        "action_type": LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER,
+        "params": {
+            "openai_base_url": "https://relay.example/openai",
+            "api_key": "secret-relay-key",
+            "model": "deepseek-v4-flash",
+        },
+    }
+
+    with _packet_ctx(adapter):
+        with patch(
+            "grix_hermes.relay_credentials.configure_relay_credentials",
+            return_value={"relay": "enabled", "model": "deepseek-v4-flash", "restart_required": True},
+        ) as configure:
+            asyncio.run(GrixAdapter._handle_local_action_packet(adapter, payload))
+
+    configure.assert_called_once()
+    assert configure.call_args.args[0] == "/tmp/grix-hermes-profile"
+    assert configure.call_args.kwargs["credentials"].model == "deepseek-v4-flash"
+    adapter._client.send_local_action_result_confirmed.assert_awaited_once_with(
+        action_id="act-relay",
+        status=STATUS_OK,
+        result={"relay": "enabled", "model": "deepseek-v4-flash", "restart_required": True},
+    )
+    adapter._schedule_gateway_restart_after_relay_change.assert_called_once_with()
+    assert "secret-relay-key" not in str(adapter._client.send_local_action_result_confirmed.await_args)
