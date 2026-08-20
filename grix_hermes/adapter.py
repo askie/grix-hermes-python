@@ -4109,7 +4109,8 @@ class GrixAdapter(BasePlatformAdapter):
             anthropic_base_url=anthropic_base_url,
         )
         values = dict(payload)
-        values.setdefault("model", model)
+        if model and not str(values.get("model") or "").strip():
+            values["model"] = model
         return relay_credentials_from_params(values)
 
     async def _handle_apply_relay_state(self, action: GrixLocalAction) -> None:
@@ -4204,20 +4205,26 @@ class GrixAdapter(BasePlatformAdapter):
                     or isinstance(revision_value, bool)
                     or not isinstance(revision_value, int)
                     or revision_value < 0
-                    or (desired_enabled and not model)
                 ):
                     raise GrixTransportError("invalid relay state sync response")
                 revision = revision_value
 
                 if desired_enabled:
+                    # State rows created by older clients can have no model.
+                    # Match connector behavior: a locally active relay is
+                    # already valid in that case, rather than needlessly
+                    # failing a credential request that has no model input.
+                    if local.enabled and (not model or not local.model or local.model == model):
+                        await client.send_relay_state_report(applied=True, revision=revision)
+                        return
                     credential = desired.get("credential")
                     if isinstance(credential, dict):
                         credential_values = dict(credential)
-                        credential_values["model"] = model
+                        if model:
+                            credential_values["model"] = model
+                        elif local.model:
+                            credential_values["model"] = local.model
                         credentials = relay_credentials_from_params(credential_values)
-                    elif local.enabled and local.model == model:
-                        await client.send_relay_state_report(applied=True, revision=revision)
-                        return
                     else:
                         credentials = await self._request_relay_credentials(client, model)
                     result = await asyncio.to_thread(
