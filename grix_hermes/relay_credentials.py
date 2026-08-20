@@ -52,6 +52,26 @@ class RelayConfigurationSnapshot:
     relay_state: Optional[bytes]
 
 
+@dataclass(frozen=True)
+class RelayLocalState:
+    """The non-secret relay state needed by the server reconciliation protocol."""
+
+    enabled: bool
+    model: Optional[str]
+
+
+def read_relay_local_state(hermes_home: str) -> RelayLocalState:
+    """Read only whether this profile currently selects Grix and its model."""
+    home = str(Path(hermes_home).expanduser())
+    with _CONFIG_LOCK, _using_hermes_home(home):
+        read_raw_config, _, _ = _host_config_api()
+        config = _read_raw_config(read_raw_config, home)
+    model = config.get("model")
+    enabled = _model_uses_grix(config)
+    selected = str(model.get("default") or "").strip() if isinstance(model, dict) else ""
+    return RelayLocalState(enabled=enabled, model=selected or None)
+
+
 def relay_credentials_from_params(params: Dict[str, Any]) -> Optional[RelayCredentials]:
     """Read current and transitional downlink field names without logging secrets."""
     base_url = _first_text(params, "openai_base_url", "base_url", "api_base_url")

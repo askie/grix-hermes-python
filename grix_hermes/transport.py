@@ -28,6 +28,11 @@ from .contract import (
     CMD_EVENT_STOP_RESULT,
     CMD_LOCAL_ACTION_RESULT,
     CMD_LOCAL_ACTION_ACK,
+    CMD_RELAY_CREDENTIAL_REQUEST,
+    CMD_RELAY_CREDENTIAL_RESULT,
+    CMD_RELAY_STATE_SYNC_REQUEST,
+    CMD_RELAY_STATE_SYNC_RESULT,
+    CMD_RELAY_STATE_REPORT,
     CMD_PING,
     CMD_PONG,
     CMD_QUEUE_CLEAR_RESULT,
@@ -694,6 +699,65 @@ class GrixTransportClient:
         if ack_action_id != action_id.strip() or (packet.get("payload") or {}).get("received") is not True:
             raise GrixTransportError("invalid local_action_result acknowledgement")
         return True
+
+    async def request_relay_credential(
+        self,
+        *,
+        model: str,
+        openai_base_url: str,
+        anthropic_base_url: str,
+    ) -> Dict[str, Any]:
+        """Request an agent-scoped relay credential without logging its value."""
+        packet = await self.request(
+            CMD_RELAY_CREDENTIAL_REQUEST,
+            {
+                "model": model,
+                "openai_base_url": openai_base_url,
+                "anthropic_base_url": anthropic_base_url,
+            },
+            expected=(CMD_RELAY_CREDENTIAL_RESULT, CMD_ERROR),
+        )
+        if packet["cmd"] != CMD_RELAY_CREDENTIAL_RESULT:
+            raise self._packet_error(packet)
+        payload = packet.get("payload") or {}
+        if payload.get("status") != "ok":
+            raise GrixTransportError("relay credential request was rejected")
+        return payload
+
+    async def request_relay_state_sync(
+        self,
+        *,
+        local_enabled: bool,
+        local_model: Optional[str],
+    ) -> Dict[str, Any]:
+        """Fetch the desired relay state after a successful WS authentication."""
+        payload: Dict[str, Any] = {"local_enabled": bool(local_enabled)}
+        if local_model:
+            payload["local_model"] = local_model
+        packet = await self.request(
+            CMD_RELAY_STATE_SYNC_REQUEST,
+            payload,
+            expected=(CMD_RELAY_STATE_SYNC_RESULT, CMD_ERROR),
+        )
+        if packet["cmd"] != CMD_RELAY_STATE_SYNC_RESULT:
+            raise self._packet_error(packet)
+        response = packet.get("payload") or {}
+        if response.get("status") != "ok":
+            raise GrixTransportError("relay state sync was rejected")
+        return response
+
+    async def send_relay_state_report(
+        self,
+        *,
+        applied: bool,
+        revision: int,
+        error_code: Optional[str] = None,
+    ) -> None:
+        """Report the actual local relay state; errors never contain credentials."""
+        payload: Dict[str, Any] = {"applied": bool(applied), "revision": int(revision)}
+        if error_code:
+            payload["error_code"] = error_code
+        await self.send_packet(CMD_RELAY_STATE_REPORT, payload)
 
     async def acknowledge_event(
         self,

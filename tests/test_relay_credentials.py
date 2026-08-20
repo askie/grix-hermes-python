@@ -8,6 +8,7 @@ from grix_hermes.relay_credentials import (
     RelayCredentialError,
     configure_relay_credentials,
     configure_relay_credentials_for_model_switch,
+    read_relay_local_state,
     relay_credentials_from_params,
     restore_relay_configuration,
 )
@@ -148,3 +149,18 @@ def test_relay_credentials_require_complete_safe_values():
     with pytest.raises(RelayCredentialError, match="absolute HTTP") as invalid_url:
         relay_credentials_from_params({"openai_base_url": "not-a-url", "api_key": "secret", "model": "m"})
     assert invalid_url.value.code == "invalid_base_url"
+
+
+def test_read_relay_local_state_only_exposes_non_secret_selection(tmp_path):
+    config = {
+        "providers": {GRIX_PROVIDER_ID: {"api_key": "must-not-be-returned"}},
+        "model": {"provider": GRIX_PROVIDER_ID, "default": "deepseek-v4-flash"},
+    }
+    ops, _saved = _ops(config)
+
+    with patch("grix_hermes.relay_credentials._host_config_api", return_value=ops):
+        state = read_relay_local_state(str(tmp_path))
+
+    assert state.enabled is True
+    assert state.model == "deepseek-v4-flash"
+    assert "must-not-be-returned" not in repr(state)

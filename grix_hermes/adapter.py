@@ -15,6 +15,7 @@ import os
 import random
 import re
 import time
+from urllib.parse import urlparse
 from collections import defaultdict
 from contextlib import suppress
 from contextvars import ContextVar
@@ -80,6 +81,7 @@ from .contract import (
     ERR_UNSUPPORTED_LOCAL_ACTION,
     LOCAL_ACTION_CREATE_FOLDER,
     LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER,
+    LOCAL_ACTION_APPLY_RELAY_STATE,
     LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH,
     LOCAL_ACTION_EXEC_APPROVE,
     LOCAL_ACTION_EXEC_REJECT,
@@ -1620,6 +1622,7 @@ class GrixAdapter(BasePlatformAdapter):
                     await new_client.connect()
                     self._client = new_client
                     self._mark_connected()
+                    self._schedule_relay_state_sync(new_client)
                     await self._report_skills()
                     # 补发滞留的 event_result。重连回调不在 packet handler scope 内，
                     # 必须显式把新主连接放进 ContextVar —— 否则下游 _active_client()
@@ -1753,6 +1756,7 @@ class GrixAdapter(BasePlatformAdapter):
             return False
 
         self._mark_connected()
+        self._schedule_relay_state_sync(self._client)
         logger.info("[%s] Connected to %s", self.name, self.connection.endpoint)
         await self._report_skills()
         await self._start_upgrade_checker()
@@ -3618,6 +3622,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_configure_gateway_provider(action)
             return
 
+        if action.action_type == LOCAL_ACTION_APPLY_RELAY_STATE:
+            await self._handle_apply_relay_state(action)
+            return
+
         if action.action_type == LOCAL_ACTION_GET_SESSION_USAGE:
             await self._handle_get_session_usage(action)
             return
@@ -3999,7 +4007,14 @@ class GrixAdapter(BasePlatformAdapter):
         finally:
             relay_lock.release()
 
-    async def _handle_configure_gateway_provider(self, action: GrixLocalAction) -> None:
+    async def _handle_configure_gateway_provider(
+        self,
+        action: GrixLocalAction,
+        *,
+        credentials_override: Any = None,
+        disable_override: Optional[bool] = None,
+        result_extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Receive relay credentials without requiring grix-connector to be installed."""
         client = self._active_client()
         if client is None:
@@ -4007,8 +4022,12 @@ class GrixAdapter(BasePlatformAdapter):
         try:
             from .relay_credentials import configure_relay_credentials_with_snapshot, relay_credentials_from_params
 
-            disable = action.params.get("disable") is True
-            credentials = None if disable else relay_credentials_from_params(action.params)
+            disable = action.params.get("disable") is True if disable_override is None else disable_override
+            credentials = (
+                None
+                if disable
+                else (credentials_override if credentials_override is not None else relay_credentials_from_params(action.params))
+            )
             hermes_home = self._resolve_hermes_home()
             snapshot = None
             async with _relay_profile_lock(hermes_home):
@@ -4022,10 +4041,13 @@ class GrixAdapter(BasePlatformAdapter):
                 )
                 try:
                     result, snapshot = await asyncio.shield(config_task)
+                    result_payload = dict(result)
+                    if result_extra:
+                        result_payload.update(result_extra)
                     confirmed = await client.send_local_action_result_confirmed(
                         action_id=action.action_id,
                         status=STATUS_OK,
-                        result=result,
+                        result=result_payload,
                     )
                     if result.get("restart_required") is True and confirmed:
                         self._schedule_gateway_restart_after_relay_change()
@@ -4061,8 +4083,169 @@ class GrixAdapter(BasePlatformAdapter):
                             await _report_relay_rollback_failure(client, action.action_id, self.name)
                     raise
         except Exception as exc:  # noqa: BLE001 - host config errors must not expose api_key
-            await self._send_relay_config_error(action, exc)
+            failure_result = dict(result_extra) if result_extra else None
+            if failure_result and "applied" in failure_result:
+                failure_result["applied"] = False
+            await self._send_relay_config_error(action, exc, result=failure_result)
             return
+
+    def _relay_gateway_base_urls(self) -> Tuple[str, str]:
+        """Derive the same gateway provider endpoints used by grix-connector."""
+        endpoint = urlparse(self.connection.endpoint)
+        scheme = "https" if endpoint.scheme == "wss" else "http"
+        if endpoint.scheme not in {"ws", "wss"} or not endpoint.netloc:
+            raise GrixTransportError("invalid Grix websocket endpoint for relay credentials")
+        origin = f"{scheme}://{endpoint.netloc}"
+        return f"{origin}/openai/v1", f"{origin}/anthropic/v1"
+
+    async def _request_relay_credentials(self, client: GrixTransportClient, model: str) -> Any:
+        """Issue credentials on demand; returned values are never logged or sent in action results."""
+        from .relay_credentials import relay_credentials_from_params
+
+        openai_base_url, anthropic_base_url = self._relay_gateway_base_urls()
+        payload = await client.request_relay_credential(
+            model=model,
+            openai_base_url=openai_base_url,
+            anthropic_base_url=anthropic_base_url,
+        )
+        values = dict(payload)
+        values.setdefault("model", model)
+        return relay_credentials_from_params(values)
+
+    async def _handle_apply_relay_state(self, action: GrixLocalAction) -> None:
+        """Apply the durable relay toggle used by standalone Hermes profiles."""
+        client = self._active_client()
+        if client is None:
+            return
+        enabled = action.params.get("enabled")
+        revision = action.params.get("revision")
+        model = str(action.params.get("model") or "").strip()
+        if not isinstance(enabled, bool) or isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            await self._send_relay_config_error(
+                action,
+                ValueError("invalid relay state action"),
+                result={"revision": revision if isinstance(revision, int) else 0},
+            )
+            return
+        if enabled and not model:
+            await self._send_relay_config_error(
+                action,
+                ValueError("relay model is required"),
+                result={"revision": revision, "applied": False},
+            )
+            return
+        try:
+            credentials = await self._request_relay_credentials(client, model) if enabled else None
+        except Exception as exc:  # noqa: BLE001 - transport errors must become a local action result
+            await self._send_relay_config_error(
+                action,
+                exc,
+                result={"revision": revision, "applied": False},
+            )
+            return
+        await self._handle_configure_gateway_provider(
+            action,
+            credentials_override=credentials,
+            disable_override=not enabled,
+            result_extra={"revision": revision, "applied": enabled},
+        )
+
+    def _schedule_relay_state_sync(self, client: Optional[GrixTransportClient]) -> None:
+        """Reconcile durable relay desired state after every primary WS auth."""
+        if client is None:
+            return
+        # Do not cancel an earlier worker: it may be inside the blocking,
+        # atomic Hermes config write.  The profile lock serializes the new
+        # sync behind it and prevents a late write racing a new connection.
+        task = asyncio.create_task(self._sync_relay_state_after_connect(client))
+        self._relay_state_sync_task = task
+
+        def done(completed: asyncio.Task) -> None:
+            if getattr(self, "_relay_state_sync_task", None) is completed:
+                self._relay_state_sync_task = None
+            if completed.cancelled():
+                return
+            with suppress(Exception):
+                completed.result()
+
+        task.add_done_callback(done)
+
+    async def _sync_relay_state_after_connect(self, client: GrixTransportClient) -> None:
+        """Implement the connector relay-state sync path for standalone Hermes.
+
+        The server owns desired state.  This path repairs missed broadcasts
+        while the profile was offline and reports the actual local outcome.
+        """
+        from .relay_credentials import (
+            configure_relay_credentials,
+            read_relay_local_state,
+            relay_credentials_from_params,
+        )
+
+        hermes_home = self._resolve_hermes_home()
+        revision: Optional[int] = None
+        desired_enabled = False
+        try:
+            async with _relay_profile_lock(hermes_home):
+                if client is not self._client:
+                    return
+                local = await asyncio.to_thread(read_relay_local_state, hermes_home)
+                desired = await client.request_relay_state_sync(
+                    local_enabled=local.enabled,
+                    local_model=local.model,
+                )
+                if client is not self._client:
+                    return
+                desired_enabled = desired.get("enabled")
+                revision_value = desired.get("revision")
+                model = str(desired.get("model") or "").strip()
+                if (
+                    not isinstance(desired_enabled, bool)
+                    or isinstance(revision_value, bool)
+                    or not isinstance(revision_value, int)
+                    or revision_value < 0
+                    or (desired_enabled and not model)
+                ):
+                    raise GrixTransportError("invalid relay state sync response")
+                revision = revision_value
+
+                if desired_enabled:
+                    credential = desired.get("credential")
+                    if isinstance(credential, dict):
+                        credential_values = dict(credential)
+                        credential_values["model"] = model
+                        credentials = relay_credentials_from_params(credential_values)
+                    elif local.enabled and local.model == model:
+                        await client.send_relay_state_report(applied=True, revision=revision)
+                        return
+                    else:
+                        credentials = await self._request_relay_credentials(client, model)
+                    result = await asyncio.to_thread(
+                        configure_relay_credentials,
+                        hermes_home,
+                        credentials=credentials,
+                    )
+                else:
+                    result = await asyncio.to_thread(
+                        configure_relay_credentials,
+                        hermes_home,
+                        disable=True,
+                    )
+
+                await client.send_relay_state_report(applied=desired_enabled, revision=revision)
+                if result.get("restart_required") is True:
+                    self._schedule_gateway_restart_after_relay_change()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - never expose a credential in logs or reports
+            logger.warning("[%s] relay state sync failed (%s)", self.name, type(exc).__name__)
+            if revision is not None and client is self._client:
+                with suppress(Exception):
+                    await client.send_relay_state_report(
+                        applied=not desired_enabled,
+                        revision=revision,
+                        error_code="relay_sync_failed",
+                    )
 
     def _schedule_gateway_restart_after_relay_change(self) -> None:
         """Restart this profile only after its local-action ACK was queued.
@@ -4082,7 +4265,13 @@ class GrixAdapter(BasePlatformAdapter):
 
         asyncio.get_running_loop().call_soon(request_restart)
 
-    async def _send_relay_config_error(self, action: GrixLocalAction, exc: Exception) -> None:
+    async def _send_relay_config_error(
+        self,
+        action: GrixLocalAction,
+        exc: Exception,
+        *,
+        result: Optional[Dict[str, Any]] = None,
+    ) -> None:
         from .relay_credentials import RelayCredentialError, redact_relay_secret
 
         client = self._active_client()
@@ -4104,6 +4293,7 @@ class GrixAdapter(BasePlatformAdapter):
         await client.send_local_action_result(
             action_id=action.action_id,
             status=STATUS_FAILED,
+            result=result,
             error_code=code,
             error_message=message,
         )

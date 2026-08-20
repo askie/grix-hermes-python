@@ -4,7 +4,16 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from grix_hermes.contract import CMD_ERROR, CMD_LOCAL_ACTION_ACK, CMD_LOCAL_ACTION_RESULT
+from grix_hermes.contract import (
+    CMD_ERROR,
+    CMD_LOCAL_ACTION_ACK,
+    CMD_LOCAL_ACTION_RESULT,
+    CMD_RELAY_CREDENTIAL_REQUEST,
+    CMD_RELAY_CREDENTIAL_RESULT,
+    CMD_RELAY_STATE_REPORT,
+    CMD_RELAY_STATE_SYNC_REQUEST,
+    CMD_RELAY_STATE_SYNC_RESULT,
+)
 from grix_hermes.transport import GrixTransportClient
 
 
@@ -95,3 +104,26 @@ def test_cancelled_request_removes_pending_while_packet_is_sending():
         assert client._pending == {}
 
     asyncio.run(run())
+
+
+def test_relay_transport_uses_request_reply_and_non_secret_state_report():
+    client = _client()
+    client.request.side_effect = [
+        {"cmd": CMD_RELAY_CREDENTIAL_RESULT, "payload": {"status": "ok", "api_key": "secret"}},
+        {"cmd": CMD_RELAY_STATE_SYNC_RESULT, "payload": {"status": "ok", "enabled": True, "revision": 2}},
+    ]
+
+    async def run():
+        credential = await client.request_relay_credential(
+            model="m", openai_base_url="https://x/openai/v1", anthropic_base_url="https://x/anthropic/v1"
+        )
+        state = await client.request_relay_state_sync(local_enabled=True, local_model="m")
+        await client.send_relay_state_report(applied=True, revision=2)
+        return credential, state
+
+    credential, state = asyncio.run(run())
+    assert credential["api_key"] == "secret"
+    assert state["revision"] == 2
+    assert client.request.await_args_list[0].args[0] == CMD_RELAY_CREDENTIAL_REQUEST
+    assert client.request.await_args_list[1].args[0] == CMD_RELAY_STATE_SYNC_REQUEST
+    client.send_packet.assert_awaited_once_with(CMD_RELAY_STATE_REPORT, {"applied": True, "revision": 2})

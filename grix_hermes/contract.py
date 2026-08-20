@@ -29,6 +29,11 @@ CMD_SESSION_ACTIVITY_SET = "session_activity_set"
 CMD_LOCAL_ACTION = "local_action"
 CMD_LOCAL_ACTION_RESULT = "local_action_result"
 CMD_LOCAL_ACTION_ACK = "local_action_ack"
+CMD_RELAY_CREDENTIAL_REQUEST = "relay_credential_request"
+CMD_RELAY_CREDENTIAL_RESULT = "relay_credential_result"
+CMD_RELAY_STATE_SYNC_REQUEST = "relay_state_sync_request"
+CMD_RELAY_STATE_SYNC_RESULT = "relay_state_sync_result"
+CMD_RELAY_STATE_REPORT = "relay_state_report"
 CMD_EVENT_MSG = "event_msg"
 CMD_EVENT_ACK = "event_ack"
 CMD_EVENT_RESULT = "event_result"
@@ -119,6 +124,11 @@ STABLE_PUBLIC_COMMANDS = (
         "purpose": "local_action_result",
     },
     {"cmd": CMD_LOCAL_ACTION_ACK, "direction": "server_to_client", "purpose": "local_action_result_received"},
+    {"cmd": CMD_RELAY_CREDENTIAL_REQUEST, "direction": "client_to_server", "purpose": "request_relay_credential"},
+    {"cmd": CMD_RELAY_CREDENTIAL_RESULT, "direction": "server_to_client", "purpose": "relay_credential_result"},
+    {"cmd": CMD_RELAY_STATE_SYNC_REQUEST, "direction": "client_to_server", "purpose": "sync_relay_state"},
+    {"cmd": CMD_RELAY_STATE_SYNC_RESULT, "direction": "server_to_client", "purpose": "relay_state_sync_result"},
+    {"cmd": CMD_RELAY_STATE_REPORT, "direction": "client_to_server", "purpose": "report_applied_relay_state"},
     {
         "cmd": CMD_SESSION_ROUTE_BIND,
         "direction": "client_to_server",
@@ -180,6 +190,7 @@ LOCAL_ACTION_FILE_LIST = "file_list"
 LOCAL_ACTION_CREATE_FOLDER = "create_folder"
 LOCAL_ACTION_SET_MODEL = "set_model"
 LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER = "configure_gateway_provider"
+LOCAL_ACTION_APPLY_RELAY_STATE = "apply_relay_state"
 LOCAL_ACTION_GET_SESSION_USAGE = "get_session_usage"
 LOCAL_ACTION_GET_RATE_LIMITS = "get_rate_limits"
 LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH = "connector_upgrade_push"
@@ -214,6 +225,7 @@ STABLE_LOCAL_ACTIONS = (
     LOCAL_ACTION_CREATE_FOLDER,
     LOCAL_ACTION_SET_MODEL,
     LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER,
+    LOCAL_ACTION_APPLY_RELAY_STATE,
     LOCAL_ACTION_GET_SESSION_USAGE,
     LOCAL_ACTION_GET_RATE_LIMITS,
     LOCAL_ACTION_CONNECTOR_UPGRADE_PUSH,
@@ -319,6 +331,9 @@ MINIMAL_PLUGIN_SURFACE = (
     CMD_EDIT_MSG,
     CMD_LOCAL_ACTION,
     CMD_LOCAL_ACTION_RESULT,
+    CMD_RELAY_CREDENTIAL_REQUEST,
+    CMD_RELAY_STATE_SYNC_REQUEST,
+    CMD_RELAY_STATE_REPORT,
     CMD_SESSION_ROUTE_BIND,
     CMD_SESSION_ROUTE_RESOLVE,
     CMD_AGENT_INVOKE,
