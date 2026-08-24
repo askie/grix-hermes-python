@@ -6537,6 +6537,11 @@ class GrixAdapter(BasePlatformAdapter):
                     return cleaned
             return False
 
+        # 先硬中断 runner 里正在跑的 agent 线程：cancel_session_processing 只取消
+        # asyncio 包装任务，agent 循环跑在线程里，不打中断标志会继续调用模型和
+        # 起后台进程（停止后仍在跑发布脚本的根因）。
+        await self._hard_interrupt_running_agent(session_key, source)
+
         await self.cancel_session_processing(
             session_key,
             release_guard=True,
@@ -6583,6 +6588,34 @@ class GrixAdapter(BasePlatformAdapter):
 
         logger.info("[%s] Locally stopped active GRIX session %s", self.name, session_key)
         return True
+
+    async def _hard_interrupt_running_agent(self, session_key: str, source: Any) -> None:
+        """走 hermes 原生 /stop 同一条路硬中断 agent 线程，失败只记日志。"""
+        try:
+            from gateway.run import _gateway_runner_ref, _INTERRUPT_REASON_STOP
+
+            runner = _gateway_runner_ref()
+        except Exception as exc:
+            logger.warning(
+                "[%s] stop hard-interrupt unavailable (runner import failed): %s",
+                self.name, exc,
+            )
+            return
+        interrupt = getattr(runner, "_interrupt_and_clear_session", None)
+        if runner is None or not callable(interrupt):
+            return
+        try:
+            await interrupt(
+                session_key,
+                source,
+                interrupt_reason=_INTERRUPT_REASON_STOP,
+                invalidation_reason="grix_stop",
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] stop hard-interrupt failed session_key=%s: %s",
+                self.name, session_key, exc,
+            )
 
     async def _notify_session_stop_result(
         self,

@@ -341,3 +341,53 @@ def test_composing_skipped_for_other_sessions_events(monkeypatch):
     _with_ctx(client, inst.send_typing(SESSION_ID))
 
     assert inst.activities == []
+
+
+# ── 停止必须硬中断 runner 里的 agent 线程 ────────────────────────────────────
+
+
+def test_stop_hard_interrupts_running_agent_before_cancel(monkeypatch):
+    """回归：cancel_session_processing 只取消 asyncio 包装任务，agent 循环跑在
+    线程里，不走 runner._interrupt_and_clear_session 就会在"已停止"后继续调模型、
+    起后台进程（发布脚本停止后仍在跑）。必须先硬中断，再取消。"""
+    client = FakeTransportClient()
+    inst = _prepare_stop_adapter(monkeypatch, client, [GROUP_KEY])
+
+    calls = []
+
+    class _Runner:
+        async def _interrupt_and_clear_session(self, session_key, source, **kw):
+            calls.append(("interrupt", session_key, kw["interrupt_reason"]))
+
+    orig_cancel = inst.cancel_session_processing
+
+    async def _cancel(session_key, **kw):
+        calls.append(("cancel", session_key))
+        await orig_cancel(session_key, **kw)
+
+    inst.cancel_session_processing = _cancel
+    gw_run = types.ModuleType("gateway.run")
+    gw_run._gateway_runner_ref = lambda: _Runner()
+    gw_run._INTERRUPT_REASON_STOP = "Stop requested"
+    monkeypatch.setitem(sys.modules, "gateway.run", gw_run)
+
+    _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
+
+    assert calls == [
+        ("interrupt", GROUP_KEY, "Stop requested"),
+        ("cancel", GROUP_KEY),
+    ]
+
+
+def test_stop_survives_missing_runner(monkeypatch):
+    """runner 不可用（测试桩 / 启动早期）时停止流程照常完成。"""
+    client = FakeTransportClient()
+    inst = _prepare_stop_adapter(monkeypatch, client, [GROUP_KEY])
+    gw_run = types.ModuleType("gateway.run")
+    gw_run._gateway_runner_ref = lambda: None
+    gw_run._INTERRUPT_REASON_STOP = "Stop requested"
+    monkeypatch.setitem(sys.modules, "gateway.run", gw_run)
+
+    _with_ctx(client, inst._handle_message_packet(_toolbar_stop_payload()))
+
+    assert inst.stopped_keys == [GROUP_KEY]
