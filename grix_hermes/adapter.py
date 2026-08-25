@@ -2112,13 +2112,12 @@ class GrixAdapter(BasePlatformAdapter):
             thread_id=thread_id_hint,
             source_hint=source_hint,
         )
-        # NOTE: event_id is deliberately NOT included in send_text here.
-        # Previously, the first streaming chunk carried event_id and called
-        # _complete_event_if_needed, which closed the backend pending event
-        # prematurely.  Subsequent final-response sends then hit 4003
-        # "event_id not owned by current agent".
-        # Event lifecycle is now managed at the handler level
-        # (_handle_message_packet) instead.
+        # 每条消息都带触发 event_id：服务端 agentapi 的 send_msg 只按 event_id
+        # 查 active run 来继承触发消息的 visible_to（隐藏消息的回复只对发起人可见），
+        # 不带就会按全员可见落库。这里只透传 event_id，不在发送路径里完结事件——
+        # 事件生命周期仍由 _handle_message_packet 统一管理，不会再触发早年的
+        # 4003「event_id not owned by current agent」。
+        trigger_event_id = self._resolve_trigger_event_id(str(chat_id), reply_to_id)
         biz_card = (
             None
             if is_tool_execution
@@ -2145,6 +2144,7 @@ class GrixAdapter(BasePlatformAdapter):
                     chunk,
                     reply_to_message_id=reply_to if (is_first and force_quote) else None,
                     thread_id=thread_id,
+                    event_id=trigger_event_id,
                     biz_card=biz_card if is_first else None,
                     channel_data=channel_data if is_first else None,
                 )
@@ -2181,6 +2181,32 @@ class GrixAdapter(BasePlatformAdapter):
                 raw_response=exc,
                 retryable=_coerce_retryable(exc),
             )
+
+    def _resolve_trigger_event_id(self, chat_id: str, reply_to_id: str) -> Optional[str]:
+        """定位本次发送所属的触发事件 event_id。
+
+        优先按处理任务 ContextVar 里的 session_key 精确命中本轮 reply target
+        （asyncio 任务链路与工具线程都会拷贝传播）；ContextVar 缺失时退化为
+        「同 chat 且 reply_to 等于触发消息 id」匹配；都匹配不到则不带 event_id。
+        """
+        state = self._active_state()
+        ctx_key = _CURRENT_REPLY_SESSION_KEY.get()
+        if ctx_key:
+            entry = state.active_reply_targets.get(ctx_key)
+            if entry and str(entry.get("chat_id") or "") == chat_id:
+                event_id = str(entry.get("event_id") or "").strip()
+                if event_id:
+                    return event_id
+        if reply_to_id:
+            for entry in state.active_reply_targets.values():
+                if str(entry.get("chat_id") or "") != chat_id:
+                    continue
+                if str(entry.get("message_id") or "") != reply_to_id:
+                    continue
+                event_id = str(entry.get("event_id") or "").strip()
+                if event_id:
+                    return event_id
+        return None
 
     async def send_final_reply(
         self,

@@ -129,6 +129,7 @@ class FakeTransportClient:
             "content": content,
             "reply_to_message_id": reply_to_message_id,
             "thread_id": thread_id,
+            "event_id": kw.get("event_id"),
             "biz_card": biz_card,
             "channel_data": channel_data,
         })
@@ -232,6 +233,7 @@ def test_send_tool_progress_uses_minimal_wire_payload_without_mutating_audit_inp
         "content": "",
         "reply_to_message_id": None,
         "thread_id": "thread-7",
+        "event_id": None,
         "biz_card": None,
         "channel_data": {
             "grix": {
@@ -367,6 +369,47 @@ def test_reply_tool_quotes_trigger_message(monkeypatch):
     assert len(client.sent) == 1
     assert client.sent[0]["reply_to_message_id"] == "trigger-1"
     assert client.sent[0]["content"] == "最终总结"
+
+
+def test_reply_tool_send_carries_trigger_event_id(monkeypatch):
+    """最终应答须带触发 event_id：服务端靠它继承隐藏消息的 visible_to。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _install_runner(monkeypatch, inst)
+    _put_target(inst, client=client)
+
+    out = asyncio.run(reply_tool_mod._grix_reply_handler({"text": "最终总结"}))
+
+    assert out.startswith("OK:")
+    assert client.sent[0]["event_id"] == "ev-1"
+
+
+def test_progress_send_carries_trigger_event_id_via_context(monkeypatch):
+    """过程消息（无引用）也须带 event_id，按处理任务 ContextVar 命中本轮 target。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _put_target(inst, client=client)
+
+    async def _run():
+        adapter_mod._CURRENT_REPLY_SESSION_KEY.set("sk:chat-1")
+        return await inst.send("chat-1", "进度中")
+
+    result = _with_ctx(client, _run())
+    assert result.success
+    assert client.sent[0]["reply_to_message_id"] is None
+    assert client.sent[0]["event_id"] == "ev-1"
+
+
+def test_send_without_matching_target_omits_event_id(monkeypatch):
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    result = _with_ctx(client, inst.send("chat-1", "无归属文本"))
+    assert result.success
+    assert client.sent[0]["event_id"] is None
 
 
 def test_reply_tool_no_active_target_errors(monkeypatch):

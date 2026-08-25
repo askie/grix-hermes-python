@@ -504,14 +504,12 @@ class GrixTransportClient:
             "msg_type": 1,
             "content": text,
         }
-        if event_id:
-            client_msg_id = f"hermes_{event_id.strip()}"
-        else:
-            digest = hashlib.sha256(
-                f"{stripped_session}:{time.monotonic_ns()}".encode()
-            ).hexdigest()[:16]
-            client_msg_id = f"hermes_{digest}"
-        payload["client_msg_id"] = client_msg_id
+        # client_msg_id 必须每条唯一：event_id 现在随每条过程/最终消息一起上送
+        # （服务端据此继承触发消息的 visible_to），不能再用 event_id 充当去重键。
+        digest = hashlib.sha256(
+            f"{stripped_session}:{time.monotonic_ns()}".encode()
+        ).hexdigest()[:16]
+        payload["client_msg_id"] = f"hermes_{digest}"
         if reply_to_message_id:
             payload["quoted_message_id"] = reply_to_message_id.strip()
         if thread_id:
