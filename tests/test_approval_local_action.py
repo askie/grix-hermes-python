@@ -188,8 +188,11 @@ def test_configure_gateway_provider_writes_standalone_hermes_profile():
 
     with _packet_ctx(adapter):
         with patch(
-            "grix_hermes.relay_credentials.configure_relay_credentials",
-            return_value={"relay": "enabled", "model": "deepseek-v4-flash", "restart_required": True},
+            "grix_hermes.relay_credentials.configure_relay_credentials_with_snapshot",
+            return_value=(
+                {"relay": "enabled", "model": "deepseek-v4-flash", "restart_required": True},
+                Mock(name="relay_snapshot"),
+            ),
         ) as configure:
             asyncio.run(GrixAdapter._handle_local_action_packet(adapter, payload))
 
