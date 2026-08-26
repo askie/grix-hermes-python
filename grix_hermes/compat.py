@@ -138,12 +138,11 @@ def build_exec_approval_message(
     if normalized_description:
         biz_payload["warning_text"] = normalized_description
 
-    heading = (
-        "[Smart DENY] owner override for one operation"
-        if smart_denied
-        else f"[Exec Approval] {_compact_text(normalized_command, 160)} (hermes)"
-    )
-    fallback_lines = [heading, decision_commands["allow-once"]]
+    fallback_lines = []
+    if smart_denied:
+        fallback_lines.append("[Smart DENY] owner override for one operation")
+    fallback_lines.append(f"[Exec Approval] {_compact_text(normalized_command, 160)} (hermes)")
+    fallback_lines.append(decision_commands["allow-once"])
     if normalized_description:
         fallback_lines.append(f"Reason: {normalized_description}")
 
