@@ -2300,6 +2300,9 @@ class GrixAdapter(BasePlatformAdapter):
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
         approval_id: Optional[str] = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
     ) -> SendResult:
         client = await self._get_ready_client(operation="send_exec_approval")
         if not client:
@@ -2317,11 +2320,14 @@ class GrixAdapter(BasePlatformAdapter):
             thread_id=self._metadata_thread_id(metadata),
             source_hint=source_hint,
         )
-        raw_approval_data = None
+        raw_approval_data: Dict[str, Any] = {}
         if isinstance(metadata, dict):
             candidate = metadata.get("approval_data")
             if isinstance(candidate, dict):
-                raw_approval_data = candidate
+                raw_approval_data = dict(candidate)
+        raw_approval_data["allow_permanent"] = allow_permanent
+        raw_approval_data["allow_session"] = allow_session
+        raw_approval_data["smart_denied"] = smart_denied
 
         message = build_exec_approval_message(
             approval_id=resolved_approval_id,
