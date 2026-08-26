@@ -189,6 +189,14 @@ def _remove_pending(agent_id: Optional[str] = None) -> None:
         pass
 
 
+class PluginNotEnabledError(RuntimeError):
+    """The plugin update/install succeeded but the plugin is still disabled.
+
+    Distinguished from a plain update/install failure so backend reports
+    (and operators reading them) can tell the two failure modes apart.
+    """
+
+
 # ---------------------------------------------------------------------------
 #  UpgradeChecker
 # ---------------------------------------------------------------------------
@@ -379,11 +387,12 @@ class UpgradeChecker:
             self._record_failure(target)
 
             duration_ms = int((time.monotonic() - start_time) * 1000)
+            error_code = "ENABLE_VERIFY_FAILED" if isinstance(exc, PluginNotEnabledError) else "UPGRADE_FAILED"
             await self._report({
                 "from_version": from_ver,
                 "to_version": target,
                 "status": "failed",
-                "error_code": "UPGRADE_FAILED",
+                "error_code": error_code,
                 "error_msg": msg[:500],
                 "duration_ms": duration_ms,
             })
@@ -599,8 +608,8 @@ class UpgradeChecker:
         """
         await self._run_cmd(["hermes", "plugins", "enable", PLUGIN_NAME])
         code, stdout, stderr = await self._run_cmd(["hermes", "plugins", "show", PLUGIN_NAME])
-        if code != 0 or "Status: enabled" not in stdout:
-            raise RuntimeError(
+        if code != 0 or "status: enabled" not in (stdout or "").lower():
+            raise PluginNotEnabledError(
                 f"plugin not enabled after update; "
                 f"status check: {(stdout or stderr)[:300] or '<no output>'}"
             )

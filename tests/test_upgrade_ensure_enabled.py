@@ -80,6 +80,7 @@ def _install_stubs() -> None:
 
 _install_stubs()
 
+from grix_hermes import upgrade_checker as uc  # noqa: E402
 from grix_hermes.upgrade_checker import UpgradeChecker  # noqa: E402
 
 
@@ -151,3 +152,40 @@ def test_install_fallback_success_also_verified(monkeypatch):
     assert any(c[:3] == ["hermes", "plugins", "install"] for c in calls)
     assert calls[-2][:3] == ["hermes", "plugins", "enable"]
     assert calls[-1][:3] == ["hermes", "plugins", "show"]
+
+
+def test_check_skips_restart_and_reports_distinct_error_code_when_left_disabled(monkeypatch, tmp_path):
+    """_check() 级别验证：静默 disable 时不重启，且回执 error_code 可与
+    update/install 本身失败区分开——这正是这次事故里被漏判的地方。"""
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(uc, "_is_shadowed_copy", lambda: False)
+
+    _, fake_cmd = _fake_run_cmd([
+        (["hermes", "plugins", "update"], (0, "", "")),
+        (["hermes", "plugins", "enable"], (0, "", "")),
+        (["hermes", "plugins", "show"], (0, "Status: disabled\n", "")),
+    ])
+    monkeypatch.setattr(UpgradeChecker, "_run_cmd", staticmethod(fake_cmd))
+
+    async def _fake_query(self):
+        return {"available": True, "release": {"version": "1.13.9"}}
+
+    monkeypatch.setattr(UpgradeChecker, "_query_upgrade", _fake_query)
+
+    reports = []
+
+    async def _fake_report(self, report):
+        reports.append(report)
+
+    monkeypatch.setattr(UpgradeChecker, "_report", _fake_report)
+
+    restarted = []
+    monkeypatch.setattr(UpgradeChecker, "_restart_process", lambda self: restarted.append(1))
+
+    checker = _make_checker()
+    asyncio.run(checker._check())
+
+    assert restarted == []
+    assert len(reports) == 1
+    assert reports[0]["status"] == "failed"
+    assert reports[0]["error_code"] == "ENABLE_VERIFY_FAILED"
