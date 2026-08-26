@@ -68,7 +68,6 @@ def build_card_action_user_text(tag: Any, value: Any) -> str:
 
 
 _DEFAULT_APPROVAL_TIMEOUT_SEC = 300
-_ALLOWED_DECISIONS = ("allow-once", "allow-always", "deny")
 
 
 def _compact_text(value: str, limit: int) -> str:
@@ -105,8 +104,14 @@ def build_exec_approval_message(
     normalized_command = str(command or "").replace("\r\n", "\n").strip()
     normalized_description = str(description or "").replace("\r\n", "\n").strip()
 
-    decisions = list(_ALLOWED_DECISIONS)
-    decision_commands = _decision_commands(normalized_approval_id)
+    smart_denied = bool(isinstance(raw_approval_data, Mapping) and raw_approval_data.get("smart_denied"))
+    allow_permanent = not isinstance(raw_approval_data, Mapping) or raw_approval_data.get("allow_permanent", True)
+
+    decisions = ["allow-once"]
+    if not smart_denied and allow_permanent:
+        decisions.append("allow-always")
+    decisions.append("deny")
+    decision_commands = {key: cmd for key, cmd in _decision_commands(normalized_approval_id).items() if key in decisions}
 
     raw_payload: Dict[str, Any] = (
         copy.deepcopy(dict(raw_approval_data)) if isinstance(raw_approval_data, Mapping) else {}
@@ -128,14 +133,16 @@ def build_exec_approval_message(
         "allowed_decisions": list(decisions),
         "decision_commands": dict(decision_commands),
         "expires_in_seconds": _DEFAULT_APPROVAL_TIMEOUT_SEC,
+        "smart_denied": smart_denied,
     }
     if normalized_description:
         biz_payload["warning_text"] = normalized_description
 
-    fallback_lines = [
-        f"[Exec Approval] {_compact_text(normalized_command, 160)} (hermes)",
-        decision_commands["allow-once"],
-    ]
+    fallback_lines = []
+    if smart_denied:
+        fallback_lines.append("[Smart DENY] owner override for one operation")
+    fallback_lines.append(f"[Exec Approval] {_compact_text(normalized_command, 160)} (hermes)")
+    fallback_lines.append(decision_commands["allow-once"])
     if normalized_description:
         fallback_lines.append(f"Reason: {normalized_description}")
 
