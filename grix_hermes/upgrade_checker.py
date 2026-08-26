@@ -558,6 +558,7 @@ class UpgradeChecker:
             code, stdout, stderr = await self._run_cmd(["hermes", "plugins", "update", PLUGIN_NAME])
             if code == 0:
                 logger.info("[upgrade] hermes plugins update succeeded (attempt %d)", attempt)
+                await self._ensure_enabled()
                 return
             # ``hermes`` prints git failures (e.g. dirty tree, non-ff) to stdout, not
             # stderr, so capture both — reporting stderr alone leaves the real cause blank.
@@ -575,6 +576,7 @@ class UpgradeChecker:
         )
         if code2 == 0:
             logger.info("[upgrade] hermes plugins install succeeded")
+            await self._ensure_enabled()
             return
 
         install_out = "\n".join(p for p in (stdout2, stderr2) if p)
@@ -582,6 +584,26 @@ class UpgradeChecker:
             f"both update (exit {last_code}) and install (exit {code2}) failed; "
             f"output={(install_out or last_out)[:500] or '<no output>'}"
         )
+
+    async def _ensure_enabled(self) -> None:
+        """Guard against ``hermes plugins update`` landing the plugin disabled.
+
+        Observed in production: a successful ``hermes plugins update`` can still
+        leave grix-hermes out of ``plugins.enabled`` in config.yaml. Restarting
+        into that state silently drops all messaging connectivity (the gateway
+        logs "No messaging platforms enabled" with no error anywhere) — so this
+        must run, and be verified, before the caller proceeds to restart.
+        Raising here aborts ``_do_upgrade`` before the restart, so ``_check``'s
+        except-block reports the upgrade as failed and the old, still-connected
+        process keeps running instead of restarting into a broken state.
+        """
+        await self._run_cmd(["hermes", "plugins", "enable", PLUGIN_NAME])
+        code, stdout, stderr = await self._run_cmd(["hermes", "plugins", "show", PLUGIN_NAME])
+        if code != 0 or "Status: enabled" not in stdout:
+            raise RuntimeError(
+                f"plugin not enabled after update; "
+                f"status check: {(stdout or stderr)[:300] or '<no output>'}"
+            )
 
     @staticmethod
     async def _run_cmd(
