@@ -319,7 +319,28 @@ def test_snapshot_reports_switchable_toolbar_models():
     meta = client.binding_cards[-1]["meta"]
     assert meta["model_id"] == "deepseek-v4-flash"
     assert meta["model_provider"] == "opencode-go"
+    assert meta["provider_id"] == "opencode-go"
     assert meta["available_models"] == inst._toolbar_available_models
+    assert meta["available_providers"] == [{"id": "opencode-go", "displayName": "OpenCode Go"}]
+
+
+def test_snapshot_filters_models_to_current_provider():
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    inst._toolbar_model_id = "kimi-k2"
+    inst._toolbar_model_provider = "kimi"
+    inst._toolbar_available_models = [
+        {"id": "deepseek-v4-pro", "displayName": "deepseek-v4-pro", "provider": "deepseek", "providerLabel": "DeepSeek"},
+        {"id": "kimi-k2", "displayName": "kimi-k2", "provider": "kimi", "providerLabel": "Kimi"},
+    ]
+
+    _run_with_ctx(
+        inst, client, inst._handle_queue_snapshot_query_packet({"session_id": "s1"})
+    )
+
+    meta = client.binding_cards[-1]["meta"]
+    assert [m["id"] for m in meta["available_models"]] == ["kimi-k2"]
+    assert [p["id"] for p in meta["available_providers"]] == ["deepseek", "kimi"]
 
 
 def test_inventory_refresh_repushes_empty_new_session_and_releases_tracking(monkeypatch):
