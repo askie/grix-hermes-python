@@ -22,7 +22,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, ProcessingOutcome, SendResult
@@ -90,6 +90,7 @@ from .contract import (
     LOCAL_ACTION_GET_RATE_LIMITS,
     LOCAL_ACTION_GET_SESSION_USAGE,
     LOCAL_ACTION_SET_MODEL,
+    LOCAL_ACTION_SET_PROVIDER,
     LOCAL_ACTION_SKILL_DISABLE,
     LOCAL_ACTION_SKILL_ENABLE,
     LOCAL_ACTION_SKILL_REFRESH,
@@ -437,6 +438,34 @@ def _fallback_toolbar_models(
 ) -> List[Dict[str, Any]]:
     model = (model or "").strip()
     return [_toolbar_model_entry(model, provider, provider_label)] if model else []
+
+
+def _toolbar_provider_entries(models: Iterable[Any]) -> List[Dict[str, str]]:
+    """Distinct providers found in the model catalog, in catalog order."""
+    entries: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+    for entry in models or ():
+        if not isinstance(entry, dict):
+            continue
+        slug = str(entry.get("provider") or "").strip()
+        if not slug or slug in seen:
+            continue
+        seen.add(slug)
+        label = str(entry.get("providerLabel") or "").strip() or slug
+        entries.append({"id": slug, "displayName": label})
+    return entries
+
+
+def _toolbar_models_for_provider(models: Iterable[Any], provider: str) -> List[Dict[str, Any]]:
+    """Models belonging to ``provider``; the whole catalog when no provider is known."""
+    provider = str(provider or "").strip()
+    all_models = [entry for entry in models or () if isinstance(entry, dict)]
+    if not provider:
+        return all_models
+    filtered = [
+        entry for entry in all_models if str(entry.get("provider") or "").strip() == provider
+    ]
+    return filtered or all_models
 
 
 def _configured_toolbar_providers(config: Dict[str, Any]) -> Set[str]:
@@ -3650,6 +3679,10 @@ class GrixAdapter(BasePlatformAdapter):
             await self._handle_set_model(action)
             return
 
+        if action.action_type == LOCAL_ACTION_SET_PROVIDER:
+            await self._handle_set_provider(action)
+            return
+
         if action.action_type == LOCAL_ACTION_CONFIGURE_GATEWAY_PROVIDER:
             await self._handle_configure_gateway_provider(action)
             return
@@ -3789,16 +3822,90 @@ class GrixAdapter(BasePlatformAdapter):
     def _toolbar_session_model_key(owner_key: str, session_id: str) -> str:
         return f"{owner_key}\0{session_id}"
 
-    def _find_toolbar_model_entry(self, model_id: str) -> Optional[Dict[str, Any]]:
+    def _find_toolbar_model_entry(
+        self, model_id: str, provider: str = ""
+    ) -> Optional[Dict[str, Any]]:
         target = str(model_id or "").strip()
+        provider = str(provider or "").strip()
         if not target:
             return None
+        fallback: Optional[Dict[str, Any]] = None
         for entry in getattr(self, "_toolbar_available_models", None) or ():
             if not isinstance(entry, dict):
                 continue
-            if str(entry.get("id") or "").strip() == target:
+            if str(entry.get("id") or "").strip() != target:
+                continue
+            if provider and str(entry.get("provider") or "").strip() == provider:
                 return entry
-        return None
+            if fallback is None:
+                fallback = entry
+        return fallback
+
+    def _toolbar_model_catalog_meta(self, provider: str) -> Dict[str, Any]:
+        """Toolbar catalog fields: all providers plus the models of ``provider``."""
+        models = getattr(self, "_toolbar_available_models", None) or []
+        meta: Dict[str, Any] = {
+            "available_models": _toolbar_models_for_provider(models, provider),
+        }
+        providers = _toolbar_provider_entries(models)
+        if providers:
+            meta["available_providers"] = providers
+        return meta
+
+    async def _handle_set_provider(self, action: GrixLocalAction) -> None:
+        """Switch provider: keep the current model when it exists there, else its first model."""
+        client = self._active_client()
+        if client is None:
+            return
+        provider = str(
+            action.params.get("provider_id") or action.params.get("provider") or ""
+        ).strip()
+        session_id = str(action.params.get("session_id") or "").strip()
+        if not provider or not session_id:
+            await client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="invalid_params",
+                error_message="session_id and provider_id are required",
+            )
+            return
+        models = _toolbar_models_for_provider(
+            getattr(self, "_toolbar_available_models", None) or [], provider
+        )
+        models = [m for m in models if str(m.get("provider") or "").strip() == provider]
+        if not models:
+            await client.send_local_action_result(
+                action_id=action.action_id,
+                status=STATUS_FAILED,
+                error_code="provider_not_found",
+                error_message=f"provider has no configured models: {provider}",
+            )
+            return
+        owner_key = self._active_owner_key()
+        session_model = (getattr(self, "_toolbar_session_models", {}) or {}).get(
+            self._toolbar_session_model_key(owner_key, session_id), {}
+        )
+        current_model = str(
+            session_model.get("model_id") or getattr(self, "_toolbar_model_id", "") or ""
+        ).strip()
+        target = next(
+            (m for m in models if str(m.get("id") or "").strip() == current_model),
+            models[0],
+        )
+        model_action = GrixLocalAction(
+            action_id=action.action_id,
+            action_type=action.action_type,
+            params={
+                "session_id": session_id,
+                "model_id": str(target.get("id") or ""),
+                "provider": provider,
+                "display_label": str(target.get("displayName") or target.get("id") or ""),
+            },
+            event_id=action.event_id,
+            timeout_ms=action.timeout_ms,
+            raw=action.raw,
+        )
+        await self._handle_set_model(model_action)
 
     async def _handle_set_model(self, action: GrixLocalAction) -> None:
         client = self._active_client()
@@ -3823,7 +3930,10 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return
 
-        entry = self._find_toolbar_model_entry(model_id)
+        requested_provider = str(
+            action.params.get("provider") or action.params.get("model_provider") or ""
+        ).strip()
+        entry = self._find_toolbar_model_entry(model_id, requested_provider)
         if entry is None and getattr(self, "_toolbar_available_models", None):
             await client.send_local_action_result(
                 action_id=action.action_id,
@@ -3833,12 +3943,9 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return
 
-        provider = str(
-            action.params.get("provider")
-            or action.params.get("model_provider")
-            or ((entry or {}).get("provider") if isinstance(entry, dict) else "")
-            or ""
-        ).strip()
+        provider = requested_provider
+        if not provider and isinstance(entry, dict):
+            provider = str(entry.get("provider") or "").strip()
         if re.search(r"\s", provider):
             await client.send_local_action_result(
                 action_id=action.action_id,
@@ -3994,7 +4101,9 @@ class GrixAdapter(BasePlatformAdapter):
                 "session_id": session_id,
                 "model_id": model_id,
                 "provider": provider,
+                "provider_id": provider,
                 "display_label": label,
+                **self._toolbar_model_catalog_meta(provider),
             }
             confirmed = False
             if credentials is not None:
@@ -6400,11 +6509,17 @@ class GrixAdapter(BasePlatformAdapter):
             try:
                 meta: Dict[str, Any] = {
                     "model_id": model_id,
-                    "available_models": list(available_models),
+                    "available_models": _toolbar_models_for_provider(
+                        available_models, model_provider
+                    ),
                     **self._provider_quota_toolbar_meta(),
                 }
+                available_providers = _toolbar_provider_entries(available_models)
+                if available_providers:
+                    meta["available_providers"] = available_providers
                 if model_provider:
                     meta["model_provider"] = model_provider
+                    meta["provider_id"] = model_provider
                 await client.send_update_binding_card(
                     session_id=session_id,
                     worker_status="busy" if running else "ready",

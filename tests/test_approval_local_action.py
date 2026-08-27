@@ -130,10 +130,83 @@ def test_handle_set_model_dispatches_hermes_model_command():
             "session_id": "s1",
             "model_id": "deepseek-v4-pro",
             "provider": "opencode-go",
+            "provider_id": "opencode-go",
             "display_label": "DeepSeek Pro",
+            "available_providers": [{"id": "opencode-go", "displayName": "opencode-go"}],
+            "available_models": adapter._toolbar_available_models,
         },
     )
     adapter._push_queue_snapshot.assert_awaited_once_with("s1", "")
+
+
+def _two_provider_catalog():
+    return [
+        {"id": "deepseek-v4-pro", "displayName": "deepseek-v4-pro", "provider": "deepseek", "providerLabel": "DeepSeek"},
+        {"id": "deepseek-v4-flash", "displayName": "deepseek-v4-flash", "provider": "deepseek", "providerLabel": "DeepSeek"},
+        {"id": "kimi-k2", "displayName": "kimi-k2", "provider": "kimi", "providerLabel": "Kimi"},
+    ]
+
+
+def _run_set_provider(adapter, provider_id):
+    source = SimpleNamespace(chat_id="s1", chat_type="dm", thread_id=None)
+    payload = {
+        "action_id": "act-provider",
+        "action_type": "set_provider",
+        "params": {"session_id": "s1", "provider_id": provider_id, "display_label": provider_id},
+    }
+    with _packet_ctx(adapter):
+        adapter._active_state().latest_sources["s1"] = source
+        asyncio.run(GrixAdapter._handle_local_action_packet(adapter, payload))
+
+
+def test_handle_set_provider_switches_to_first_model_of_provider():
+    adapter = _adapter()
+    adapter._message_handler = AsyncMock(return_value="switched")
+    adapter._push_queue_snapshot = AsyncMock()
+    adapter._toolbar_available_models = _two_provider_catalog()
+    adapter._toolbar_model_id = "kimi-k2"
+
+    _run_set_provider(adapter, "deepseek")
+
+    event = adapter._message_handler.await_args.args[0]
+    assert event.text == "/model deepseek-v4-pro --provider deepseek"
+    kwargs = adapter._client.send_local_action_result.await_args.kwargs
+    assert kwargs["action_id"] == "act-provider"
+    assert kwargs["status"] == STATUS_OK
+    result = kwargs["result"]
+    assert result["provider_id"] == "deepseek"
+    assert result["model_id"] == "deepseek-v4-pro"
+    assert [m["id"] for m in result["available_models"]] == ["deepseek-v4-pro", "deepseek-v4-flash"]
+    assert [p["id"] for p in result["available_providers"]] == ["deepseek", "kimi"]
+    assert result["available_providers"][0]["displayName"] == "DeepSeek"
+
+
+def test_handle_set_provider_keeps_current_model_when_provider_has_it():
+    adapter = _adapter()
+    adapter._message_handler = AsyncMock(return_value="switched")
+    adapter._push_queue_snapshot = AsyncMock()
+    adapter._toolbar_available_models = _two_provider_catalog() + [
+        {"id": "kimi-k2", "displayName": "kimi-k2", "provider": "deepseek", "providerLabel": "DeepSeek"},
+    ]
+    adapter._toolbar_model_id = "kimi-k2"
+
+    _run_set_provider(adapter, "deepseek")
+
+    event = adapter._message_handler.await_args.args[0]
+    assert event.text == "/model kimi-k2 --provider deepseek"
+
+
+def test_handle_set_provider_rejects_unknown_provider():
+    adapter = _adapter()
+    adapter._message_handler = AsyncMock(return_value="switched")
+    adapter._toolbar_available_models = _two_provider_catalog()
+
+    _run_set_provider(adapter, "zhipu")
+
+    adapter._message_handler.assert_not_awaited()
+    kwargs = adapter._client.send_local_action_result.await_args.kwargs
+    assert kwargs["status"] == STATUS_FAILED
+    assert kwargs["error_code"] == "provider_not_found"
 
 
 def test_handle_set_model_rolls_back_relay_when_hermes_command_fails():
