@@ -81,7 +81,7 @@ def _install_stubs() -> None:
 _install_stubs()
 
 from grix_hermes import upgrade_checker as uc  # noqa: E402
-from grix_hermes.upgrade_checker import UpgradeChecker  # noqa: E402
+from grix_hermes.upgrade_checker import PluginNotEnabledError, UpgradeChecker  # noqa: E402
 
 
 def _make_checker() -> UpgradeChecker:
@@ -189,3 +189,72 @@ def test_check_skips_restart_and_reports_distinct_error_code_when_left_disabled(
     assert len(reports) == 1
     assert reports[0]["status"] == "failed"
     assert reports[0]["error_code"] == "ENABLE_VERIFY_FAILED"
+
+
+_NO_SHOW_ERR = (
+    "usage: hermes plugins [-h] {install,update,remove,rm,uninstall,list,ls,enable,disable} ...\n"
+    "hermes plugins: error: argument plugins_action: invalid choice: 'show' "
+    "(choose from 'install', 'update', 'remove', 'rm', 'uninstall', 'list', 'ls', 'enable', 'disable')"
+)
+
+
+def _write_config(tmp_path, enabled):
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": enabled}}))
+
+
+def test_show_unavailable_falls_back_to_config_enabled(monkeypatch, tmp_path):
+    # 生产回执：旧版 hermes CLI 无 `plugins show`，之前被当成"未启用"导致 ENABLE_VERIFY_FAILED。
+    _write_config(tmp_path, ["grix-hermes", "other"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls, fake = _fake_run_cmd([
+        (["hermes", "plugins", "update"], (0, "", "")),
+        (["hermes", "plugins", "enable"], (0, "", "")),
+        (["hermes", "plugins", "show"], (2, "", _NO_SHOW_ERR)),
+    ])
+    monkeypatch.setattr(UpgradeChecker, "_run_cmd", staticmethod(fake))
+    checker = _make_checker()
+
+    asyncio.run(checker._do_upgrade())
+
+    assert calls[-1][:3] == ["hermes", "plugins", "show"]
+
+
+def test_show_unavailable_and_config_disabled_raises(monkeypatch, tmp_path):
+    _write_config(tmp_path, ["other"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls, fake = _fake_run_cmd([
+        (["hermes", "plugins", "update"], (0, "", "")),
+        (["hermes", "plugins", "enable"], (0, "", "")),
+        (["hermes", "plugins", "show"], (2, "", _NO_SHOW_ERR)),
+    ])
+    monkeypatch.setattr(UpgradeChecker, "_run_cmd", staticmethod(fake))
+    checker = _make_checker()
+
+    try:
+        asyncio.run(checker._do_upgrade())
+    except PluginNotEnabledError as exc:
+        assert "plugins.enabled" in str(exc)
+    else:
+        raise AssertionError("expected PluginNotEnabledError")
+
+
+def test_show_present_but_failing_still_raises(monkeypatch, tmp_path):
+    # 非"子命令不存在"的失败不走 config 回退。
+    _write_config(tmp_path, ["grix-hermes"])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls, fake = _fake_run_cmd([
+        (["hermes", "plugins", "update"], (0, "", "")),
+        (["hermes", "plugins", "enable"], (0, "", "")),
+        (["hermes", "plugins", "show"], (1, "", "boom")),
+    ])
+    monkeypatch.setattr(UpgradeChecker, "_run_cmd", staticmethod(fake))
+    checker = _make_checker()
+
+    try:
+        asyncio.run(checker._do_upgrade())
+    except PluginNotEnabledError:
+        pass
+    else:
+        raise AssertionError("expected PluginNotEnabledError")

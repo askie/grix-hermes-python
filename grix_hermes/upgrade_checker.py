@@ -189,6 +189,30 @@ def _remove_pending(agent_id: Optional[str] = None) -> None:
         pass
 
 
+def _cli_lacks_subcommand(stdout: str, stderr: str, name: str) -> bool:
+    """argparse 对未知子命令的报错形态：``invalid choice: 'show'``。"""
+    text = f"{stdout or ''}\n{stderr or ''}".lower()
+    return "invalid choice" in text and f"'{name}'" in text
+
+
+def _plugin_enabled_in_config(hermes_home: Optional[str] = None) -> bool:
+    """Read ``plugins.enabled`` from config.yaml (the field the incident lost)."""
+    home = Path(hermes_home or os.environ.get("HERMES_HOME", "") or "~/.hermes").expanduser()
+    try:
+        import yaml
+
+        with open(home / "config.yaml", "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception as exc:  # noqa: BLE001 - unreadable config == unverifiable
+        logger.warning("[upgrade] cannot read %s for enable verification: %s", home / "config.yaml", exc)
+        return False
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    enabled = plugins.get("enabled") if isinstance(plugins, dict) else None
+    if isinstance(enabled, (list, tuple, set)):
+        return PLUGIN_NAME in {str(item).strip() for item in enabled}
+    return False
+
+
 class PluginNotEnabledError(RuntimeError):
     """The plugin update/install succeeded but the plugin is still disabled.
 
@@ -608,6 +632,17 @@ class UpgradeChecker:
         """
         await self._run_cmd(["hermes", "plugins", "enable", PLUGIN_NAME])
         code, stdout, stderr = await self._run_cmd(["hermes", "plugins", "show", PLUGIN_NAME])
+        if code != 0 and _cli_lacks_subcommand(stdout, stderr, "show"):
+            # 旧版 Hermes CLI 没有 ``plugins show``：直接读 config.yaml 的
+            # plugins.enabled（事故里丢的就是这个字段），而不是把"命令不存在"
+            # 当成"未启用"——否则这类主机每次升级都会在校验处失败。
+            if _plugin_enabled_in_config():
+                logger.info("[upgrade] 'plugins show' unavailable; verified plugins.enabled via config.yaml")
+                return
+            raise PluginNotEnabledError(
+                "plugin not enabled after update; 'hermes plugins show' unavailable "
+                "and grix-hermes missing from plugins.enabled in config.yaml"
+            )
         if code != 0 or "status: enabled" not in (stdout or "").lower():
             raise PluginNotEnabledError(
                 f"plugin not enabled after update; "
