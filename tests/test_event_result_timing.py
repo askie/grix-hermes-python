@@ -168,6 +168,7 @@ def _run_turn(inst, client, event, outcome=None):
     async def _turn():
         await inst.on_processing_start(event)
         await inst.on_processing_complete(event, outcome)
+        await inst.flush_deferred_failure_reports()
 
     _with_ctx(client, _turn())
 
@@ -215,11 +216,18 @@ def test_failure_outcome_carries_gateway_error_detail(monkeypatch):
     _register(inst, "sk:chat-1", "ev-1")
     event = _msg_event()
 
-    inst._remember_failure_hint_from_reply(
-        event.source.chat_id,
-        "Sorry, I encountered an error (RuntimeError).\nprovider returned 401\nTry again or use /reset to start a fresh session.",
-    )
-    _run_turn(inst, client, event, outcome=object())
+    async def _turn():
+        await inst.on_processing_start(event)
+        await inst.on_processing_complete(event, object())
+        # 与网关顺序一致：钩子返回后才发错误文案
+        assert client.completed == []
+        inst._remember_failure_hint_from_reply(
+            event.source.chat_id,
+            "Sorry, I encountered an error (RuntimeError).\nprovider returned 401\nTry again or use /reset to start a fresh session.",
+        )
+        await inst.flush_deferred_failure_reports()
+
+    _with_ctx(client, _turn())
 
     assert client.completed == [
         {"event_id": "ev-1", "status": "failed", "message": "RuntimeError: provider returned 401"}
@@ -349,7 +357,11 @@ def test_leftover_inline_events_swept_as_responded(monkeypatch):
     # 运行期间到达并被旁路消化的事件（如 clarify 文本答复）
     _register(inst, "sk:chat-1", "ev-inline")
     # 本轮失败：旁路事件自身被成功消化，仍应报 responded 而非跟随失败
-    _with_ctx(client, inst.on_processing_complete(event, object()))
+    async def _complete():
+        await inst.on_processing_complete(event, object())
+        await inst.flush_deferred_failure_reports()
+
+    _with_ctx(client, _complete())
 
     rows = {c["event_id"]: c["status"] for c in client.completed}
     assert rows == {"ev-1": "failed", "ev-inline": "responded"}

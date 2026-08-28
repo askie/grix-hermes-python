@@ -2543,6 +2543,39 @@ class GrixAdapter(BasePlatformAdapter):
         return SendResult(success=False, error=last_error, raw_response=last_raw, retryable=True)
 
     _GATEWAY_ERROR_REPLY_PREFIX = "Sorry, I encountered an error ("
+    _FAILURE_HINT_WAIT_S = 1.0
+    _FAILURE_DEFAULT_MESSAGE = "message processing failed: Hermes finished without producing a reply"
+
+    @property
+    def _deferred_failure_tasks(self) -> "set[asyncio.Task[None]]":
+        tasks = self.__dict__.get("_deferred_failure_tasks_store")
+        if tasks is None:
+            tasks = self.__dict__["_deferred_failure_tasks_store"] = set()
+        return tasks
+
+    def _complete_failed_events_with_hint(self, event_ids: List[str], chat_key: str) -> None:
+        state = self._active_state()
+
+        async def _run() -> None:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + self._FAILURE_HINT_WAIT_S
+            hint = state.last_failure_hints.pop(chat_key, "")
+            while not hint and loop.time() < deadline:
+                await asyncio.sleep(0.05)
+                hint = state.last_failure_hints.pop(chat_key, "")
+            for eid in event_ids:
+                await self._complete_event_if_needed(
+                    eid, status=STATUS_FAILED, message=hint or self._FAILURE_DEFAULT_MESSAGE,
+                )
+
+        task = asyncio.get_running_loop().create_task(_run())
+        self._deferred_failure_tasks.add(task)
+        task.add_done_callback(self._deferred_failure_tasks.discard)
+
+    async def flush_deferred_failure_reports(self) -> None:
+        """等待所有推后的 failed 收口完成（测试/关停用）。"""
+        while self._deferred_failure_tasks:
+            await asyncio.gather(*list(self._deferred_failure_tasks), return_exceptions=True)
 
     def _remember_failure_hint_from_reply(self, chat_id: str, content: str) -> None:
         """网关处理异常时会先给用户发一段固定格式的错误文案（BasePlatformAdapter），
@@ -2951,11 +2984,14 @@ class GrixAdapter(BasePlatformAdapter):
             # 与 connector 一致上报 canceled 而非 failed。
             status, message = STATUS_CANCELED, "stopped by user"
         else:
-            hint = state.last_failure_hints.pop(str(event.source.chat_id), "")
-            status = STATUS_FAILED
-            message = hint or "message processing failed: Hermes finished without producing a reply"
-        for eid in event_ids:
-            await self._complete_event_if_needed(eid, status=status, message=message)
+            status, message = STATUS_FAILED, None
+        if status == STATUS_FAILED and event_ids:
+            # 网关的异常兜底文案（唯一带异常详情的通道）是在本钩子返回之后才发出的，
+            # 此刻多半还没到；把 failed 收口推后一小段时间等它，等不到再用默认文案。
+            self._complete_failed_events_with_hint(list(event_ids), str(event.source.chat_id))
+        else:
+            for eid in event_ids:
+                await self._complete_event_if_needed(eid, status=status, message=message)
 
         # 扫尾：会话已无排队消息时，收口本轮内被旁路消化、未进入后台任务的
         # 事件（clarify 文本答复、/approve 等旁路命令）——否则它们无人认领。
@@ -2998,6 +3034,8 @@ class GrixAdapter(BasePlatformAdapter):
         # on_processing_complete 按任务真实结果统一发 event_result。
         state = self._active_state()
         owner_key = self._active_owner_key()
+        # 新一轮开始：上一轮收口后才到的错误文案已经没有归属，清掉以免串到本轮。
+        state.last_failure_hints.pop(str(event.source.chat_id), None)
         running = state.session_next_run_event_ids.pop(session_key, [])
         raw_event_id = str(raw_message.get("event_id") or "").strip()
         if raw_event_id and raw_event_id not in running:
