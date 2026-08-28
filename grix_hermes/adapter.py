@@ -3956,7 +3956,9 @@ class GrixAdapter(BasePlatformAdapter):
                 store, core_key, owner_key, session_id, model_id, provider
             )
             return
-        if not model_id:
+        if not model_id or not fresh:
+            # 非 fresh 只做持久化对账；store/条目异常时绝不落到 /model 命令路径
+            # （否则每条消息都会发一次可见的 /model 且无法自愈）。
             return
         if store is not None and entry is not None and _session_reset_pending(store, entry, source):
             try:

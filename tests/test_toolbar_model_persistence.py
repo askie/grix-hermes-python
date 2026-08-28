@@ -235,3 +235,14 @@ def test_existing_session_adopts_core_override_into_toolbar(tmp_path):
     assert not [c for c in store.calls if c[0] == "set"]
     assert ToolbarModelStore(path).get_session("\0s")["model_id"] == "m-a"
     assert ToolbarModelStore(path).get_global("")["model_id"] == "m-b"
+
+
+def test_non_fresh_without_core_entry_never_sends_model_command(tmp_path):
+    path = str(tmp_path / "toolbar-models.json")
+    ToolbarModelStore(path).set_session("\0s", {"model_id": "m-b", "provider": "p2"})
+    adapter = _adapter(path)
+    adapter._session_store = None
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "s", "", SimpleNamespace(), "k", fresh=False))
+    adapter._session_store = _FakeStore()  # store present, entry missing
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "s", "", SimpleNamespace(), "k", fresh=False))
+    adapter._message_handler.assert_not_awaited()
