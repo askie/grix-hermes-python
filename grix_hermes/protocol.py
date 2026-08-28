@@ -149,6 +149,8 @@ class GrixConnectionConfig:
     terminal_commit_token_store_path: Optional[str] = None
     stop_result_outbox_path: Optional[str] = None
     terminal_committed_store_path: Optional[str] = None
+    # 工具栏模型/供应商选择持久化（会话级 + agent 全局上次选择，对齐 connector）。
+    toolbar_model_store_path: Optional[str] = None
 
 
 def _resolve_client_version() -> str:
