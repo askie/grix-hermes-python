@@ -178,7 +178,13 @@ def test_dispatch_puts_system_context_first(monkeypatch):
         handle_message=_handle_message,
         _event_still_open=lambda session_key, event_id: False,
         _session_has_queued_work=lambda session_key: False,
+        _active_owner_key=lambda: "",
     )
+
+    async def _no_inherit(session_id, owner_key, source):
+        return None
+
+    adapter._apply_inherited_toolbar_model = _no_inherit
     adapter._session_context_block_once = (
         lambda message, source, session_key: GrixAdapter._session_context_block_once(
             adapter, message, source, session_key

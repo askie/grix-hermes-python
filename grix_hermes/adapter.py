@@ -126,6 +126,7 @@ from .protocol import (
     normalize_stop_event,
     resolve_event_queue_settings,
 )
+from .persistence.toolbar_model_store import ToolbarModelStore
 from .terminal_paths import (
     build_terminal_outbox_path,
     resolve_terminal_sidecar_paths,
@@ -360,6 +361,10 @@ def build_grix_connection_config(config: PlatformConfig) -> GrixConnectionConfig
         terminal_commit_token_store_path=token_path,
         stop_result_outbox_path=stop_path,
         terminal_committed_store_path=committed_path,
+        toolbar_model_store_path=(
+            str(extra.get("toolbar_model_store_path") or "").strip()
+            or (f"{outbox_path}.toolbar-models" if outbox_path else None)
+        ),
     )
 
 
@@ -1276,7 +1281,14 @@ class GrixAdapter(BasePlatformAdapter):
             self._toolbar_model_id,
             self._toolbar_model_provider,
         )
-        self._toolbar_session_models: Dict[str, Dict[str, str]] = {}
+        # 会话级选择 + agent 全局上次选择落盘（对齐 connector 的 binding/global store），
+        # 新会话继承全局选择，重启后工具栏显示与 Hermes 实际执行模型保持一致。
+        self._toolbar_model_store = ToolbarModelStore(
+            getattr(self.connection, "toolbar_model_store_path", None)
+        )
+        self._toolbar_session_models: Dict[str, Dict[str, str]] = (
+            self._toolbar_model_store.sessions
+        )
         self._toolbar_pending_model_sessions: Set[Tuple[str, str]] = set()
         self._toolbar_models_loaded = False
         self._toolbar_models_task: Optional[asyncio.Task] = None
@@ -3844,6 +3856,87 @@ class GrixAdapter(BasePlatformAdapter):
     def _toolbar_session_model_key(owner_key: str, session_id: str) -> str:
         return f"{owner_key}\0{session_id}"
 
+    def _toolbar_effective_model(self, owner_key: str, session_id: str) -> Dict[str, str]:
+        """会话持久化选择 → agent 全局上次选择 → 空（调用方回退 config 默认）。"""
+        key = self._toolbar_session_model_key(owner_key, session_id)
+        session_model = (getattr(self, "_toolbar_session_models", {}) or {}).get(key)
+        if session_model:
+            return dict(session_model)
+        store = getattr(self, "_toolbar_model_store", None)
+        global_model = store.get_global() if store is not None else None
+        return dict(global_model) if global_model else {}
+
+    def _remember_toolbar_model(
+        self,
+        owner_key: str,
+        session_id: str,
+        entry: Dict[str, str],
+        *,
+        update_global: bool = True,
+    ) -> None:
+        key = self._toolbar_session_model_key(owner_key, session_id)
+        store = getattr(self, "_toolbar_model_store", None)
+        if store is None:
+            store = ToolbarModelStore(None)
+            self._toolbar_model_store = store
+            self._toolbar_session_models = store.sessions
+        store.set_session(key, entry, update_global=update_global)
+
+    async def _apply_inherited_toolbar_model(
+        self, session_id: str, owner_key: str, source: Any
+    ) -> None:
+        """新的 Hermes 会话（首次/自动重置）继承持久化的模型选择。
+
+        Hermes 自身的 /model 覆盖随会话过期被清空，因此凡是检测到新会话，
+        都按 会话选择 → 全局选择 重新下发一次 /model（与 config 默认一致时跳过）。
+        """
+        desired = self._toolbar_effective_model(owner_key, session_id)
+        model_id = str(desired.get("model_id") or "").strip()
+        if not model_id or re.search(r"\s", model_id):
+            return
+        provider = str(desired.get("provider") or "").strip()
+        if (
+            model_id == str(getattr(self, "_toolbar_model_id", "") or "")
+            and provider == str(getattr(self, "_toolbar_model_provider", "") or "")
+        ):
+            return
+        handler = getattr(self, "_message_handler", None)
+        if handler is None:
+            return
+        command = f"/model {model_id}"
+        if provider:
+            command = f"{command} --provider {provider}"
+        event_fields = {
+            "text": command,
+            "message_type": MessageType.TEXT,
+            "source": source,
+            "raw_message": {"_grix_kind": "toolbar_model_inherit"},
+        }
+        try:
+            event = MessageEvent(**event_fields)
+        except TypeError:
+            event = MessageEvent()
+            for key, value in event_fields.items():
+                setattr(event, key, value)
+        relay_lock = _relay_profile_lock(self._resolve_hermes_home())
+        async with relay_lock:
+            try:
+                await handler(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - inherit is best-effort
+                logger.warning(
+                    "[%s] failed to inherit toolbar model %s/%s for session %s: %s",
+                    self.name, provider, model_id, session_id, exc,
+                )
+                return
+        self._remember_toolbar_model(
+            owner_key,
+            session_id,
+            {**desired, "model_id": model_id, "provider": provider},
+            update_global=False,
+        )
+
     def _find_toolbar_model_entry(
         self, model_id: str, provider: str = ""
     ) -> Optional[Dict[str, Any]]:
@@ -3904,9 +3997,7 @@ class GrixAdapter(BasePlatformAdapter):
             )
             return
         owner_key = self._active_owner_key()
-        session_model = (getattr(self, "_toolbar_session_models", {}) or {}).get(
-            self._toolbar_session_model_key(owner_key, session_id), {}
-        )
+        session_model = self._toolbar_effective_model(owner_key, session_id)
         current_model = str(
             session_model.get("model_id") or getattr(self, "_toolbar_model_id", "") or ""
         ).strip()
@@ -4155,15 +4246,11 @@ class GrixAdapter(BasePlatformAdapter):
                     status=STATUS_OK,
                     result=model_result,
                 )
-            session_models = getattr(self, "_toolbar_session_models", None)
-            if session_models is None:
-                session_models = {}
-                self._toolbar_session_models = session_models
-            session_models[self._toolbar_session_model_key(owner_key, session_id)] = {
-                "model_id": model_id,
-                "provider": provider,
-                "display_label": label,
-            }
+            self._remember_toolbar_model(
+                owner_key,
+                session_id,
+                {"model_id": model_id, "provider": provider, "display_label": label},
+            )
             await self._push_queue_snapshot(session_id, owner_key)
             if credentials is not None and confirmed:
                 self._schedule_gateway_restart_after_relay_change()
@@ -5219,6 +5306,11 @@ class GrixAdapter(BasePlatformAdapter):
         session_context = self._session_context_block_once(message, source, session_key)
         if session_context:
             event_text = f"{session_context}\n\n{event_text}" if event_text else session_context
+            await self._apply_inherited_toolbar_model(
+                str(getattr(message, "session_id", "") or "").strip(),
+                self._active_owner_key(),
+                source,
+            )
         event_message_type = _resolve_message_type(message)
         raw_kind = "message"
         raw_message = {**message.raw}
@@ -6519,9 +6611,7 @@ class GrixAdapter(BasePlatformAdapter):
             }
             for entry in snap["queued"]
         ]
-        session_model = (
-            getattr(self, "_toolbar_session_models", {}) or {}
-        ).get(self._toolbar_session_model_key(owner_key, session_id), {})
+        session_model = self._toolbar_effective_model(owner_key, session_id)
         model_id = session_model.get("model_id") or getattr(self, "_toolbar_model_id", "")
         model_provider = session_model.get("provider") or getattr(self, "_toolbar_model_provider", "")
         available_models = getattr(self, "_toolbar_available_models", None)
