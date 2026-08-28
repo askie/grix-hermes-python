@@ -216,10 +216,17 @@ def _plugin_enabled_in_config(hermes_home: Optional[str] = None) -> bool:
         logger.warning("[upgrade] cannot read %s for enable verification: %s", home / "config.yaml", exc)
         return False
     plugins = data.get("plugins") if isinstance(data, dict) else None
-    enabled = plugins.get("enabled") if isinstance(plugins, dict) else None
-    if isinstance(enabled, (list, tuple, set)):
-        return PLUGIN_NAME in {str(item).strip() for item in enabled}
-    return False
+    if not isinstance(plugins, dict):
+        return False
+
+    def _names(key: str) -> set:
+        value = plugins.get(key)
+        if isinstance(value, (list, tuple, set)):
+            return {str(item).strip() for item in value}
+        return set()
+
+    # Hermes 加载语义是 enabled ∧ ¬disabled（拒绝列表优先）。
+    return PLUGIN_NAME in _names("enabled") and PLUGIN_NAME not in _names("disabled")
 
 
 class PluginNotEnabledError(RuntimeError):

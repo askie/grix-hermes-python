@@ -340,3 +340,16 @@ def test_enable_timeout_and_config_disabled_raises(monkeypatch, tmp_path):
         pass
     else:
         raise AssertionError("expected PluginNotEnabledError")
+
+
+def test_config_fallback_respects_disabled_list(tmp_path):
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": {"enabled": ["grix-hermes"], "disabled": ["grix-hermes"]}})
+    )
+    assert uc._plugin_enabled_in_config(str(tmp_path)) is False
+
+
+def test_config_fallback_missing_config_is_not_enabled(tmp_path):
+    assert uc._plugin_enabled_in_config(str(tmp_path)) is False
