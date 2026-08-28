@@ -599,6 +599,28 @@ def resolve_toolbar_available_models(
     if not isinstance(rows, list):
         return fallback_models
 
+    # Providers signed in through `hermes auth add` (built-in slugs such as
+    # opencode-go) never appear in config.yaml sections; asking Hermes whether
+    # the slug is explicitly configured keeps them switchable from the toolbar
+    # without shadowing the built-in provider definition via `providers:`.
+    configured_providers = set(configured_providers)
+    try:
+        from hermes_cli.auth import is_provider_explicitly_configured
+    except Exception:
+        is_provider_explicitly_configured = None
+    if is_provider_explicitly_configured is not None:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            slug = str(row.get("slug") or row.get("id") or row.get("provider") or "").strip()
+            if not slug or slug in configured_providers:
+                continue
+            try:
+                if is_provider_explicitly_configured(slug):
+                    configured_providers.add(slug)
+            except Exception:
+                continue
+
     entries: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, str]] = set()
 
