@@ -643,11 +643,11 @@ class UpgradeChecker:
             return
 
         install_out = "\n".join(p for p in (stdout2, stderr2) if p)
-        # 预算 160/100/150，整体落在回执 error_msg 的 500 字上限内。
+        # 预算 160/100/140，整体落在回执 error_msg 的 500 字上限内。
         parts = [f"update (exit {last_code}): {last_out[:160] or '<no output>'}"]
         if checkout_dir is not None:
             parts.append(f"git: {git_out[:100] or '<no output>'}")
-        parts.append(f"install (exit {code2}): {install_out[:150] or '<no output>'}")
+        parts.append(f"install (exit {code2}): {install_out[:140] or '<no output>'}")
         raise RuntimeError("update, git fallback and install all failed; " + " | ".join(parts))
 
     async def _git_fallback_update(self, checkout_dir: Path) -> Tuple[bool, str]:
