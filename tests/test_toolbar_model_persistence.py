@@ -65,13 +65,32 @@ def test_store_roundtrip(tmp_path):
     store.set_session("o\0s1", {"model_id": "m-b", "provider": "p2", "display_label": "B"})
     store.set_session("o\0s2", {"model_id": "m-a", "provider": "p1"}, update_global=False)
     data = json.loads(open(path).read())
-    assert data["global"] == {"model_id": "m-b", "provider": "p2", "display_label": "B"}
+    assert data["global"] == {"": {"model_id": "m-b", "provider": "p2", "display_label": "B"}}
     reloaded = ToolbarModelStore(path)
     assert reloaded.get_session("o\0s1")["model_id"] == "m-b"
     assert reloaded.get_session("o\0s2")["provider"] == "p1"
     assert reloaded.get_global()["model_id"] == "m-b"
-    reloaded.clear_session("o\0s1")
-    assert ToolbarModelStore(path).get_session("o\0s1") is None
+    assert reloaded.get_global("other-owner") is None
+
+
+def test_store_global_is_per_owner_and_sessions_are_bounded(tmp_path):
+    path = str(tmp_path / "toolbar-models.json")
+    store = ToolbarModelStore(path, max_sessions=2)
+    store.set_session("o\0s1", {"model_id": "m-a"}, owner_key="")
+    store.set_session("u\0s2", {"model_id": "m-b"}, owner_key="u")
+    store.set_session("o\0s3", {"model_id": "m-a"}, owner_key="", update_global=False)
+    assert store.get_global("")["model_id"] == "m-a"
+    assert store.get_global("u")["model_id"] == "m-b"
+    assert list(store.sessions) == ["u\0s2", "o\0s3"]
+    reloaded = ToolbarModelStore(path)
+    assert list(reloaded.sessions) == ["u\0s2", "o\0s3"]
+    assert reloaded.get_global("u")["model_id"] == "m-b"
+
+
+def test_store_reads_legacy_flat_global(tmp_path):
+    path = tmp_path / "toolbar-models.json"
+    path.write_text(json.dumps({"sessions": {}, "global": {"model_id": "m-b", "provider": "p2"}}))
+    assert ToolbarModelStore(str(path)).get_global("")["model_id"] == "m-b"
 
 
 def test_store_ignores_broken_entries(tmp_path):
@@ -124,6 +143,15 @@ def test_inherit_sends_model_command_for_new_session(tmp_path):
 def test_inherit_skips_when_matching_config_default(tmp_path):
     path = str(tmp_path / "toolbar-models.json")
     ToolbarModelStore(path).set_session("\0old", {"model_id": "m-a", "provider": "p1"})
+    adapter = _adapter(path)
+    asyncio.run(GrixAdapter._apply_inherited_toolbar_model(adapter, "fresh", "", SimpleNamespace()))
+    adapter._message_handler.assert_not_awaited()
+    assert ToolbarModelStore(path).get_session("\0fresh") is None
+
+
+def test_inherit_skips_model_missing_from_catalog(tmp_path):
+    path = str(tmp_path / "toolbar-models.json")
+    ToolbarModelStore(path).set_session("\0old", {"model_id": "gone", "provider": "p9"})
     adapter = _adapter(path)
     asyncio.run(GrixAdapter._apply_inherited_toolbar_model(adapter, "fresh", "", SimpleNamespace()))
     adapter._message_handler.assert_not_awaited()

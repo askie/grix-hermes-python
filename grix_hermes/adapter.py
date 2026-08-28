@@ -384,6 +384,7 @@ def build_shared_connection_config(
         terminal_committed_store_path=suffix_shared_path(
             base.terminal_committed_store_path, owner
         ),
+        toolbar_model_store_path=suffix_shared_path(base.toolbar_model_store_path, owner),
     )
 
 
@@ -3863,7 +3864,7 @@ class GrixAdapter(BasePlatformAdapter):
         if session_model:
             return dict(session_model)
         store = getattr(self, "_toolbar_model_store", None)
-        global_model = store.get_global() if store is not None else None
+        global_model = store.get_global(owner_key) if store is not None else None
         return dict(global_model) if global_model else {}
 
     def _remember_toolbar_model(
@@ -3880,7 +3881,7 @@ class GrixAdapter(BasePlatformAdapter):
             store = ToolbarModelStore(None)
             self._toolbar_model_store = store
             self._toolbar_session_models = store.sessions
-        store.set_session(key, entry, update_global=update_global)
+        store.set_session(key, entry, owner_key=owner_key, update_global=update_global)
 
     async def _apply_inherited_toolbar_model(
         self, session_id: str, owner_key: str, source: Any
@@ -3899,6 +3900,17 @@ class GrixAdapter(BasePlatformAdapter):
             model_id == str(getattr(self, "_toolbar_model_id", "") or "")
             and provider == str(getattr(self, "_toolbar_model_provider", "") or "")
         ):
+            return
+        # 目录已加载时先校验，失效的持久化选择不下发（否则核心可能静默
+        # 忽略而被误记成功，工具栏与实际模型错位）。
+        if (
+            getattr(self, "_toolbar_available_models", None)
+            and self._find_toolbar_model_entry(model_id, provider) is None
+        ):
+            logger.warning(
+                "[%s] persisted toolbar model %s/%s is not in the catalog; skip inherit for session %s",
+                self.name, provider, model_id, session_id,
+            )
             return
         handler = getattr(self, "_message_handler", None)
         if handler is None:

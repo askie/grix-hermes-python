@@ -8,6 +8,7 @@ so brand-new sessions inherit it.  Both live in one JSON file per agent.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Any, Dict, Optional
 
 from .atomic_json import atomic_write_json, read_json_object
@@ -15,7 +16,8 @@ from .atomic_json import atomic_write_json, read_json_object
 logger = logging.getLogger(__name__)
 
 FILE_VERSION = 1
-_FIELDS = ("model_id", "provider", "display_label")
+# 会话条目上限（LRU 淘汰），避免长期运行下文件无界增长。
+MAX_SESSIONS = 500
 
 
 def _normalize_entry(value: Any) -> Optional[Dict[str, str]]:
@@ -32,12 +34,18 @@ def _normalize_entry(value: Any) -> Optional[Dict[str, str]]:
 
 
 class ToolbarModelStore:
-    """Session-keyed model choices plus one agent-wide ``global`` default."""
+    """Session-keyed model choices plus a per-owner ``global`` last choice.
 
-    def __init__(self, file_path: Optional[str] = None):
+    ``global`` is keyed by owner_key (empty string for the agent owner) so a
+    sharee's toolbar choice does not leak into the owner's new sessions,
+    mirroring the connector's per-agent AgentGlobalConfigStore.
+    """
+
+    def __init__(self, file_path: Optional[str] = None, *, max_sessions: int = MAX_SESSIONS):
         self._file_path = file_path
-        self._sessions: Dict[str, Dict[str, str]] = {}
-        self._global: Optional[Dict[str, str]] = None
+        self._max_sessions = max(1, max_sessions)
+        self._sessions: "OrderedDict[str, Dict[str, str]]" = OrderedDict()
+        self._global: Dict[str, Dict[str, str]] = {}
         self._load()
 
     # -- load / save -------------------------------------------------------
@@ -57,7 +65,16 @@ class ToolbarModelStore:
                 entry = _normalize_entry(value)
                 if key and entry is not None:
                     self._sessions[str(key)] = entry
-        self._global = _normalize_entry(data.get("global"))
+        raw_global = data.get("global")
+        if isinstance(raw_global, dict):
+            legacy = _normalize_entry(raw_global)
+            if legacy is not None:
+                self._global[""] = legacy
+            else:
+                for owner_key, value in raw_global.items():
+                    entry = _normalize_entry(value)
+                    if entry is not None:
+                        self._global[str(owner_key)] = entry
 
     def _save(self) -> None:
         if not self._file_path:
@@ -67,7 +84,7 @@ class ToolbarModelStore:
                 self._file_path,
                 {
                     "version": FILE_VERSION,
-                    "sessions": self._sessions,
+                    "sessions": dict(self._sessions),
                     "global": self._global,
                 },
             )
@@ -83,18 +100,25 @@ class ToolbarModelStore:
     def get_session(self, key: str) -> Optional[Dict[str, str]]:
         return self._sessions.get(key)
 
-    def get_global(self) -> Optional[Dict[str, str]]:
-        return dict(self._global) if self._global else None
+    def get_global(self, owner_key: str = "") -> Optional[Dict[str, str]]:
+        entry = self._global.get(str(owner_key or ""))
+        return dict(entry) if entry else None
 
-    def set_session(self, key: str, entry: Dict[str, Any], *, update_global: bool = True) -> None:
+    def set_session(
+        self,
+        key: str,
+        entry: Dict[str, Any],
+        *,
+        owner_key: str = "",
+        update_global: bool = True,
+    ) -> None:
         normalized = _normalize_entry(entry)
         if not key or normalized is None:
             return
         self._sessions[key] = normalized
+        self._sessions.move_to_end(key)
+        while len(self._sessions) > self._max_sessions:
+            self._sessions.popitem(last=False)
         if update_global:
-            self._global = dict(normalized)
+            self._global[str(owner_key or "")] = dict(normalized)
         self._save()
-
-    def clear_session(self, key: str) -> None:
-        if self._sessions.pop(key, None) is not None:
-            self._save()
