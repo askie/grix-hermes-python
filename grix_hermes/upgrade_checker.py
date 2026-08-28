@@ -643,14 +643,32 @@ class UpgradeChecker:
             return
 
         install_out = "\n".join(p for p in (stdout2, stderr2) if p)
-        parts = [f"update (exit {last_code}): {last_out[:200] or '<no output>'}"]
+        # 预算 160/100/150，整体落在回执 error_msg 的 500 字上限内。
+        parts = [f"update (exit {last_code}): {last_out[:160] or '<no output>'}"]
         if checkout_dir is not None:
-            parts.append(f"git: {git_out[:150] or '<no output>'}")
-        parts.append(f"install (exit {code2}): {install_out[:200] or '<no output>'}")
+            parts.append(f"git: {git_out[:100] or '<no output>'}")
+        parts.append(f"install (exit {code2}): {install_out[:150] or '<no output>'}")
         raise RuntimeError("update, git fallback and install all failed; " + " | ".join(parts))
 
     async def _git_fallback_update(self, checkout_dir: Path) -> Tuple[bool, str]:
+        """fetch + reset --hard 到 origin/main，仅限官方仓库的干净托管克隆。
+
+        ``reset --hard`` 不可逆且由后台无人值守执行：工作树有未提交改动
+        （开发者 editable/软链仓库）或 origin 不是官方仓库时一律跳过，
+        退回 install 路径报错，绝不销毁本地工作。
+        """
         base = ["git", "-C", str(checkout_dir)]
+        try:
+            code, stdout, stderr = await self._run_cmd(base + ["remote", "get-url", "origin"])
+            if code != 0 or PLUGIN_GIT_REPO.lower() not in (stdout or "").lower():
+                return False, f"origin is not {PLUGIN_GIT_REPO}: {(stdout or stderr)[:120] or '<no output>'}"
+            code, stdout, stderr = await self._run_cmd(base + ["status", "--porcelain"])
+            if code != 0:
+                return False, f"git status failed: {(stdout or stderr)[:120] or '<no output>'}"
+            if (stdout or "").strip():
+                return False, "working tree has local changes; refusing reset --hard"
+        except Exception as exc:  # noqa: BLE001 - git missing / timeout
+            return False, str(exc)
         for args in (
             ["fetch", "--force", "--tags", "origin", "main"],
             ["reset", "--hard", "origin/main"],
@@ -686,6 +704,7 @@ class UpgradeChecker:
         except RuntimeError as exc:
             logger.warning("[upgrade] plugins show did not finish in time: %s", exc)
             if _plugin_enabled_in_config():
+                logger.info("[upgrade] 'plugins show' timed out; verified plugins.enabled via config.yaml")
                 return
             raise PluginNotEnabledError(
                 "plugin not enabled after update; 'hermes plugins show' timed out "
