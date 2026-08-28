@@ -189,6 +189,15 @@ def _remove_pending(agent_id: Optional[str] = None) -> None:
         pass
 
 
+def _plugin_checkout_dir() -> Optional[Path]:
+    """Running plugin directory when it is a git checkout, else None."""
+    plugin_dir = Path(__file__).resolve().parent.parent
+    return plugin_dir if (plugin_dir / ".git").exists() else None
+
+
+GIT_FALLBACK_TIMEOUT_S = 300
+
+
 def _cli_lacks_subcommand(stdout: str, stderr: str, name: str) -> bool:
     """argparse 对未知子命令的报错形态：``invalid choice: 'show'``。"""
     text = f"{stdout or ''}\n{stderr or ''}".lower()
@@ -603,7 +612,21 @@ class UpgradeChecker:
             if attempt < UPDATE_MAX_ATTEMPTS:
                 await asyncio.sleep(UPDATE_RETRY_BASE_S * attempt + random.uniform(0, 1.0))
 
-        logger.info("[upgrade] update exhausted %d attempts, trying install from source", UPDATE_MAX_ATTEMPTS)
+        # ``hermes plugins update`` 会因 detached HEAD / 历史分叉 / 符号链接目录 /
+        # 60s clone 超时等原因失败，而随后的 install 又因目录已存在必然失败。
+        # 插件目录本身是 git 检出时，直接 fetch + reset 到 origin/main 更稳。
+        git_out = ""
+        checkout_dir = _plugin_checkout_dir()
+        if checkout_dir is not None:
+            logger.info("[upgrade] update exhausted %d attempts, trying git fetch/reset in %s", UPDATE_MAX_ATTEMPTS, checkout_dir)
+            git_ok, git_out = await self._git_fallback_update(checkout_dir)
+            if git_ok:
+                logger.info("[upgrade] git fallback update succeeded")
+                await self._ensure_enabled()
+                return
+            logger.info("[upgrade] git fallback failed: %s", git_out[:500] or "<no output>")
+
+        logger.info("[upgrade] trying install from source")
         code2, stdout2, stderr2 = await self._run_cmd(
             ["hermes", "plugins", "install", PLUGIN_GIT_REPO, "--enable"],
         )
@@ -613,10 +636,25 @@ class UpgradeChecker:
             return
 
         install_out = "\n".join(p for p in (stdout2, stderr2) if p)
-        raise RuntimeError(
-            f"both update (exit {last_code}) and install (exit {code2}) failed; "
-            f"output={(install_out or last_out)[:500] or '<no output>'}"
-        )
+        parts = [f"update (exit {last_code}): {last_out[:200] or '<no output>'}"]
+        if checkout_dir is not None:
+            parts.append(f"git: {git_out[:150] or '<no output>'}")
+        parts.append(f"install (exit {code2}): {install_out[:200] or '<no output>'}")
+        raise RuntimeError("update, git fallback and install all failed; " + " | ".join(parts))
+
+    async def _git_fallback_update(self, checkout_dir: Path) -> Tuple[bool, str]:
+        base = ["git", "-C", str(checkout_dir)]
+        for args in (
+            ["fetch", "--force", "--tags", "origin", "main"],
+            ["reset", "--hard", "origin/main"],
+        ):
+            try:
+                code, stdout, stderr = await self._run_cmd(base + args, timeout=GIT_FALLBACK_TIMEOUT_S)
+            except Exception as exc:  # noqa: BLE001 - timeout / git missing
+                return False, str(exc)
+            if code != 0:
+                return False, "\n".join(p for p in (stdout, stderr) if p)
+        return True, ""
 
     async def _ensure_enabled(self) -> None:
         """Guard against ``hermes plugins update`` landing the plugin disabled.
@@ -630,8 +668,22 @@ class UpgradeChecker:
         except-block reports the upgrade as failed and the old, still-connected
         process keeps running instead of restarting into a broken state.
         """
-        await self._run_cmd(["hermes", "plugins", "enable", PLUGIN_NAME])
-        code, stdout, stderr = await self._run_cmd(["hermes", "plugins", "show", PLUGIN_NAME])
+        # Windows 上冷启动 hermes CLI 可能超过 120s：enable 只是改 config.yaml，
+        # 超时不等于失败，交给下面的状态校验判定。
+        try:
+            await self._run_cmd(["hermes", "plugins", "enable", PLUGIN_NAME])
+        except RuntimeError as exc:
+            logger.warning("[upgrade] plugins enable did not finish in time: %s", exc)
+        try:
+            code, stdout, stderr = await self._run_cmd(["hermes", "plugins", "show", PLUGIN_NAME])
+        except RuntimeError as exc:
+            logger.warning("[upgrade] plugins show did not finish in time: %s", exc)
+            if _plugin_enabled_in_config():
+                return
+            raise PluginNotEnabledError(
+                "plugin not enabled after update; 'hermes plugins show' timed out "
+                "and grix-hermes missing from plugins.enabled in config.yaml"
+            )
         if code != 0 and _cli_lacks_subcommand(stdout, stderr, "show"):
             # 旧版 Hermes CLI 没有 ``plugins show``：直接读 config.yaml 的
             # plugins.enabled（事故里丢的就是这个字段），而不是把"命令不存在"
