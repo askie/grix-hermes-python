@@ -181,10 +181,10 @@ def test_dispatch_puts_system_context_first(monkeypatch):
         _active_owner_key=lambda: "",
     )
 
-    async def _no_inherit(session_id, owner_key, source):
+    async def _no_sync(session_id, owner_key, source, session_key, *, fresh):
         return None
 
-    adapter._apply_inherited_toolbar_model = _no_inherit
+    adapter._sync_toolbar_model_for_turn = _no_sync
     adapter._session_context_block_once = (
         lambda message, source, session_key: GrixAdapter._session_context_block_once(
             adapter, message, source, session_key

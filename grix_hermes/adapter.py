@@ -3883,24 +3883,40 @@ class GrixAdapter(BasePlatformAdapter):
             self._toolbar_session_models = store.sessions
         store.set_session(key, entry, owner_key=owner_key, update_global=update_global)
 
-    async def _apply_inherited_toolbar_model(
-        self, session_id: str, owner_key: str, source: Any
-    ) -> None:
-        """新的 Hermes 会话（首次/自动重置）继承持久化的模型选择。
+    def _core_session_lookup(
+        self, source: Any, session_key: str
+    ) -> Tuple[Any, str, Any]:
+        """(session_store, core_session_key, entry) —— 只读窥视核心 SessionStore。"""
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return None, session_key, None
+        key_fn = getattr(store, "_generate_session_key", None)
+        try:
+            core_key = key_fn(source) if callable(key_fn) else session_key
+        except Exception:
+            core_key = session_key
+        ensure_loaded = getattr(store, "_ensure_loaded", None)
+        if callable(ensure_loaded):
+            try:
+                ensure_loaded()
+            except Exception:
+                pass
+        entries = getattr(store, "_entries", None)
+        entry = entries.get(core_key) if isinstance(entries, dict) else None
+        return store, core_key, entry
 
-        Hermes 自身的 /model 覆盖随会话过期被清空，因此凡是检测到新会话，
-        都按 会话选择 → 全局选择 重新下发一次 /model（与 config 默认一致时跳过）。
-        """
+    def _desired_toolbar_model(self, owner_key: str, session_id: str) -> Tuple[str, str, Dict[str, str]]:
+        """持久化的期望模型 (model_id, provider, entry)；无需下发时返回空 model_id。"""
         desired = self._toolbar_effective_model(owner_key, session_id)
         model_id = str(desired.get("model_id") or "").strip()
         if not model_id or re.search(r"\s", model_id):
-            return
+            return "", "", desired
         provider = str(desired.get("provider") or "").strip()
         if (
             model_id == str(getattr(self, "_toolbar_model_id", "") or "")
             and provider == str(getattr(self, "_toolbar_model_provider", "") or "")
         ):
-            return
+            return "", "", desired
         # 目录已加载时先校验，失效的持久化选择不下发（否则核心可能静默
         # 忽略而被误记成功，工具栏与实际模型错位）。
         if (
@@ -3911,7 +3927,110 @@ class GrixAdapter(BasePlatformAdapter):
                 "[%s] persisted toolbar model %s/%s is not in the catalog; skip inherit for session %s",
                 self.name, provider, model_id, session_id,
             )
+            return "", "", desired
+        return model_id, provider, desired
+
+    async def _sync_toolbar_model_for_turn(
+        self,
+        session_id: str,
+        owner_key: str,
+        source: Any,
+        session_key: str,
+        *,
+        fresh: bool,
+    ) -> None:
+        """让 Hermes 会话的模型覆盖与工具栏持久化选择一致（对齐 connector 新会话继承）。
+
+        - Hermes 核心在自动重置（空闲/每日/挂起）时会清空 /model 覆盖，且 slash 命令
+          在会话重置判定之前处理：若直接发 `/model`，覆盖会落在将被丢弃的旧会话上。
+          因此重置待发生时先由本侧触发重置（get_or_create_session），再把覆盖写入
+          新条目的持久化字段；核心在下一次运行时解析时会从持久化 rehydrate。
+        - 全新会话（核心尚无条目）无法预写持久化：走 `/model` 命令写入内存覆盖，
+          后续消息看到条目已存在且持久化为空时再补写一次。
+        - 核心持久化已有不同选择（用户在聊天里手动 /model）时以核心为准，同步回工具栏。
+        """
+        model_id, provider, desired = self._desired_toolbar_model(owner_key, session_id)
+        store, core_key, entry = self._core_session_lookup(source, session_key)
+        if store is not None and entry is not None and not fresh:
+            await self._reconcile_persisted_model_override(
+                store, core_key, owner_key, session_id, model_id, provider
+            )
             return
+        if not model_id:
+            return
+        if store is not None and entry is not None and _session_reset_pending(store, entry, source):
+            try:
+                await asyncio.to_thread(
+                    store.get_or_create_session, source, touch_activity=False
+                )
+                await asyncio.to_thread(
+                    store.set_model_override,
+                    core_key,
+                    {"model": model_id, "provider": provider or None},
+                )
+            except Exception as exc:  # noqa: BLE001 - inherit is best-effort
+                logger.warning(
+                    "[%s] failed to persist inherited toolbar model %s/%s after reset for %s: %s",
+                    self.name, provider, model_id, session_id, exc,
+                )
+                return
+            self._remember_toolbar_model(
+                owner_key, session_id,
+                {**desired, "model_id": model_id, "provider": provider},
+                update_global=False,
+            )
+            return
+        await self._send_inherited_model_command(
+            session_id, owner_key, source, model_id, provider, desired
+        )
+
+    async def _reconcile_persisted_model_override(
+        self,
+        store: Any,
+        core_key: str,
+        owner_key: str,
+        session_id: str,
+        model_id: str,
+        provider: str,
+    ) -> None:
+        get_override = getattr(store, "get_model_override", None)
+        set_override = getattr(store, "set_model_override", None)
+        if not callable(get_override) or not callable(set_override):
+            return
+        try:
+            persisted = await asyncio.to_thread(get_override, core_key)
+        except Exception:
+            return
+        persisted_model = str((persisted or {}).get("model") or "").strip()
+        persisted_provider = str((persisted or {}).get("provider") or "").strip()
+        if persisted_model:
+            if persisted_model != model_id or (provider and persisted_provider != provider):
+                # 核心已有不同的会话覆盖（聊天内手动 /model）：以核心为准同步回工具栏。
+                self._remember_toolbar_model(
+                    owner_key, session_id,
+                    {"model_id": persisted_model, "provider": persisted_provider,
+                     "display_label": persisted_model},
+                    update_global=False,
+                )
+            return
+        if not model_id:
+            return
+        try:
+            await asyncio.to_thread(
+                set_override, core_key, {"model": model_id, "provider": provider or None}
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[%s] persist toolbar model override failed: %s", self.name, exc)
+
+    async def _send_inherited_model_command(
+        self,
+        session_id: str,
+        owner_key: str,
+        source: Any,
+        model_id: str,
+        provider: str,
+        desired: Dict[str, str],
+    ) -> None:
         handler = getattr(self, "_message_handler", None)
         if handler is None:
             return
@@ -5318,11 +5437,13 @@ class GrixAdapter(BasePlatformAdapter):
         session_context = self._session_context_block_once(message, source, session_key)
         if session_context:
             event_text = f"{session_context}\n\n{event_text}" if event_text else session_context
-            await self._apply_inherited_toolbar_model(
-                str(getattr(message, "session_id", "") or "").strip(),
-                self._active_owner_key(),
-                source,
-            )
+        await self._sync_toolbar_model_for_turn(
+            str(getattr(message, "session_id", "") or "").strip(),
+            self._active_owner_key(),
+            source,
+            session_key,
+            fresh=bool(session_context),
+        )
         event_message_type = _resolve_message_type(message)
         raw_kind = "message"
         raw_message = {**message.raw}
