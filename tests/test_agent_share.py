@@ -101,6 +101,12 @@ class FakeTransportClient:
     async def complete_event(self, **kw):
         self.send_log.append(("complete_event", kw))
 
+    async def agent_invoke(self, *, action, params=None, timeout_ms=None):
+        self.send_log.append(
+            ("agent_invoke", {"action": action, "params": params, "timeout_ms": timeout_ms})
+        )
+        return {"ok": True, "action": action}
+
 
 def _make_adapter():
     """构造一个最小可用 GrixAdapter，FakeClient 替掉真 transport。"""
@@ -320,7 +326,7 @@ def test_get_ready_client_treats_stale_primary_as_primary_not_shared(monkeypatch
     reconnect_calls: list[str] = []
 
     async def fake_reconnect(*, reason: str = "", max_attempts: int = 2):
-        reconnect_calls.append(reason)
+        reconnect_calls.append((reason, max_attempts))
         return True
 
     monkeypatch.setattr(inst, "_try_reconnect_transport", fake_reconnect)
@@ -338,9 +344,96 @@ def test_get_ready_client_treats_stale_primary_as_primary_not_shared(monkeypatch
             "旧主连接引用必须按主连接处理走 reconnect 路径,"
             "不能因为 `ctx_client is self._client` 不等就当成共享子连接 return None"
         )
-        assert reconnect_calls, "应该触发了主连接 reconnect 路径"
+        assert reconnect_calls == [
+            ("send: transport not ready", adapter_mod._OUTBOUND_RECONNECT_ATTEMPTS)
+        ], "应该触发主连接长窗口 reconnect 路径"
 
     asyncio.run(in_stale_primary_ctx())
+
+
+def test_agent_invoke_retries_safe_read_action_after_transient_disconnect(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+
+    old_primary = inst._client
+    old_primary.status = {"connected": True, "authed": True}
+
+    calls = {"n": 0}
+
+    async def flaky_agent_invoke(*, action, params=None, timeout_ms=None):
+        calls["n"] += 1
+        old_primary.status = {
+            "connected": False,
+            "authed": False,
+            "last_error": "grix websocket closed",
+        }
+        raise adapter_mod.GrixConnectionClosedError("grix websocket closed")
+
+    old_primary.agent_invoke = flaky_agent_invoke
+
+    new_primary = FakeTransportClient(inst.connection)
+    new_primary.status = {"connected": True, "authed": True}
+
+    async def fake_reconnect(*, reason: str = "", max_attempts: int = 2):
+        inst._client = new_primary
+        return True
+
+    monkeypatch.setattr(inst, "_try_reconnect_transport", fake_reconnect)
+
+    async def run():
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(old_primary)
+        try:
+            return await inst.agent_invoke(
+                action="message_history",
+                params={"session_id": "s1"},
+            )
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+
+    result = asyncio.run(run())
+
+    assert result == {"ok": True, "action": "message_history"}
+    assert calls["n"] == 1
+    assert new_primary.send_log == [
+        (
+            "agent_invoke",
+            {
+                "action": "message_history",
+                "params": {"session_id": "s1"},
+                "timeout_ms": None,
+            },
+        )
+    ]
+
+
+def test_agent_invoke_does_not_replay_side_effect_action_after_disconnect(monkeypatch):
+    _patch_transport(monkeypatch)
+    inst = _make_adapter()
+
+    primary = inst._client
+    primary.status = {"connected": True, "authed": True}
+
+    async def failing_agent_invoke(*, action, params=None, timeout_ms=None):
+        raise adapter_mod.GrixConnectionClosedError("grix websocket closed")
+
+    primary.agent_invoke = failing_agent_invoke
+
+    async def run():
+        token = adapter_mod._CURRENT_CLIENT_CTX.set(primary)
+        try:
+            return await inst.agent_invoke(
+                action="send_msg",
+                params={"session_id": "s1", "text": "x"},
+            )
+        finally:
+            adapter_mod._CURRENT_CLIENT_CTX.reset(token)
+
+    try:
+        asyncio.run(run())
+    except adapter_mod.GrixConnectionClosedError:
+        pass
+    else:
+        raise AssertionError("side-effect agent_invoke must not be replayed after write failure")
 
 
 # ── 8. _schedule_session_route_bind 跟随 ContextVar:被共享者会话的 route_bind
