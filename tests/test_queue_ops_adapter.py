@@ -485,6 +485,37 @@ def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkey
     ]
 
 
+def test_resolve_toolbar_models_includes_auth_store_providers(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "model:\n  default: deepseek-v4-flash\n  provider: grix\n"
+        "providers:\n  grix:\n    default_model: deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+    hermes_pkg = types.ModuleType("hermes_cli")
+    inventory = types.ModuleType("hermes_cli.inventory")
+    inventory.load_picker_context = lambda: object()
+    inventory.build_models_payload = lambda *a, **k: {
+        "providers": [
+            {"slug": "grix", "name": "Grix", "models": ["deepseek-v4-flash"]},
+            {"slug": "opencode-go", "name": "OpenCode Go", "models": ["kimi-k3"]},
+            {"slug": "opencode-free", "name": "OpenCode Free", "models": ["hy3-free"]},
+        ],
+    }
+    auth = types.ModuleType("hermes_cli.auth")
+    auth.is_provider_explicitly_configured = lambda slug: slug == "opencode-go"
+    monkeypatch.setitem(sys.modules, "hermes_cli", hermes_pkg)
+    monkeypatch.setitem(sys.modules, "hermes_cli.inventory", inventory)
+    monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
+
+    models = adapter_mod.resolve_toolbar_available_models(str(tmp_path))
+
+    assert [(m["id"], m["provider"]) for m in models] == [
+        ("kimi-k3", "opencode-go"),
+        ("deepseek-v4-flash", "grix"),
+    ]
+
+
 def test_resolve_toolbar_models_maps_configured_custom_provider(tmp_path, monkeypatch):
     (tmp_path / "config.yaml").write_text(
         "model:\n  default: z-model\n  provider: custom:local\n"
