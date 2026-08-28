@@ -43,6 +43,7 @@ def _adapter(store_path=None):
     adapter._push_queue_snapshot = AsyncMock()
     adapter.build_source = lambda chat_id, chat_type: SimpleNamespace(chat_id=chat_id, chat_type=chat_type)
     adapter._provider_quota_toolbar_meta = lambda: {}
+    adapter._session_store = None
     return adapter
 
 
@@ -129,7 +130,7 @@ def test_inherit_sends_model_command_for_new_session(tmp_path):
     ToolbarModelStore(path).set_session("\0old", {"model_id": "m-b", "provider": "p2", "display_label": "B"})
     adapter = _adapter(path)
     source = SimpleNamespace(chat_id="fresh")
-    asyncio.run(GrixAdapter._apply_inherited_toolbar_model(adapter, "fresh", "", source))
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "fresh", "", source, "k", fresh=True))
     adapter._message_handler.assert_awaited_once()
     event = adapter._message_handler.await_args.args[0]
     assert event.text == "/model m-b --provider p2"
@@ -144,7 +145,7 @@ def test_inherit_skips_when_matching_config_default(tmp_path):
     path = str(tmp_path / "toolbar-models.json")
     ToolbarModelStore(path).set_session("\0old", {"model_id": "m-a", "provider": "p1"})
     adapter = _adapter(path)
-    asyncio.run(GrixAdapter._apply_inherited_toolbar_model(adapter, "fresh", "", SimpleNamespace()))
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "fresh", "", SimpleNamespace(), "k", fresh=True))
     adapter._message_handler.assert_not_awaited()
     assert ToolbarModelStore(path).get_session("\0fresh") is None
 
@@ -153,7 +154,7 @@ def test_inherit_skips_model_missing_from_catalog(tmp_path):
     path = str(tmp_path / "toolbar-models.json")
     ToolbarModelStore(path).set_session("\0old", {"model_id": "gone", "provider": "p9"})
     adapter = _adapter(path)
-    asyncio.run(GrixAdapter._apply_inherited_toolbar_model(adapter, "fresh", "", SimpleNamespace()))
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "fresh", "", SimpleNamespace(), "k", fresh=True))
     adapter._message_handler.assert_not_awaited()
     assert ToolbarModelStore(path).get_session("\0fresh") is None
 
@@ -163,5 +164,85 @@ def test_inherit_failure_does_not_record_session(tmp_path):
     ToolbarModelStore(path).set_session("\0old", {"model_id": "m-b", "provider": "p2"})
     adapter = _adapter(path)
     adapter._message_handler = AsyncMock(side_effect=RuntimeError("boom"))
-    asyncio.run(GrixAdapter._apply_inherited_toolbar_model(adapter, "fresh", "", SimpleNamespace()))
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "fresh", "", SimpleNamespace(), "k", fresh=True))
     assert ToolbarModelStore(path).get_session("\0fresh") is None
+
+
+class _FakeStore:
+    """核心 SessionStore 的最小桩：entries / reset 判定 / 覆盖持久化。"""
+
+    def __init__(self, entry=None, reset_pending=False):
+        self._entries = {"core-k": entry} if entry is not None else {}
+        self._reset_pending = reset_pending
+        self.overrides = {}
+        self.calls = []
+
+    def _generate_session_key(self, source):
+        return "core-k"
+
+    def _should_reset(self, entry, source):
+        return self._reset_pending
+
+    def get_or_create_session(self, source, force_new=False, touch_activity=True):
+        self.calls.append(("get_or_create", touch_activity))
+        self._reset_pending = False
+        self._entries["core-k"] = SimpleNamespace(session_id="new", was_auto_reset=True)
+        return self._entries["core-k"]
+
+    def set_model_override(self, key, override):
+        self.calls.append(("set", key, override))
+        self.overrides[key] = override
+
+    def get_model_override(self, key):
+        return self.overrides.get(key)
+
+
+def test_reset_pending_persists_override_instead_of_command(tmp_path):
+    path = str(tmp_path / "toolbar-models.json")
+    ToolbarModelStore(path).set_session("\0old", {"model_id": "m-b", "provider": "p2"})
+    adapter = _adapter(path)
+    adapter._session_store = _FakeStore(entry=SimpleNamespace(session_id="old"), reset_pending=True)
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "fresh", "", SimpleNamespace(), "k", fresh=True))
+    adapter._message_handler.assert_not_awaited()
+    assert adapter._session_store.calls == [
+        ("get_or_create", False),
+        ("set", "core-k", {"model": "m-b", "provider": "p2"}),
+    ]
+    assert ToolbarModelStore(path).get_session("\0fresh")["model_id"] == "m-b"
+
+
+def test_existing_session_backfills_missing_persisted_override(tmp_path):
+    path = str(tmp_path / "toolbar-models.json")
+    ToolbarModelStore(path).set_session("\0s", {"model_id": "m-b", "provider": "p2"})
+    adapter = _adapter(path)
+    adapter._session_store = _FakeStore(entry=SimpleNamespace(session_id="s"))
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "s", "", SimpleNamespace(), "k", fresh=False))
+    adapter._message_handler.assert_not_awaited()
+    assert adapter._session_store.overrides["core-k"] == {"model": "m-b", "provider": "p2"}
+    # already persisted: no further writes
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "s", "", SimpleNamespace(), "k", fresh=False))
+    assert len([c for c in adapter._session_store.calls if c[0] == "set"]) == 1
+
+
+def test_existing_session_adopts_core_override_into_toolbar(tmp_path):
+    path = str(tmp_path / "toolbar-models.json")
+    ToolbarModelStore(path).set_session("\0s", {"model_id": "m-b", "provider": "p2"})
+    adapter = _adapter(path)
+    store = _FakeStore(entry=SimpleNamespace(session_id="s"))
+    store.overrides["core-k"] = {"model": "m-a", "provider": "p1"}
+    adapter._session_store = store
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "s", "", SimpleNamespace(), "k", fresh=False))
+    assert not [c for c in store.calls if c[0] == "set"]
+    assert ToolbarModelStore(path).get_session("\0s")["model_id"] == "m-a"
+    assert ToolbarModelStore(path).get_global("")["model_id"] == "m-b"
+
+
+def test_non_fresh_without_core_entry_never_sends_model_command(tmp_path):
+    path = str(tmp_path / "toolbar-models.json")
+    ToolbarModelStore(path).set_session("\0s", {"model_id": "m-b", "provider": "p2"})
+    adapter = _adapter(path)
+    adapter._session_store = None
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "s", "", SimpleNamespace(), "k", fresh=False))
+    adapter._session_store = _FakeStore()  # store present, entry missing
+    asyncio.run(GrixAdapter._sync_toolbar_model_for_turn(adapter, "s", "", SimpleNamespace(), "k", fresh=False))
+    adapter._message_handler.assert_not_awaited()
