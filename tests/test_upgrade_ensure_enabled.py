@@ -272,6 +272,8 @@ def test_update_failure_uses_git_fallback_before_install(monkeypatch, tmp_path):
     monkeypatch.setattr("grix_hermes.upgrade_checker._plugin_checkout_dir", lambda: tmp_path)
     calls, fake = _fake_run_cmd([
         (["hermes", "plugins", "update"], (1, "fatal: not currently on a branch", "")),
+        (["git", "-C", str(tmp_path), "remote"], (0, "https://github.com/askie/grix-hermes-python.git", "")),
+        (["git", "-C", str(tmp_path), "status"], (0, "", "")),
         (["git", "-C", str(tmp_path), "fetch"], (0, "", "")),
         (["git", "-C", str(tmp_path), "reset"], (0, "HEAD is now at abc", "")),
         (["hermes", "plugins", "enable"], (0, "", "")),
@@ -282,7 +284,7 @@ def test_update_failure_uses_git_fallback_before_install(monkeypatch, tmp_path):
 
     asyncio.run(checker._do_upgrade())
 
-    assert [c[0] for c in calls] == ["hermes", "git", "git", "hermes", "hermes"]
+    assert [c[0] for c in calls] == ["hermes", "git", "git", "git", "git", "hermes", "hermes"]
     assert not any(c[:3] == ["hermes", "plugins", "install"] for c in calls)
 
 
@@ -291,6 +293,8 @@ def test_git_fallback_failure_falls_through_to_install_and_reports_all_outputs(m
     monkeypatch.setattr("grix_hermes.upgrade_checker._plugin_checkout_dir", lambda: tmp_path)
     calls, fake = _fake_run_cmd([
         (["hermes", "plugins", "update"], (1, "Error: pull failed", "")),
+        (["git", "-C", str(tmp_path), "remote"], (0, "git@github.com:askie/grix-hermes-python.git", "")),
+        (["git", "-C", str(tmp_path), "status"], (0, "", "")),
         (["git", "-C", str(tmp_path), "fetch"], (128, "", "fatal: unable to access")),
         (["hermes", "plugins", "install"], (1, "Error: Plugin 'grix-hermes' already exists.", "")),
     ])
@@ -353,3 +357,51 @@ def test_config_fallback_respects_disabled_list(tmp_path):
 
 def test_config_fallback_missing_config_is_not_enabled(tmp_path):
     assert uc._plugin_enabled_in_config(str(tmp_path)) is False
+
+
+def _git_guard_case(monkeypatch, tmp_path, remote_out, status_out):
+    _no_retry(monkeypatch)
+    monkeypatch.setattr("grix_hermes.upgrade_checker._plugin_checkout_dir", lambda: tmp_path)
+    calls, fake = _fake_run_cmd([
+        (["hermes", "plugins", "update"], (1, "Error: pull failed", "")),
+        (["git", "-C", str(tmp_path), "remote"], (0, remote_out, "")),
+        (["git", "-C", str(tmp_path), "status"], (0, status_out, "")),
+        (["hermes", "plugins", "install"], (1, "Error: already exists", "")),
+    ])
+    monkeypatch.setattr(UpgradeChecker, "_run_cmd", staticmethod(fake))
+    try:
+        asyncio.run(_make_checker()._do_upgrade())
+    except RuntimeError as exc:
+        return calls, str(exc)
+    raise AssertionError("expected RuntimeError")
+
+
+def test_git_fallback_refuses_dirty_tree(monkeypatch, tmp_path):
+    calls, msg = _git_guard_case(monkeypatch, tmp_path, "https://github.com/askie/grix-hermes-python.git", " M grix_hermes/adapter.py")
+    assert not any(c[:1] == ["git"] and c[3] in ("fetch", "reset") for c in calls)
+    assert "local changes" in msg
+
+
+def test_git_fallback_refuses_foreign_origin(monkeypatch, tmp_path):
+    calls, msg = _git_guard_case(monkeypatch, tmp_path, "git@github.com:someone/fork.git", "")
+    assert not any(c[:1] == ["git"] and c[3] in ("status", "fetch", "reset") for c in calls)
+    assert "origin is not" in msg
+
+
+def test_failure_message_fits_report_limit(monkeypatch, tmp_path):
+    _no_retry(monkeypatch)
+    monkeypatch.setattr("grix_hermes.upgrade_checker._plugin_checkout_dir", lambda: tmp_path)
+    calls, fake = _fake_run_cmd([
+        (["hermes", "plugins", "update"], (1, "u" * 900, "")),
+        (["git", "-C", str(tmp_path), "remote"], (0, "https://github.com/askie/grix-hermes-python.git", "")),
+        (["git", "-C", str(tmp_path), "status"], (0, "", "")),
+        (["git", "-C", str(tmp_path), "fetch"], (1, "g" * 900, "")),
+        (["hermes", "plugins", "install"], (1, "i" * 900, "")),
+    ])
+    monkeypatch.setattr(UpgradeChecker, "_run_cmd", staticmethod(fake))
+    try:
+        asyncio.run(_make_checker()._do_upgrade())
+    except RuntimeError as exc:
+        assert len(str(exc)) <= 500
+    else:
+        raise AssertionError("expected RuntimeError")
