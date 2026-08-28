@@ -203,8 +203,29 @@ def test_failure_outcome_reports_failed(monkeypatch):
     _run_turn(inst, client, _msg_event(), outcome=object())  # 非 SUCCESS 非 CANCELLED
 
     assert client.completed == [
-        {"event_id": "ev-1", "status": "failed", "message": "message processing failed"}
+        {"event_id": "ev-1", "status": "failed", "message": "message processing failed: Hermes finished without producing a reply"}
     ]
+
+
+def test_failure_outcome_carries_gateway_error_detail(monkeypatch):
+    """网关异常兜底文案是异常详情唯一能到适配器的通道，failed 结果要带上它。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", _session_key_by_chat)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _register(inst, "sk:chat-1", "ev-1")
+    event = _msg_event()
+
+    inst._remember_failure_hint_from_reply(
+        event.source.chat_id,
+        "Sorry, I encountered an error (RuntimeError).\nprovider returned 401\nTry again or use /reset to start a fresh session.",
+    )
+    _run_turn(inst, client, event, outcome=object())
+
+    assert client.completed == [
+        {"event_id": "ev-1", "status": "failed", "message": "RuntimeError: provider returned 401"}
+    ]
+    # 线索是一次性的，下一轮失败不会重复带上旧原因
+    assert inst._owner_states[""].last_failure_hints == {}
 
 
 def test_cancelled_outcome_reports_canceled(monkeypatch):

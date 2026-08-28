@@ -261,7 +261,10 @@ def test_run_timeout_fails_running_event_and_drains_queue():
         return queue, rec
 
     queue, rec = asyncio.run(_run())
-    assert ("e1", STATE_FAILED, {"reason": "run timeout"}) in rec.states
+    assert any(
+        eid == "e1" and st == STATE_FAILED and str(meta.get("reason", "")).startswith("run timeout")
+        for eid, st, meta in rec.states
+    )
     assert not queue.is_running("e1")
     # 槽位释放后排队事件立即续投（e2 自己的看门狗 100ms 才到期，此刻仍在运行）
     assert queue.is_running("e2")
