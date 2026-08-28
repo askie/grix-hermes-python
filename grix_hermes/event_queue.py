@@ -511,7 +511,12 @@ class EventQueue:
             event_id,
             item.session_id,
         )
-        self._on_state_change(item, STATE_FAILED, {"reason": "run timeout"})
+        minutes = max(1, round(self._config.run_timeout_ms / 60_000))
+        self._on_state_change(
+            item,
+            STATE_FAILED,
+            {"reason": f"run timeout: no completion reported within {minutes} min"},
+        )
         self._schedule_drain()
 
     def _cancel_run_timeout(self, event_id: str) -> None:

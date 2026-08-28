@@ -168,6 +168,7 @@ def _run_turn(inst, client, event, outcome=None):
     async def _turn():
         await inst.on_processing_start(event)
         await inst.on_processing_complete(event, outcome)
+        await inst.flush_deferred_failure_reports()
 
     _with_ctx(client, _turn())
 
@@ -203,8 +204,36 @@ def test_failure_outcome_reports_failed(monkeypatch):
     _run_turn(inst, client, _msg_event(), outcome=object())  # 非 SUCCESS 非 CANCELLED
 
     assert client.completed == [
-        {"event_id": "ev-1", "status": "failed", "message": "message processing failed"}
+        {"event_id": "ev-1", "status": "failed", "message": "message processing failed: Hermes finished without producing a reply"}
     ]
+
+
+def test_failure_outcome_carries_gateway_error_detail(monkeypatch):
+    """网关异常兜底文案是异常详情唯一能到适配器的通道，failed 结果要带上它。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", _session_key_by_chat)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _register(inst, "sk:chat-1", "ev-1")
+    event = _msg_event()
+
+    async def _turn():
+        await inst.on_processing_start(event)
+        await inst.on_processing_complete(event, object())
+        # 与网关顺序一致：钩子返回后才发错误文案
+        assert client.completed == []
+        inst._remember_failure_hint_from_reply(
+            event.source.chat_id,
+            "Sorry, I encountered an error (RuntimeError).\nprovider returned 401\nTry again or use /reset to start a fresh session.",
+        )
+        await inst.flush_deferred_failure_reports()
+
+    _with_ctx(client, _turn())
+
+    assert client.completed == [
+        {"event_id": "ev-1", "status": "failed", "message": "RuntimeError: provider returned 401"}
+    ]
+    # 线索是一次性的，下一轮失败不会重复带上旧原因
+    assert inst._owner_states[""].last_failure_hints == {}
 
 
 def test_cancelled_outcome_reports_canceled(monkeypatch):
@@ -328,7 +357,11 @@ def test_leftover_inline_events_swept_as_responded(monkeypatch):
     # 运行期间到达并被旁路消化的事件（如 clarify 文本答复）
     _register(inst, "sk:chat-1", "ev-inline")
     # 本轮失败：旁路事件自身被成功消化，仍应报 responded 而非跟随失败
-    _with_ctx(client, inst.on_processing_complete(event, object()))
+    async def _complete():
+        await inst.on_processing_complete(event, object())
+        await inst.flush_deferred_failure_reports()
+
+    _with_ctx(client, _complete())
 
     rows = {c["event_id"]: c["status"] for c in client.completed}
     assert rows == {"ev-1": "failed", "ev-inline": "responded"}
