@@ -161,6 +161,22 @@ _RECONNECT_MAX_DELAY_SECONDS = 30.0
 _RECONNECT_JITTER_RATIO = 0.2
 _BACKGROUND_RECONNECT_BASE_DELAY_SECONDS = 30.0
 _BACKGROUND_RECONNECT_MAX_DELAY_SECONDS = 300.0
+_OUTBOUND_RECONNECT_ATTEMPTS = 6
+_SAFE_AGENT_INVOKE_RETRY_ACTIONS = frozenset(
+    {
+        "contact_search",
+        "session_search",
+        "search_favorite_sessions",
+        "message_history",
+        "message_search",
+        "group_detail_read",
+        "agent_category_list",
+        "egg_search",
+        "egg_get",
+        "chat_state_query",
+        "skill_get",
+    }
+)
 
 
 def _reconnect_delay_seconds(
@@ -1564,6 +1580,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not self._disconnect_requested:
             if await self._try_reconnect_transport(
                 reason=f"{operation}: transport not ready",
+                max_attempts=_OUTBOUND_RECONNECT_ATTEMPTS,
             ):
                 return self._client
 
@@ -2709,10 +2726,28 @@ class GrixAdapter(BasePlatformAdapter):
         params: Optional[Dict[str, Any]] = None,
         timeout_ms: Optional[int] = None,
     ) -> Dict[str, Any]:
-        client = await self._get_ready_client(operation="agent_invoke")
-        if not client:
-            raise RuntimeError("GRIX transport is not connected")
-        return await client.agent_invoke(action=action, params=params, timeout_ms=timeout_ms)
+        safe_retry = action.strip() in _SAFE_AGENT_INVOKE_RETRY_ACTIONS
+        attempts = 2 if safe_retry else 1
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            client = await self._get_ready_client(operation="agent_invoke")
+            if not client:
+                raise RuntimeError("GRIX transport is not connected")
+            try:
+                return await client.agent_invoke(action=action, params=params, timeout_ms=timeout_ms)
+            except Exception as exc:
+                last_error = exc
+                if attempt >= attempts or not _coerce_retryable(exc):
+                    raise
+                logger.warning(
+                    "[%s] Retrying read-only grix_invoke action=%s after transient failure: %s",
+                    self.name,
+                    action,
+                    exc,
+                )
+
+        raise RuntimeError(str(last_error) if last_error else "GRIX transport is not connected")
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         source = self._active_state().latest_sources.get(str(chat_id))

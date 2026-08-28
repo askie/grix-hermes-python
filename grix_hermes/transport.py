@@ -225,6 +225,7 @@ class GrixTransportClient:
         self._connection_generation = 0
         self._negotiated_capabilities: set[str] = set()
         self._ack_policy: Optional[Dict[str, Any]] = None
+        self._send_lock = asyncio.Lock()
         self._terminal = TerminalDeliveryController(self)
 
     @property
@@ -1205,13 +1206,16 @@ class GrixTransportClient:
         self._ensure_ready(require_authed=require_authed)
         out_seq = seq or self._next_seq()
         packet = build_packet(cmd, payload, out_seq)
-        if not self._socket:
-            raise GrixTransportError("grix websocket is not connected")
-        try:
-            await self._socket.send_text(encode_packet(packet))
-        except Exception as exc:
-            await self.disconnect(f"{cmd} send failed: {exc}")
-            raise GrixConnectionClosedError(str(exc) or f"{cmd} send failed") from exc
+        async with self._send_lock:
+            self._ensure_ready(require_authed=require_authed)
+            socket = self._socket
+            if not socket:
+                raise GrixTransportError("grix websocket is not connected")
+            try:
+                await socket.send_text(encode_packet(packet))
+            except Exception as exc:
+                await self.disconnect(f"{cmd} send failed: {exc}")
+                raise GrixConnectionClosedError(str(exc) or f"{cmd} send failed") from exc
         return out_seq
 
     def _ensure_ready(self, *, require_authed: bool) -> None:
