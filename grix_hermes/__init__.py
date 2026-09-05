@@ -50,6 +50,15 @@ PLUGIN_SKILLS = {
         "description": "Register, authenticate, create API agents, and hand off Grix credentials.",
         "tools": ["grix_auth", "grix_egg"],
     },
+    "grix-connector-bootstrap": {
+        "description": (
+            "Install grix-connector on this machine and bring up its first "
+            "agent: install check, Node.js check, global npm install, create "
+            "the platform agent, write ~/.grix/config/agents.json, start the "
+            "daemon and verify the agent is connected."
+        ),
+        "tools": ["grix_invoke"],
+    },
     "grix-chat-state": {
         "description": "Query the chat-level task state across all the owner's chats (running / waiting / completed / failed / idle). Supports pagination and state filtering.",
         "tools": ["grix_invoke"],
