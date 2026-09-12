@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 SUPPORTED_ACTIONS = {
     "send_msg": "Send a message to a session (not for answering the inbound event being handled — use grix_reply or normal reply text for that)",
     "delete_msg": "Delete (unsend/recall) a message",
+    "message_edit": "Edit the content of a message you (this agent) previously sent, in place. Only your own message, and only a plain text/markdown one — card messages are always rejected by the server. Requires the owner to have granted the Edit Own Messages (message.edit) permission scope; if rejected for missing permission, surface the server error as-is — do not retry, do not fall back to send_msg (params: session_id, msg_id, content[max 10000 chars])",
     "contact_search": "Search contacts by keyword or ID",
     "session_search": "Search sessions by keyword",
     "search_favorite_sessions": "List the owner's favorited sessions (optional keyword filter)",
@@ -40,6 +41,9 @@ SUPPORTED_ACTIONS = {
     "egg_get": "Get egg details by ID (params: id[required], locale, version)",
     "skill_set": "Create/update/delete an owner's custom skill in the multi-machine-synced skill library (params: name[required], content[required]; empty content deletes by name)",
     "skill_get": "Read an owner's custom skill by name, or list the skill library when no name given (params: name[optional])",
+    "webhook_create": 'Create a webhook endpoint for a session this agent belongs to. POSTing {"content":"..."} to the returned URL sends that text into the session as the owner and wakes the agent — use it for human/timer-driven scheduled or recurring triggers (cron, schtasks, launchd). Not for agent-to-agent dispatch callbacks (params: session_id[required], expires_at[optional RFC3339])',
+    "webhook_list": "List the active webhook endpoints (with full URLs) of a session this agent belongs to. Call this BEFORE webhook_create and reuse an existing endpoint instead of creating another one (params: session_id[required])",
+    "webhook_delete": "Delete a webhook endpoint by id (from webhook_list / webhook_create). Only endpoints of sessions this agent belongs to. Use when tearing down scheduled triggers or removing duplicate endpoints (params: id[required])",
 }
 
 GRIX_INVOKE_SCHEMA = {
@@ -47,7 +51,7 @@ GRIX_INVOKE_SCHEMA = {
     "description": (
         "Unified Grix API — all operations go through the agent_invoke channel.\n\n"
         "Supported actions:\n"
-        "  Message: send_msg, delete_msg\n"
+        "  Message: send_msg, delete_msg, message_edit\n"
         "  Query: contact_search, session_search, search_favorite_sessions, message_history, message_search\n"
         "  Group: group_create, group_detail_read, group_leave_self, group_member_add, "
         "group_member_remove, group_member_role_update, group_all_members_muted_update, "
@@ -58,7 +62,8 @@ GRIX_INVOKE_SCHEMA = {
         "  Owner relay: call_owner, session_send\n"
         "  Chat state: chat_state_query, chat_state_update\n"
         "  Egg marketplace: egg_search, egg_get\n"
-        "  Custom skills (multi-machine synced): skill_set, skill_get\n\n"
+        "  Custom skills (multi-machine synced): skill_set, skill_get\n"
+        "  Webhook (scheduled/recurring triggers): webhook_create, webhook_list, webhook_delete\n\n"
         "Do NOT use send_msg to answer the inbound event you are currently handling — "
         "answer with grix_reply (or normal reply text) instead, otherwise the user "
         "receives duplicate messages."

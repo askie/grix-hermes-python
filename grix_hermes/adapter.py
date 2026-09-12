@@ -1271,10 +1271,12 @@ def _relay_profile_lock(hermes_home: str) -> asyncio.Lock:
 
 
 class GrixAdapter(BasePlatformAdapter):
-    # Grix/aibot 协议不支持编辑已发出的消息（没有客户端编辑能力）。
-    # 声明此项可使 Hermes gateway 跳过逐 token 的流式编辑消费者，避免在
-    # 对端产生「部分消息 + cursor + 完整消息」的重复气泡；最终回复走非流式
-    # 路径统一发送一次，并自动带上对触发消息的引用。
+    # Grix/aibot 协议本身支持编辑已发出的消息（edit_msg 命令，以及
+    # agent_invoke 的 message_edit 动作），但那是"编辑一条已经发完的历史
+    # 消息"，不是这里说的"流式增量编辑同一条气泡"。声明 False 是为了让
+    # Hermes gateway 跳过逐 token 的流式编辑消费者，避免在对端产生
+    # 「部分消息 + cursor + 完整消息」的重复气泡；最终回复走非流式路径统一
+    # 发送一次，并自动带上对触发消息的引用。
     SUPPORTS_MESSAGE_EDITING = False
     MAX_MESSAGE_LENGTH = 1800
     _SEND_MIN_INTERVAL = 0.5

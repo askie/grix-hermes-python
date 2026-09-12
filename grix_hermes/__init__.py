@@ -26,7 +26,13 @@ PLUGIN_SKILLS = {
         "tools": ["grix_invoke"],
     },
     "grix-egg": {
-        "description": "Install and wire a Hermes profile to Grix with grix-hermes.",
+        "description": (
+            "Two things: search the Grix egg market (published skill/persona "
+            "packages) via grix_invoke's egg_search / egg_get actions and "
+            "install the chosen one; and the separate grix_egg tool that "
+            "bootstraps/binds this Hermes profile to Grix (detect/install/"
+            "create/bind/soul/gateway/accept)."
+        ),
         "tools": ["grix_egg", "grix_auth", "grix_invoke", "grix_card"],
     },
     "grix-group": {
@@ -73,6 +79,29 @@ PLUGIN_SKILLS = {
     },
     "message-unsend": {
         "description": "Silently recall Grix messages through Hermes.",
+        "tools": ["grix_invoke"],
+    },
+    "message-edit": {
+        "description": "Edit the content of a message this agent previously sent, in place, through Hermes. Own plain text/markdown messages only; requires the Edit Own Messages permission.",
+        "tools": ["grix_invoke"],
+    },
+    "grix-scheduled-trigger": {
+        "description": (
+            "Set up human- or timer-driven triggers by reusing or creating a "
+            "session's standing webhook (webhook_list / webhook_create) and "
+            "registering a local scheduler job (launchd/cron/systemd timer/"
+            "Task Scheduler) that POSTs to it; webhook_delete tears it down. "
+            "Not for agent-to-agent dispatch callbacks."
+        ),
+        "tools": ["grix_invoke"],
+    },
+    "grix-task-flow": {
+        "description": (
+            "Per-task judgment every agent applies for itself: do a task "
+            "directly or split it into nodes dispatched to other agents, "
+            "tracked by editing one mermaid flowchart message in place. "
+            "Recursive and depth-capped."
+        ),
         "tools": ["grix_invoke"],
     },
     "tailnet-file-share": {
