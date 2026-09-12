@@ -74,6 +74,106 @@ def test_handle_local_action_resolves_via_session_key_mapping():
     )
 
 
+def _approve_payload(approval_id, action_id="act-w"):
+    return {
+        "action_id": action_id,
+        "action_type": LOCAL_ACTION_EXEC_APPROVE,
+        "params": {"approval_id": approval_id, "decision": "allow-once"},
+    }
+
+
+def test_handle_local_action_rearms_watchdog_after_approval_resolved():
+    """审批解析、轮次恢复执行：为会话 running 事件重挂空闲看门狗。"""
+    adapter = _adapter()
+    adapter._event_queue = Mock()
+
+    with _packet_ctx(adapter):
+        adapter._active_state().approval_state["ap1"] = {"session_key": "sess-1", "chat_id": "chat-1"}
+        adapter._active_state().session_running_event_ids["sess-1"] = ["evt-1"]
+        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            asyncio.run(
+                GrixAdapter._handle_local_action_packet(adapter, _approve_payload("ap1"))
+            )
+
+    adapter._event_queue.note_progress.assert_called_once_with("evt-1")
+
+
+def test_handle_local_action_keeps_watchdog_paused_while_other_approval_pending():
+    """同会话还有另一张待审批卡片时：解析其中一张不重挂，保持暂停。"""
+    adapter = _adapter()
+    adapter._event_queue = Mock()
+
+    with _packet_ctx(adapter):
+        adapter._active_state().approval_state["ap1"] = {"session_key": "sess-1", "chat_id": "chat-1"}
+        adapter._active_state().approval_state["ap2"] = {"session_key": "sess-1", "chat_id": "chat-1"}
+        adapter._active_state().session_running_event_ids["sess-1"] = ["evt-1"]
+        with patch("tools.approval.resolve_gateway_approval", return_value=1):
+            asyncio.run(
+                GrixAdapter._handle_local_action_packet(adapter, _approve_payload("ap1"))
+            )
+
+    adapter._event_queue.note_progress.assert_not_called()
+
+
+def test_send_exec_approval_pauses_watchdog_when_card_delivered():
+    """审批卡送达后进入用户等待态：暂停会话 running 事件的空闲看门狗。"""
+    adapter = _adapter()
+    adapter.connection = None
+    adapter._event_queue = Mock()
+    client = SimpleNamespace(send_text=AsyncMock(return_value={"ok": True, "message_id": "m1"}))
+    adapter._get_ready_client = AsyncMock(return_value=client)
+
+    with _packet_ctx(adapter):
+        adapter._active_state().session_running_event_ids["sess-1"] = ["evt-1"]
+        # gateway stub 的 SendResult 不可实例化：patch 成可 kw 构造的替身。
+        with patch(
+            "grix_hermes.adapter.resolve_grix_target",
+            new=AsyncMock(return_value=("chat-1", None)),
+        ), patch(
+            "grix_hermes.adapter.SendResult",
+            lambda **kw: SimpleNamespace(**kw),
+        ):
+            result = asyncio.run(
+                GrixAdapter.send_exec_approval(adapter, "chat-1", "rm -rf /tmp/x", "sess-1")
+            )
+
+    assert result.success
+    adapter._event_queue.pause_run_timeout.assert_called_once_with("evt-1")
+    with _packet_ctx(adapter):
+        states = adapter._active_state().approval_state
+        assert len(states) == 1
+        assert next(iter(states.values()))["session_key"] == "sess-1"
+
+
+def test_send_exec_approval_keeps_watchdog_when_card_not_delivered():
+    """卡片没发出去（ok=False）：没人会点，不暂停看门狗，等待由看门狗兜底。"""
+    adapter = _adapter()
+    adapter.connection = None
+    adapter._event_queue = Mock()
+    client = SimpleNamespace(send_text=AsyncMock(return_value={"ok": False}))
+    adapter._get_ready_client = AsyncMock(return_value=client)
+
+    with _packet_ctx(adapter):
+        adapter._active_state().session_running_event_ids["sess-1"] = ["evt-1"]
+        with patch(
+            "grix_hermes.adapter.resolve_grix_target",
+            new=AsyncMock(return_value=("chat-1", None)),
+        ), patch(
+            "grix_hermes.adapter.SendResult",
+            lambda **kw: SimpleNamespace(**kw),
+        ):
+            result = asyncio.run(
+                GrixAdapter.send_exec_approval(adapter, "chat-1", "rm -rf /tmp/x", "sess-1")
+            )
+
+    assert not result.success
+    adapter._event_queue.pause_run_timeout.assert_not_called()
+    # 卡片未送达不得入 approval_state：残账会抑制审批解析处的看门狗
+    # 恢复门（any() 按 session_key 命中永远解析不了的残账而跳过重挂）。
+    with _packet_ctx(adapter):
+        assert not adapter._active_state().approval_state
+
+
 def test_handle_local_action_fails_when_approval_mapping_missing():
     adapter = _adapter()
     payload = {

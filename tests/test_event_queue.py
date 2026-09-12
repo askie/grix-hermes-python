@@ -313,6 +313,36 @@ def test_run_timeout_fires_after_progress_stops():
     assert not queue.is_running("e1")
 
 
+def test_run_timeout_paused_during_user_wait_and_rearmed_on_resume():
+    """用户等待态豁免：审批等待期间看门狗暂停，等多久都不判 failed；
+    等待结束（note_progress 重挂）后真零进展，仍按原语义判 failed。
+
+    复现场景：事件发出审批卡进入等待态，用户超过空闲阈值时长才点
+    审批——未豁免时会被误杀；豁免后存活。审批解析重挂后，挂死的
+    轮次依然能被看门狗收口（不破坏空闲看门狗本体行为）。
+    """
+    async def _run():
+        queue, rec = _make_queue(run_timeout_ms=200)
+        queue.pause_run_timeout("ghost")  # 未投递/不存在的事件：空操作，不得炸
+        queue.submit(_item("e1"))  # running
+        # 进入用户等待态（审批卡已送达）：暂停看门狗
+        queue.pause_run_timeout("e1")
+        await asyncio.sleep(0.4)  # 等了 2 个超时窗口——未暂停时早被判 failed
+        assert queue.is_running("e1"), "等待态内不应被判 failed"
+        assert not any(st == STATE_FAILED for _, st, _ in rec.states)
+        # 审批被解析、轮次恢复执行：重挂看门狗
+        queue.note_progress("e1")
+        await asyncio.sleep(0.3)  # 恢复后真零进展超过一个窗口
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    assert any(
+        eid == "e1" and st == STATE_FAILED and str(meta.get("reason", "")).startswith("run timeout")
+        for eid, st, meta in rec.states
+    )
+    assert not queue.is_running("e1")
+
+
 def test_run_timeout_cancelled_by_complete():
     async def _run():
         queue, rec = _make_queue(run_timeout_ms=30)
