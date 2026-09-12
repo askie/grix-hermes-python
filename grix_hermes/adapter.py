@@ -2434,19 +2434,28 @@ class GrixAdapter(BasePlatformAdapter):
                 biz_card=message.biz_card,
                 channel_data=message.channel_data,
             )
+            if not bool(receipt.get("ok")):
+                # 卡片没发出去：没人会点，既不入 approval_state（残账会抑制
+                # 审批解析处的看门狗恢复门——any() 扫描按 session_key 命中
+                # 永远解析不了的残账而跳过重挂），也不暂停看门狗——等待必须
+                # 由看门狗兜底。
+                return SendResult(
+                    success=False,
+                    message_id=receipt.get("message_id"),
+                    raw_response=receipt,
+                    retryable=False,
+                )
             self._active_state().approval_state[resolved_approval_id] = {
                 "session_key": str(session_key).strip(),
                 "chat_id": str(chat_id).strip(),
                 "thread_id": thread_id,
             }
-            if bool(receipt.get("ok")):
-                # 对齐 connector（acp-adapter.ts:2924 等待审批时 clearTimeout）：
-                # 卡片已送达、开始等用户操作，暂停空闲看门狗——用户多久才点
-                # 都不该误判 failed；审批解析后重挂。卡片没发出去（ok=False）
-                # 不暂停：没人会点，等待必须由看门狗兜底。
-                self._pause_run_watchdog(str(session_key).strip())
+            # 对齐 connector（acp-adapter.ts:2924 等待审批时 clearTimeout）：
+            # 卡片已送达、开始等用户操作，暂停空闲看门狗——用户多久才点
+            # 都不该误判 failed；审批解析后重挂。
+            self._pause_run_watchdog(str(session_key).strip())
             return SendResult(
-                success=bool(receipt.get("ok")),
+                success=True,
                 message_id=receipt.get("message_id"),
                 raw_response=receipt,
                 retryable=False,

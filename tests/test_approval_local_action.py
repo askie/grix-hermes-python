@@ -139,6 +139,10 @@ def test_send_exec_approval_pauses_watchdog_when_card_delivered():
 
     assert result.success
     adapter._event_queue.pause_run_timeout.assert_called_once_with("evt-1")
+    with _packet_ctx(adapter):
+        states = adapter._active_state().approval_state
+        assert len(states) == 1
+        assert next(iter(states.values()))["session_key"] == "sess-1"
 
 
 def test_send_exec_approval_keeps_watchdog_when_card_not_delivered():
@@ -164,6 +168,10 @@ def test_send_exec_approval_keeps_watchdog_when_card_not_delivered():
 
     assert not result.success
     adapter._event_queue.pause_run_timeout.assert_not_called()
+    # 卡片未送达不得入 approval_state：残账会抑制审批解析处的看门狗
+    # 恢复门（any() 按 session_key 命中永远解析不了的残账而跳过重挂）。
+    with _packet_ctx(adapter):
+        assert not adapter._active_state().approval_state
 
 
 def test_handle_local_action_fails_when_approval_mapping_missing():
