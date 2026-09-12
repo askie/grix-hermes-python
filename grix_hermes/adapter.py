@@ -2439,6 +2439,12 @@ class GrixAdapter(BasePlatformAdapter):
                 "chat_id": str(chat_id).strip(),
                 "thread_id": thread_id,
             }
+            if bool(receipt.get("ok")):
+                # 对齐 connector（acp-adapter.ts:2924 等待审批时 clearTimeout）：
+                # 卡片已送达、开始等用户操作，暂停空闲看门狗——用户多久才点
+                # 都不该误判 failed；审批解析后重挂。卡片没发出去（ok=False）
+                # 不暂停：没人会点，等待必须由看门狗兜底。
+                self._pause_run_watchdog(str(session_key).strip())
             return SendResult(
                 success=bool(receipt.get("ok")),
                 message_id=receipt.get("message_id"),
@@ -3909,6 +3915,15 @@ class GrixAdapter(BasePlatformAdapter):
         paused_chat_id = str((approval_state or {}).get("chat_id") or "").strip()
         if paused_chat_id:
             self.resume_typing_for_chat(paused_chat_id)
+
+        # 审批解析、轮次恢复执行：重挂空闲看门狗（对齐 connector 等待结束
+        # 后 resetIdleTimer）。同会话还有其他待审批卡片时保持暂停，等最后
+        # 一个解析后再恢复计时（approval_state 已在上面 pop 掉本次）。
+        if not any(
+            str(entry.get("session_key") or "").strip() == session_key
+            for entry in self._active_state().approval_state.values()
+        ):
+            self._note_run_progress(session_key)
 
         await self._active_client().send_local_action_result(
             action_id=action.action_id,
@@ -7479,6 +7494,26 @@ class GrixAdapter(BasePlatformAdapter):
         state = self._active_state()
         for eid in state.session_running_event_ids.get(key) or []:
             queue.note_progress(eid)
+
+    def _pause_run_watchdog(self, session_key: Optional[str] = None) -> None:
+        """会话进入用户等待态（审批卡待点）时，暂停其 running 事件的空闲看门狗。
+
+        对齐 connector 等待用户审批时 clearTimeout（acp-adapter.ts:2924）：
+        等用户操作不算"卡死"，用户多久才点都不该被判 failed。等待结束由
+        审批解析处（或轮次恢复后的任意输出）经 _note_run_progress 重挂。
+        提问卡等待刻意不走这里（对齐 connector：提问等待保留空闲硬上限
+        兜底，防止回合在无效答案/永不回答时永久悬挂）。
+        测试用 __new__ 构造的裸 adapter 没有 _event_queue，getattr 兜底。
+        """
+        queue = getattr(self, "_event_queue", None)
+        if queue is None:
+            return
+        key = session_key or _CURRENT_REPLY_SESSION_KEY.get()
+        if not key:
+            return
+        state = self._active_state()
+        for eid in state.session_running_event_ids.get(key) or []:
+            queue.pause_run_timeout(eid)
 
     async def _complete_event_if_needed(
         self,

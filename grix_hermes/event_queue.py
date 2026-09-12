@@ -339,6 +339,19 @@ class EventQueue:
             return
         self._arm_run_timeout(item)
 
+    def pause_run_timeout(self, event_id: str) -> None:
+        """暂停运行中事件的空闲看门狗（进入用户等待态，如审批卡待点）。
+
+        对齐 connector 等待用户审批时 clearTimeout（acp-adapter.ts:2924）：
+        等用户操作不是"卡死"，空闲计时不该继续跑。等待结束（审批被解析、
+        轮次恢复输出）由 note_progress 重新武装。事件不在 running 时为
+        空操作。注意提问卡等待刻意不暂停（对齐 connector：防止回合在
+        无效答案/永不回答时永久悬挂，由空闲硬上限兜底收口）。
+        """
+        if event_id not in self._running:
+            return
+        self._cancel_run_timeout(event_id)
+
     # ── 取消 / 移除 / 清空 / 重排 ─────────────────────────────────────
 
     def cancel_queued(self, event_id: str, *, reason: str = "canceled by user") -> bool:
