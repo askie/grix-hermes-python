@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 SUPPORTED_ACTIONS = {
     "send_msg": "Send a message to a session (not for answering the inbound event being handled — use grix_reply or normal reply text for that)",
     "delete_msg": "Delete (unsend/recall) a message",
+    "message_edit": "Edit the content of a message you (this agent) previously sent, in place. Only your own message, and only a plain text/markdown one — card messages are always rejected by the server. Requires the owner to have granted the Edit Own Messages (message.edit) permission scope; if rejected for missing permission, surface the server error as-is — do not retry, do not fall back to send_msg (params: session_id, msg_id, content[max 10000 chars])",
     "contact_search": "Search contacts by keyword or ID",
     "session_search": "Search sessions by keyword",
     "search_favorite_sessions": "List the owner's favorited sessions (optional keyword filter)",
@@ -47,7 +48,7 @@ GRIX_INVOKE_SCHEMA = {
     "description": (
         "Unified Grix API — all operations go through the agent_invoke channel.\n\n"
         "Supported actions:\n"
-        "  Message: send_msg, delete_msg\n"
+        "  Message: send_msg, delete_msg, message_edit\n"
         "  Query: contact_search, session_search, search_favorite_sessions, message_history, message_search\n"
         "  Group: group_create, group_detail_read, group_leave_self, group_member_add, "
         "group_member_remove, group_member_role_update, group_all_members_muted_update, "

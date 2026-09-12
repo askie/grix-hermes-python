@@ -83,6 +83,24 @@ for a in NEW:
     check(f"{a} in SUPPORTED_ACTIONS", a in invoke_tool.SUPPORTED_ACTIONS)
     check(f"{a} in schema enum", a in enum)
 
+# message_edit action: present, described with permission + card-rejection
+# keywords, and forwards session_id/msg_id/content verbatim (params.py names
+# match the server, not the connector's camelCase MCP tool names).
+check("message_edit in SUPPORTED_ACTIONS", "message_edit" in invoke_tool.SUPPORTED_ACTIONS)
+check("message_edit in schema enum", "message_edit" in enum)
+_edit_desc = invoke_tool.SUPPORTED_ACTIONS.get("message_edit", "")
+check("message_edit description mentions permission", "permission" in _edit_desc)
+check("message_edit description mentions card rejection", "card" in _edit_desc)
+check("message_edit description mentions own message only", "own" in _edit_desc.lower())
+
+calls.clear()
+timeouts.clear()
+res = asyncio.run(invoke_tool._grix_invoke_handler(
+    {"action": "message_edit", "params": {"session_id": "s1", "msg_id": "m1", "content": "new"}}))
+check("message_edit forwarded verbatim",
+      calls == [("message_edit", {"session_id": "s1", "msg_id": "m1", "content": "new"})])
+check("message_edit result ok", res.startswith("OK:"))
+
 # handler forwards action+params verbatim
 calls.clear()
 timeouts.clear()
@@ -134,7 +152,8 @@ for args, why in [
 # ── 3. skills ↔ SKILL.md alignment ──────────────────────────────────────────
 print("3. skills + SKILL.md")
 EXPECTED_NEW_SKILLS = ["grix-access-control", "grix-agent-dispatch",
-                       "grix-owner-relay", "grix-chat-state"]
+                       "grix-owner-relay", "grix-chat-state",
+                       "message-edit", "grix-task-flow"]
 skills_root = ROOT / "grix_hermes" / "plugin_skills"
 for s in EXPECTED_NEW_SKILLS:
     check(f"{s} in PLUGIN_SKILLS", s in PLUGIN_SKILLS)
@@ -158,6 +177,7 @@ CONNECTOR_COUNTERPARTS = [
     "grix-access-control", "grix-admin", "grix-agent-dispatch", "grix-group",
     "grix-owner-relay", "grix-query", "grix-chat-state",
     "message-send", "message-unsend", "tailnet-file-share",
+    "message-edit", "grix-task-flow",
 ]
 for name in CONNECTOR_COUNTERPARTS:
     text = (skills_root / name / "SKILL.md").read_text()
@@ -168,10 +188,20 @@ for name in CONNECTOR_COUNTERPARTS:
 CAMEL = ["sessionId", "memberIds", "memberTypes", "memberId", "msgId", "beforeId",
          "quotedMessageId", "threadId", "agentId", "categoryId", "parentId",
          "sortOrder", "isMain", "agentName", "allMembersMuted"]
-for name in ["grix-query", "grix-group", "grix-admin", "message-send", "message-unsend"]:
+for name in ["grix-query", "grix-group", "grix-admin", "message-send", "message-unsend",
+             "message-edit"]:
     text = (skills_root / name / "SKILL.md").read_text()
     leaked = [c for c in CAMEL if c in text]
     check(f"{name} has no camelCase param leakage", not leaked)
+
+# ── 5. grix-task-flow mirrors connector's required sections ────────────────
+print("5. grix-task-flow required sections")
+TASK_FLOW = (skills_root / "grix-task-flow" / "SKILL.md").read_text()
+for phrase in ["When to split", "Recursion safety", "层级", "Watchdog"]:
+    check(f"grix-task-flow mentions {phrase!r}", phrase in TASK_FLOW)
+check("grix-task-flow has trigger", bool(re.search(r"^trigger:\s*\S", TASK_FLOW, re.M)))
+check("grix-task-flow has no camelCase param leakage",
+      not [c for c in CAMEL if c in TASK_FLOW])
 
 print()
 if failures:

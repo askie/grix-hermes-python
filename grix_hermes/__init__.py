@@ -75,6 +75,19 @@ PLUGIN_SKILLS = {
         "description": "Silently recall Grix messages through Hermes.",
         "tools": ["grix_invoke"],
     },
+    "message-edit": {
+        "description": "Edit the content of a message this agent previously sent, in place, through Hermes. Own plain text/markdown messages only; requires the Edit Own Messages permission.",
+        "tools": ["grix_invoke"],
+    },
+    "grix-task-flow": {
+        "description": (
+            "Per-task judgment every agent applies for itself: do a task "
+            "directly or split it into nodes dispatched to other agents, "
+            "tracked by editing one mermaid flowchart message in place. "
+            "Recursive and depth-capped."
+        ),
+        "tools": ["grix_invoke"],
+    },
     "tailnet-file-share": {
         "description": "Share a local file with the user via a tailnet download link.",
         "tools": ["grix_file_link"],
