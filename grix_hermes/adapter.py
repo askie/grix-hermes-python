@@ -2002,6 +2002,9 @@ class GrixAdapter(BasePlatformAdapter):
         # 带引用的消息都会重复误触发。最终应答由 grix_reply 工具走 force_quote=True
         # 显式补引用；reply_to 仍保留用于 busy-ack 跟踪等内部匹配。
         self._remember_failure_hint_from_reply(chat_id, content)
+        # 框架每吐一次内容（流式文本/工具/状态卡片，含后续可能被 drop 的）
+        # 都是真实处理进展：为本会话 running 事件续期空闲看门狗。
+        self._note_run_progress()
         client = await self._get_ready_client(operation="send")
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
@@ -2458,6 +2461,8 @@ class GrixAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
+        # 流式 preview 更新 / 工具进度编辑同样是真实处理进展：续期看门狗。
+        self._note_run_progress()
         # Tool progress edits should become separate card messages.
         # Only intercept edits to messages we previously identified as
         # tool progress (tracked via _tool_progress_msg_ids) to avoid
@@ -3087,6 +3092,9 @@ class GrixAdapter(BasePlatformAdapter):
             for eid in running:
                 if eid not in existing:
                     existing.append(eid)
+            # 新轮次开启本身是真实进展（含 pending 合并/内部续跑触发的
+            # 轮次）：为本轮认领的 running 事件续期空闲看门狗。
+            self._note_run_progress(session_key)
 
         # 对齐 grix-connector 的 selfDrivenSessions：Hermes 的框架轮次可能由
         # 斜杠命令、pending 合并或内部续跑触发，此时显式 EventQueue 未必能
@@ -7451,6 +7459,26 @@ class GrixAdapter(BasePlatformAdapter):
         for eid in moved:
             if eid not in target:
                 target.append(eid)
+
+    def _note_run_progress(self, session_key: Optional[str] = None) -> None:
+        """会话有真实处理进展时，为其名下 running 事件续期空闲看门狗。
+
+        对齐 connector 的 resetIdleTimer：框架每吐一次内容（流式文本、
+        工具/状态卡片）或开一个新轮次，就把对应事件的 run_timeout 重新
+        arm 一次，总耗时再长但持续有进展的合法长任务不会被误杀；只有
+        连续一个超时窗口零进展才判 failed 收口。typing 心跳只是
+        adapter→server 方向的保活，不算 agent 进展，刻意不挂在这里。
+        测试用 __new__ 构造的裸 adapter 没有 _event_queue，getattr 兜底。
+        """
+        queue = getattr(self, "_event_queue", None)
+        if queue is None:
+            return
+        key = session_key or _CURRENT_REPLY_SESSION_KEY.get()
+        if not key:
+            return
+        state = self._active_state()
+        for eid in state.session_running_event_ids.get(key) or []:
+            queue.note_progress(eid)
 
     async def _complete_event_if_needed(
         self,

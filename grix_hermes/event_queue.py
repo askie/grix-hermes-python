@@ -7,8 +7,10 @@
 - 支持精确取消单个排队事件、静默摘除、按会话清空、按会话重排（愿望清单
   语义，绝不报错）、按会话快照；
 - 队列满拒绝新事件（上报 failed），可选排队超时；
-- 运行中事件可挂看门狗超时（run_timeout_ms）：收口钩子链路断裂导致
-  槽位永久泄漏时，到期按 failed 收口并释放槽位；
+- 运行中事件可挂空闲看门狗（run_timeout_ms）：活动驱动、有进展就续期
+  （对齐 connector 的 resetIdleTimer），连续一个超时窗口零进展才按
+  failed 收口并释放槽位——总耗时再长但持续有进展的合法长任务不会被
+  误杀，而收口钩子链路断裂导致槽位永久泄漏时仍能兜底回收；
 - 出队闸门用"暂停原因集合"，多个暂停源可叠加互不踩踏。
 
 队列为纯内存态，进程重启即丢失（与 connector 一致）。本模块不做任何
@@ -81,10 +83,13 @@ class QueueItem:
 class EventQueueConfig:
     max_queued: int = 5
     queue_timeout_ms: int = 0
-    # 运行中事件的看门狗超时（毫秒）：<=0 关闭。此默认值仅供测试/独立
-    # 使用；生产环境由 protocol.resolve_event_queue_settings 显式传入
-    # （默认 30 分钟）。运行中事件的收口完全依赖使用方的完成钩子
-    # （on_processing_complete 等）；钩子链路一旦断裂（消息在框架
+    # 运行中事件的空闲看门狗阈值（毫秒）：<=0 关闭。从「最后一次真实
+    # 进展」（note_progress / 进入 running）起算，有进展即续期，连续
+    # 一个窗口零进展才到期收口——不是从任务开始起算的总时长死线（对齐
+    # connector 的 TURN_INACTIVITY_TIMEOUT_MS 语义）。此默认值仅供
+    # 测试/独立使用；生产环境由 protocol.resolve_event_queue_settings
+    # 显式传入（默认 30 分钟）。运行中事件的收口完全依赖使用方的完成
+    # 钩子（on_processing_complete 等）；钩子链路一旦断裂（消息在框架
     # pending 中丢失、轮次挂死不收口），槽位会永久泄漏，组内后续事件
     # 全部排队直至队满拒绝。看门狗到期按 failed 收口并释放槽位，把
     # 损害限制在超时窗口内。
@@ -322,6 +327,18 @@ class EventQueue:
         self._cancel_run_timeout(event_id)
         self._schedule_drain()
 
+    def note_progress(self, event_id: str) -> None:
+        """运行中事件有真实进展（工具调用、流式输出、新轮次等）时续期看门狗。
+
+        对齐 connector 的 resetIdleTimer：每次真实活动重新 arm 一次定时器，
+        只有连续 run_timeout_ms 零进展才会到期收口。事件不在 running（未
+        投递/已终态）时为空操作。
+        """
+        item = self._running.get(event_id)
+        if item is None:
+            return
+        self._arm_run_timeout(item)
+
     # ── 取消 / 移除 / 清空 / 重排 ─────────────────────────────────────
 
     def cancel_queued(self, event_id: str, *, reason: str = "canceled by user") -> bool:
@@ -481,7 +498,7 @@ class EventQueue:
             handle.cancel()
 
     def _arm_run_timeout(self, item: QueueItem) -> None:
-        """为运行中事件挂看门狗定时器；run_timeout_ms<=0 时为空操作。"""
+        """为运行中事件挂（重挂）空闲看门狗定时器；run_timeout_ms<=0 时为空操作。"""
         if self._config.run_timeout_ms <= 0:
             return
         self._cancel_run_timeout(item.event_id)
@@ -496,18 +513,19 @@ class EventQueue:
         )
 
     def _run_timeout_event(self, event_id: str) -> None:
-        """运行看门狗到期：按 failed 收口并释放槽位，让排队事件得以续投。
+        """空闲看门狗到期：连续一个超时窗口零进展，按 failed 收口并释放槽位。
 
-        到期的 run 可能仍在真的执行（合法长任务）——槽位释放后其迟到
-        的 complete 是幂等空操作；也可能早已挂死（钩子链路断裂），此时
-        这是唯一的槽位回收通道。
+        有真实进展的路径（note_progress）都会重挂定时器，所以到期即意味着
+        整个窗口无任何活动：run 可能已挂死（钩子链路断裂），此时这是唯一的
+        槽位回收通道；也可能仍在零输出地执行（如无输出的长命令）——槽位
+        释放后其迟到的 complete 是幂等空操作。
         """
         self._run_timeout_handles.pop(event_id, None)
         item = self._running.pop(event_id, None)
         if item is None:
             return
         logger.warning(
-            "event queue run timeout, reaping stale running event event_id=%s session_id=%s",
+            "event queue run timeout, reaping idle running event event_id=%s session_id=%s",
             event_id,
             item.session_id,
         )
@@ -515,7 +533,7 @@ class EventQueue:
         self._on_state_change(
             item,
             STATE_FAILED,
-            {"reason": f"run timeout: no completion reported within {minutes} min"},
+            {"reason": f"run timeout: no progress reported within {minutes} min"},
         )
         self._schedule_drain()
 
