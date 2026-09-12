@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SKILLS_ROOT = ROOT / "grix_hermes" / "plugin_skills"
 MESSAGE_EDIT = (SKILLS_ROOT / "message-edit" / "SKILL.md").read_text(encoding="utf-8")
 TASK_FLOW = (SKILLS_ROOT / "grix-task-flow" / "SKILL.md").read_text(encoding="utf-8")
+SCHEDULED_TRIGGER = (SKILLS_ROOT / "grix-scheduled-trigger" / "SKILL.md").read_text(encoding="utf-8")
+GRIX_EGG = (SKILLS_ROOT / "grix-egg" / "SKILL.md").read_text(encoding="utf-8")
 
 
 def test_message_edit_action_registered_with_permission_and_card_limits():
@@ -79,7 +81,45 @@ def test_task_flow_skill_frontmatter_and_required_sections():
         assert camel not in TASK_FLOW
 
 
-def test_task_flow_discloses_missing_hermes_watchdog_primitive():
-    # Hermes has no scheduled-trigger/webhook equivalent yet; the skill must
-    # say so plainly rather than inventing a tool call that doesn't exist.
-    assert "no self-scheduling primitive" in TASK_FLOW or "no such self-scheduling" in TASK_FLOW
+def test_task_flow_arms_watchdog_via_scheduled_trigger():
+    # Hermes now has a scheduled-trigger/webhook equivalent (grix-scheduled-
+    # trigger); the skill must call into it rather than disclosing a gap.
+    assert "grix-scheduled-trigger" in TASK_FLOW
+    assert "no self-scheduling primitive" not in TASK_FLOW
+    assert "no such self-scheduling" not in TASK_FLOW
+
+
+def test_webhook_actions_registered():
+    for action in ("webhook_create", "webhook_list", "webhook_delete"):
+        assert action in invoke_tool.SUPPORTED_ACTIONS
+        enum = invoke_tool.GRIX_INVOKE_SCHEMA["parameters"]["properties"]["action"]["enum"]
+        assert action in enum
+    assert "webhook_create" in invoke_tool.GRIX_INVOKE_SCHEMA["description"]
+
+
+def test_scheduled_trigger_skill_frontmatter_and_platform_coverage():
+    m = re.search(r"^name:\s*(\S+)", SCHEDULED_TRIGGER, re.M)
+    assert m and m.group(1) == "grix-scheduled-trigger"
+    assert re.search(r"^trigger:\s*\S", SCHEDULED_TRIGGER, re.M)
+
+    for action in ("webhook_create", "webhook_list", "webhook_delete"):
+        assert f'action="{action}"' in SCHEDULED_TRIGGER
+
+    # all four platform schedulers must be documented
+    for keyword in ("launchd", "crontab", "systemd", "schtasks"):
+        assert keyword in SCHEDULED_TRIGGER
+
+    assert "grix-scheduled-trigger" in PLUGIN_SKILLS
+    assert PLUGIN_SKILLS["grix-scheduled-trigger"]["tools"] == ["grix_invoke"]
+
+
+def test_grix_egg_skill_covers_marketplace_discovery():
+    # Aligns with the connector's grix-egg default skill (marketplace search)
+    # while keeping the pre-existing local bootstrap tool documentation.
+    assert "egg_search" in GRIX_EGG
+    assert "egg_get" in GRIX_EGG
+    assert "can_create_agent" in GRIX_EGG
+    assert "existing_agent_client_types" in GRIX_EGG
+    # local bootstrap documentation must survive the port unchanged
+    assert "grix_egg(action=" in GRIX_EGG
+    assert "dry_run" in GRIX_EGG

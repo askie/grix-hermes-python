@@ -31,21 +31,12 @@ inventorying agents). Read those first if you have not used them before —
 this skill only adds the orchestration layer on top; it does not repeat
 their contracts.
 
-Two pieces the connector-side equivalent of this skill relies on have no
-Hermes counterpart yet, so this version degrades them explicitly rather than
-inventing a tool that does not exist here:
-
-- **Egg marketplace discovery.** Hermes's own `grix-egg` skill is a
-  different thing (it bootstraps/binds *this* Hermes profile to Grix, not a
-  marketplace browser) — do not confuse the two. The marketplace itself is
-  still reachable directly through `grix_invoke`'s `egg_search` / `egg_get`
-  actions (see [Step 2](#step-2--fill-a-capability-gap-缺人就配人)); there is
-  just no dedicated skill wrapping them on this side yet.
-- **Scheduled watchdog wake-ups.** The connector can arm a webhook + local
-  timer to wake itself later; Hermes has no such self-scheduling primitive
-  today. [Step 8](#step-8--watchdog-for-dispatched-but-silent-nodes) says
-  plainly what this means in practice — treat it as a known gap, not
-  something to fake with an invented tool call.
+Two related skills this skill leans on: `grix-egg`'s Part 1 (marketplace
+discovery via `grix_invoke`'s `egg_search` / `egg_get` actions — see
+[Step 2](#step-2--fill-a-capability-gap-缺人就配人)) and
+`grix-scheduled-trigger` (arming a webhook + local scheduler job to wake this
+session later — see [Step 8](#step-8--watchdog-for-dispatched-but-silent-nodes)).
+Read those first if you have not used them; this skill only calls into them.
 
 ## When to split vs. do it directly
 
@@ -113,8 +104,7 @@ Never invent an agent name or ID that is not in this list.
 If no existing agent fits a node, do not leave the node stuck or silently
 drop it:
 
-1. Search the egg marketplace directly (no dedicated skill wraps this on the
-   Hermes side yet — see the note at the top of this skill):
+1. Search the egg marketplace via `grix-egg`'s Part 1 (Discovery):
 
    ```text
    grix_invoke(action="egg_search", params={"keyword": "<distilled from the node's task>"})
@@ -307,26 +297,27 @@ When you edit for a plan change (not just a status update):
 
 ## Step 8 — Watchdog for dispatched-but-silent nodes
 
-**This is the step most often forgotten, and the one where Hermes currently
-has a real gap versus the connector.** You only run while handling a chat
+**This is the step most often forgotten.** You only run while handling a chat
 turn. Once you dispatch nodes and end your turn, you are frozen — if a
 dispatched agent never calls back (crashes, gets stuck, or its `/stop` was
-sent by someone else), you never wake up again on your own.
+sent by someone else), you never wake up again on your own unless something
+external re-invokes this session.
 
-The connector's equivalent skill arms a webhook + local scheduler timer to
-force a wake-up after a delay. **Hermes has no such self-scheduling
-primitive today** — there is no `grix_invoke` action or local tool that
-re-invokes this agent later. Until that gap is closed, treat the watchdog as
-opportunistic rather than guaranteed:
+Arm a real wake-up with `grix-scheduled-trigger` instead of relying only on
+being woken incidentally: after dispatching, reuse or create this session's
+standing webhook and register a one-shot (or short-interval, for a
+long-running flow) local scheduler job that POSTs a check-in message back
+into this session after a delay proportional to how long the flow should
+reasonably take. Tear the job down in Step 9 once the flow closes out.
 
-1. Tell the owner explicitly, in the plan summary (Step 3) and again in any
-   status update, that this flow has **no automatic timeout check** on this
-   host — a stuck node stays `running` in the diagram until something wakes
-   this session again (the owner asking "怎么样了", a later unrelated message
-   in this session, or the node's own eventual callback).
-2. Whenever this session *is* woken for any reason while a flow is still
-   outstanding, opportunistically call `chat_state_query` for each
-   still-outstanding dispatched node's session before doing anything else:
+1. Tell the owner, in the plan summary (Step 3) and again in any status
+   update, when the watchdog will next check in (or that none was armed, if
+   `grix-scheduled-trigger`'s permission is not granted for this agent — do
+   not silently skip it, say so and fall back to opportunistic checking).
+2. Whenever this session is woken — by the watchdog firing, the owner asking
+   "怎么样了", or a node's own callback — while a flow is still outstanding,
+   call `chat_state_query` for each still-outstanding dispatched node's
+   session before doing anything else:
 
    ```text
    grix_invoke(action="chat_state_query", params={"session_id": "<SESSION>"})
@@ -335,13 +326,12 @@ opportunistic rather than guaranteed:
    `completed`/`failed` with no receipt ever received means the dispatched
    agent finished but did not call back; treat its `final_result` as the
    outcome and edit the diagram accordingly, same as Step 6. `running` means
-   still genuinely in progress — say so and continue waiting. `idle` with no
-   result for a long time is a stuck node: report it to the user in the
-   diagram (a distinct note, e.g. "无响应，可能需要人工检查") rather than
-   guessing an outcome.
-3. Do not fake this step by inventing a scheduling tool call that does not
-   exist in this plugin's action table — a missing watchdog is a known,
-   disclosed limitation, not something to paper over.
+   still genuinely in progress — say so, re-arm the next watchdog check-in if
+   one was armed, and continue waiting. `idle` with no result for a long time
+   is a stuck node: report it to the user in the diagram (a distinct note,
+   e.g. "无响应，可能需要人工检查") rather than guessing an outcome.
+3. Do not fake this step by inventing a scheduling mechanism outside
+   `grix-scheduled-trigger`'s contract.
 
 ## Step 9 — Close out: final summary, and reporting up
 

@@ -41,6 +41,9 @@ SUPPORTED_ACTIONS = {
     "egg_get": "Get egg details by ID (params: id[required], locale, version)",
     "skill_set": "Create/update/delete an owner's custom skill in the multi-machine-synced skill library (params: name[required], content[required]; empty content deletes by name)",
     "skill_get": "Read an owner's custom skill by name, or list the skill library when no name given (params: name[optional])",
+    "webhook_create": 'Create a webhook endpoint for a session this agent belongs to. POSTing {"content":"..."} to the returned URL sends that text into the session as the owner and wakes the agent — use it for human/timer-driven scheduled or recurring triggers (cron, schtasks, launchd). Not for agent-to-agent dispatch callbacks (params: session_id[required], expires_at[optional RFC3339])',
+    "webhook_list": "List the active webhook endpoints (with full URLs) of a session this agent belongs to. Call this BEFORE webhook_create and reuse an existing endpoint instead of creating another one (params: session_id[required])",
+    "webhook_delete": "Delete a webhook endpoint by id (from webhook_list / webhook_create). Only endpoints of sessions this agent belongs to. Use when tearing down scheduled triggers or removing duplicate endpoints (params: id[required])",
 }
 
 GRIX_INVOKE_SCHEMA = {
@@ -59,7 +62,8 @@ GRIX_INVOKE_SCHEMA = {
         "  Owner relay: call_owner, session_send\n"
         "  Chat state: chat_state_query, chat_state_update\n"
         "  Egg marketplace: egg_search, egg_get\n"
-        "  Custom skills (multi-machine synced): skill_set, skill_get\n\n"
+        "  Custom skills (multi-machine synced): skill_set, skill_get\n"
+        "  Webhook (scheduled/recurring triggers): webhook_create, webhook_list, webhook_delete\n\n"
         "Do NOT use send_msg to answer the inbound event you are currently handling — "
         "answer with grix_reply (or normal reply text) instead, otherwise the user "
         "receives duplicate messages."
