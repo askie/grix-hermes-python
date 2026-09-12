@@ -224,9 +224,13 @@ def resolve_event_queue_settings(extra: Dict[str, Any]) -> Dict[str, Any]:
     与 connector 的 concurrency 描述符字段一一对应。每会话串行执行
     （max_concurrent=1），排队深度与超时可通过 ``event_queue`` 配置段覆盖。
 
-    ``run_timeout_ms`` 是本地运行看门狗（默认 30 分钟，0 关闭）：运行中
-    事件的收口钩子链路断裂时槽位会永久泄漏、队满后新事件全被拒，看门狗
-    到期按 failed 收口释放槽位。它只属于本地队列实现，不进 auth 握手的
+    ``run_timeout_ms`` 是本地运行空闲看门狗阈值（默认 30 分钟，0 关闭）：
+    活动驱动、有真实进展（note_progress）即续期，连续一个窗口零进展才
+    到期按 failed 收口释放槽位——不是从任务开始起算的总时长死线，总
+    耗时再长但持续推进的合法长任务不会被误杀（对齐 connector 的
+    resetIdleTimer / TURN_INACTIVITY_TIMEOUT_MS 语义）。运行中事件的
+    收口钩子链路断裂时槽位会永久泄漏、队满后新事件全被拒，看门狗是
+    唯一的兜底回收通道。它只属于本地队列实现，不进 auth 握手的
     concurrency 描述符（握手字段保持与 connector 一一对应）。
     """
     raw = extra.get("event_queue")

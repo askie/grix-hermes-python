@@ -271,6 +271,48 @@ def test_run_timeout_fails_running_event_and_drains_queue():
     assert rec.delivered == ["e1", "e2"]
 
 
+def test_run_timeout_rearmed_by_progress_survives_long_run():
+    """空闲看门狗：总耗时超过超时窗口但期间持续有进展，不得判 failed。
+
+    复现 2026-09-12 误杀事故：固定死线下 30 分钟的多步发布任务被强制
+    收口；改成活动驱动续期后，只要持续有进展，跑多久都不会被杀。
+    """
+    async def _run():
+        queue, rec = _make_queue(run_timeout_ms=200)
+        queue.submit(_item("e1"))  # running
+        queue.note_progress("ghost")  # 未投递/不存在的事件：空操作，不得炸
+        # 每 50ms 上报一次真实进展，共 8 次 → 总耗时 ~400ms = 2 个超时窗口
+        for _ in range(8):
+            await asyncio.sleep(0.05)
+            queue.note_progress("e1")
+        # 距最后一次进展 ~50ms，远小于 200ms 窗口
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    assert queue.is_running("e1")
+    assert not any(st == STATE_FAILED for _, st, _ in rec.states)
+
+
+def test_run_timeout_fires_after_progress_stops():
+    """空闲看门狗：进展停止后连续一个窗口零进展，仍判 failed 收口。"""
+    async def _run():
+        queue, rec = _make_queue(run_timeout_ms=200)
+        queue.submit(_item("e1"))  # running
+        # 先有几次进展（续期生效），随后彻底停摆
+        for _ in range(3):
+            await asyncio.sleep(0.05)
+            queue.note_progress("e1")
+        await asyncio.sleep(0.3)  # 零进展超过一个完整窗口
+        return queue, rec
+
+    queue, rec = asyncio.run(_run())
+    assert any(
+        eid == "e1" and st == STATE_FAILED and str(meta.get("reason", "")).startswith("run timeout")
+        for eid, st, meta in rec.states
+    )
+    assert not queue.is_running("e1")
+
+
 def test_run_timeout_cancelled_by_complete():
     async def _run():
         queue, rec = _make_queue(run_timeout_ms=30)
