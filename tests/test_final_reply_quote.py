@@ -194,6 +194,23 @@ def test_send_suppresses_quote_by_default(monkeypatch):
     assert client.sent[0]["reply_to_message_id"] is None
 
 
+def test_send_swallows_gateway_busy_ack(monkeypatch):
+    """busy-ack / queue / steer 运行态提示不得外发到 Grix 会话。"""
+    monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+
+    text = "⚡ Interrupting current task. I'll respond to your message shortly."
+    result = _with_ctx(client, inst.send("chat-1", text, reply_to="trigger-new"))
+    assert result.success is True
+    assert client.sent == []
+
+    result = _with_ctx(client, inst.send("chat-1", "here is the real answer"))
+    assert result.success is True
+    assert len(client.sent) == 1
+    assert client.sent[0]["content"] == "here is the real answer"
+
+
 def test_send_force_quote_first_chunk_only(monkeypatch):
     monkeypatch.setattr(adapter_mod, "resolve_grix_target", _resolve_target)
     client = FakeTransportClient()

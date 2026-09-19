@@ -208,6 +208,22 @@ def test_failure_outcome_reports_failed(monkeypatch):
     ]
 
 
+def test_failure_with_queued_followup_reports_canceled(monkeypatch):
+    """被新消息打断时 pending 仍在队列：空回复 FAILURE 应按 canceled 收口，不报 failed。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", _session_key_by_chat)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _register(inst, "sk:chat-1", "ev-1")
+    # base 在 on_processing_complete 之后才 drain；钩子触发时 follow-up 仍在 pending。
+    inst._pending_messages["sk:chat-1"] = SimpleNamespace(message_id="m-followup")
+
+    _run_turn(inst, client, _msg_event(), outcome=object())
+
+    assert client.completed == [
+        {"event_id": "ev-1", "status": "canceled", "message": "interrupted by new message"}
+    ]
+
+
 def test_failure_outcome_carries_gateway_error_detail(monkeypatch):
     """网关异常兜底文案是异常详情唯一能到适配器的通道，failed 结果要带上它。"""
     monkeypatch.setattr(adapter_mod, "build_session_key", _session_key_by_chat)
@@ -247,6 +263,63 @@ def test_cancelled_outcome_reports_canceled(monkeypatch):
     assert client.completed == [
         {"event_id": "ev-1", "status": "canceled", "message": "stopped by user"}
     ]
+
+
+def test_user_stopped_forces_canceled_over_failure(monkeypatch):
+    """用户主动停止后，即便 complete 钩子拿到 FAILURE，也必须 canceled，不报 failed。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", _session_key_by_chat)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _register(inst, "sk:chat-1", "ev-1")
+    inst._owner_states[""].user_stopped_session_keys.add("sk:chat-1")
+
+    _run_turn(inst, client, _msg_event(), outcome=object())
+
+    assert client.completed == [
+        {"event_id": "ev-1", "status": "canceled", "message": "stopped by user"}
+    ]
+    assert "sk:chat-1" not in inst._owner_states[""].user_stopped_session_keys
+
+
+def test_force_stop_completes_running_as_canceled(monkeypatch):
+    """_force_stop_session 立即以 canceled 收口 running 事件，不等 complete 钩子。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", _session_key_by_chat)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    sk = "sk:chat-1"
+    inst._active_sessions[sk] = asyncio.Event()
+    inst._owner_states[""].session_running_event_ids[sk] = ["ev-run"]
+    inst._owner_states[""].session_next_run_event_ids[sk] = ["ev-queued"]
+
+    async def _noop_interrupt(*a, **kw):
+        return None
+
+    async def _cancel(session_key, **kw):
+        inst._active_sessions.pop(session_key, None)
+
+    async def _stop_typing(*a, **kw):
+        return None
+
+    inst._hard_interrupt_running_agent = _noop_interrupt
+    inst.cancel_session_processing = _cancel
+    inst.stop_typing = _stop_typing
+
+    source = SimpleNamespace(chat_id="chat-1", thread_id=None)
+    _with_ctx(
+        client,
+        inst._force_stop_session(source, sk, notify=False, cleanup_background=False),
+    )
+
+    by_id = {c["event_id"]: c for c in client.completed}
+    assert by_id["ev-run"] == {
+        "event_id": "ev-run", "status": "canceled", "message": "stopped by user",
+    }
+    assert by_id["ev-queued"] == {
+        "event_id": "ev-queued", "status": "canceled", "message": "stopped by user",
+    }
+    assert sk in inst._owner_states[""].user_stopped_session_keys
+    assert sk not in inst._owner_states[""].session_running_event_ids
+    assert sk not in inst._owner_states[""].session_next_run_event_ids
 
 
 # ── 2. 排队消费时归属移交（pending pop）────────────────────────────────────

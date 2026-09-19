@@ -3,6 +3,7 @@
 from grix_hermes.agent_status_cards import (
     build_agent_status_channel_data,
     detect_agent_status,
+    detect_gateway_runtime_notice,
 )
 from grix_hermes.tool_progress_cards import detect_tool_progress
 
@@ -48,6 +49,33 @@ def test_leading_and_trailing_whitespace_is_stripped():
     assert detect_agent_status("  \n⏳ Still working... (1 min elapsed)\n  ") == (
         "⏳ Still working... (1 min elapsed)"
     )
+
+
+# --- busy-ack / queue / steer / drain runtime notices (must be swallowed) ---
+
+def test_runtime_notice_interrupting():
+    text = "⚡ Interrupting current task. I'll respond to your message shortly."
+    assert detect_gateway_runtime_notice(text) == text
+    # Progress-style "Still working" stays a thinking-card candidate, not a swallow.
+    assert detect_gateway_runtime_notice("⏳ Still working... (3 min elapsed)") is None
+
+
+def test_runtime_notice_family():
+    for text in (
+        "⚡ Interrupting current task (2 min elapsed). I'll respond to your message shortly.",
+        "⏳ Queued for the next turn. I'll respond once the current task finishes.",
+        "⏩ Steered into current run. Your message arrives after the next tool call.",
+        "↪ Redirected current run. I'll adjust using your correction.",
+        "⏳ Gateway is restarting — queued for the next turn after it comes back.",
+        "⏳ Subagent working — `/stop` cancels.",
+        "⏳ Compressing context — `/stop` cancels.",
+    ):
+        assert detect_gateway_runtime_notice(text) is not None, text
+
+
+def test_stop_confirmation_is_not_runtime_notice():
+    # /stop 确认文案也以 ⚡ 开头，但不能吞掉。
+    assert detect_gateway_runtime_notice("⚡ Stopped. You can continue this session.") is None
 
 
 # --- detection: things that must NOT be classified as status ---------------
