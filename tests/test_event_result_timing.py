@@ -208,6 +208,22 @@ def test_failure_outcome_reports_failed(monkeypatch):
     ]
 
 
+def test_failure_with_queued_followup_reports_canceled(monkeypatch):
+    """被新消息打断时 pending 仍在队列：空回复 FAILURE 应按 canceled 收口，不报 failed。"""
+    monkeypatch.setattr(adapter_mod, "build_session_key", _session_key_by_chat)
+    client = FakeTransportClient()
+    inst = _make_adapter(client)
+    _register(inst, "sk:chat-1", "ev-1")
+    # base 在 on_processing_complete 之后才 drain；钩子触发时 follow-up 仍在 pending。
+    inst._pending_messages["sk:chat-1"] = SimpleNamespace(message_id="m-followup")
+
+    _run_turn(inst, client, _msg_event(), outcome=object())
+
+    assert client.completed == [
+        {"event_id": "ev-1", "status": "canceled", "message": "interrupted by new message"}
+    ]
+
+
 def test_failure_outcome_carries_gateway_error_detail(monkeypatch):
     """网关异常兜底文案是异常详情唯一能到适配器的通道，failed 结果要带上它。"""
     monkeypatch.setattr(adapter_mod, "build_session_key", _session_key_by_chat)

@@ -7,13 +7,21 @@ message bubbles is noisy.  This module detects those status lines so the adapter
 can tag them with ``channel_data.grix.thinking`` and let the backend/client
 render them as a lightweight thinking card instead of a formal bubble.
 
-Source of the status strings (gateway/run.py):
+Busy-ack / queue / steer / drain runtime notices (⚡ Interrupting, ⏳ Queued,
+⏩ Steered, ↪ Redirected, ⏳ Gateway …) are a stricter subset: they must never
+enter a Grix chat at all (especially under delegate, where they would appear as
+the owner speaking).  Use :func:`detect_gateway_runtime_notice` to swallow them.
+
+Source of the status strings (gateway/run.py / run_busy.py):
   - "⏳ Still working... (N min elapsed — iteration X/Y, running: tool)"
   - "⏳ Working — N min — iteration X/Y, tool"
   - "⚠️ No activity for N min. ..."
   - "⏳ Queued for the next turn ..."
   - "⏳ Gateway is running ..." / "⏳ Gateway running — queued ..."
   - "⏳ Agent is running — `/cmd` can't run ..."
+  - "⚡ Interrupting current task ..."
+  - "⏩ Steered into current run ..."
+  - "↪ Redirected current run ..."
 """
 
 from __future__ import annotations
@@ -33,6 +41,40 @@ _STATUS_PATTERNS = (
     re.compile(r"^⏳\s+Gateway\b"),
     re.compile(r"^⏳\s+Agent is running\b"),
 )
+
+# Busy-path runtime notices from gateway/run_busy.py.  These are ack/queue/
+# steer/drain chatter, not chat content — swallow at the adapter boundary.
+_RUNTIME_NOTICE_PATTERNS = (
+    re.compile(r"^⚡\s+Interrupting current task\b"),
+    re.compile(r"^⏩\s+Steered into current run\b"),
+    re.compile(r"^↪\s+Redirected current run\b"),
+    re.compile(r"^⏳\s+Queued for the next turn\b"),
+    re.compile(r"^⏳\s+Subagent working\b"),
+    re.compile(r"^⏳\s+Compressing context\b"),
+    re.compile(r"^⏳\s+Gateway\b"),
+)
+
+
+def _first_line(content: str) -> str:
+    stripped = (content or "").strip()
+    if not stripped:
+        return ""
+    return stripped.split("\n", 1)[0].strip()
+
+
+def detect_gateway_runtime_notice(content: str) -> Optional[str]:
+    """Return stripped text when *content* is a busy-ack / queue / steer / drain notice.
+
+    Returns ``None`` for normal messages (including "Still working" progress
+    lines, which remain thinking-card candidates via :func:`detect_agent_status`).
+    """
+    first_line = _first_line(content)
+    if not first_line:
+        return None
+    for pattern in _RUNTIME_NOTICE_PATTERNS:
+        if pattern.match(first_line):
+            return (content or "").strip()
+    return None
 
 
 def detect_agent_status(content: str) -> Optional[str]:

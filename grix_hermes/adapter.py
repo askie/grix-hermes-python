@@ -56,6 +56,7 @@ from .provider_quota_service import shared_provider_quota_service
 from .agent_status_cards import (
     build_agent_status_channel_data,
     detect_agent_status,
+    detect_gateway_runtime_notice,
 )
 from .contract import (
     AUTH_CODE_AGENT_DELETED,
@@ -2005,6 +2006,21 @@ class GrixAdapter(BasePlatformAdapter):
         # 框架每吐一次内容（流式文本/工具/状态卡片，含后续可能被 drop 的）
         # 都是真实处理进展：为本会话 running 事件续期空闲看门狗。
         self._note_run_progress()
+
+        # Hermes gateway busy-ack / queue / steer / drain 运行态提示（⚡ Interrupting、
+        # ⏳ Queued、⏩ Steered、↪ Redirected、⏳ Gateway …）不是聊天内容。尤其托管时
+        # 会以主人身份冒出去；适配器侧一律吞掉，只打日志。
+        runtime_notice = detect_gateway_runtime_notice(content)
+        if runtime_notice is not None:
+            logger.info(
+                "[%s] Swallowing gateway runtime notice to %s (%d chars): %s",
+                self.name,
+                chat_id,
+                len(runtime_notice),
+                runtime_notice.split("\n", 1)[0][:120],
+            )
+            return SendResult(success=True, retryable=False)
+
         client = await self._get_ready_client(operation="send")
         if not client:
             return SendResult(success=False, error="GRIX transport is not connected", retryable=True)
@@ -3042,6 +3058,26 @@ class GrixAdapter(BasePlatformAdapter):
             status, message = STATUS_CANCELED, "stopped by user"
         else:
             status, message = STATUS_FAILED, None
+
+        # 被新消息打断/合并时：旧轮常以 FAILURE + 空回复收口（gateway 把
+        # interrupt 后的空结果标成 FAILURE，或 delivery 半途失败）。此时
+        # pending / debounce 仍在队列里（base 先调本钩子再 drain），不应
+        # 再报「Hermes finished without producing a reply」——按正常取消收口，
+        # 让排队的下一条接管。真异常（有 failure hint）仍走 failed。
+        if (
+            status == STATUS_FAILED
+            and event_ids
+            and self._session_has_queued_work(session_key)
+            and not state.last_failure_hints.get(str(event.source.chat_id))
+        ):
+            logger.info(
+                "[%s] Superseded turn for %s has follow-up queued; "
+                "reporting canceled instead of empty-reply failed",
+                self.name,
+                session_key,
+            )
+            status, message = STATUS_CANCELED, "interrupted by new message"
+
         if status == STATUS_FAILED and event_ids:
             # 网关的异常兜底文案（唯一带异常详情的通道）是在本钩子返回之后才发出的，
             # 此刻多半还没到；把 failed 收口推后一小段时间等它，等不到再用默认文案。
