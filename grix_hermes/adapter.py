@@ -293,6 +293,10 @@ class _OwnerState:
     # 每个 chat 最近一次失败线索：网关兜底发给用户的错误文案 / 出站发送失败原因，
     # 供 on_processing_complete 上报 event_result 时带上具体原因，而不是固定文案。
     last_failure_hints: Dict[str, str] = field(default_factory=dict)
+    # 用户主动停止（/stop、event_stop、event_cancel、工具栏停止）标记的 session_key。
+    # hard-interrupt 可能让轮次以 FAILURE 先收尾，complete 钩子必须据此强制
+    # canceled，避免「stopped by user」落成「Hermes finished without producing a reply」。
+    user_stopped_session_keys: Set[str] = field(default_factory=set)
     # Hermes gateway 的 stream consumer 在部分代码路径（proxy 路径）中即使
     # SUPPORTS_MESSAGE_EDITING=False 也不会被跳过；它会先 send 一条 preview
     # 消息再反复 edit_message 更新。Grix 协议没有客户端编辑能力，preview 会
@@ -2619,6 +2623,9 @@ class GrixAdapter(BasePlatformAdapter):
                 await asyncio.sleep(0.05)
                 hint = state.last_failure_hints.pop(chat_key, "")
             for eid in event_ids:
+                # 用户停止可能已先行以 canceled 收口；幂等跳过，禁止覆盖成 failed。
+                if eid in state.completed_event_ids:
+                    continue
                 await self._complete_event_if_needed(
                     eid, status=STATUS_FAILED, message=hint or self._FAILURE_DEFAULT_MESSAGE,
                 )
@@ -3058,6 +3065,18 @@ class GrixAdapter(BasePlatformAdapter):
             status, message = STATUS_CANCELED, "stopped by user"
         else:
             status, message = STATUS_FAILED, None
+
+        # 用户主动停止优先：hard-interrupt 可能让轮次以 FAILURE 收尾，
+        # 必须以 canceled 覆盖，避免失败提示冒出来。
+        if session_key in state.user_stopped_session_keys:
+            state.user_stopped_session_keys.discard(session_key)
+            status, message = STATUS_CANCELED, "stopped by user"
+            logger.info(
+                "[%s] User-stopped session %s: forcing canceled over outcome=%r",
+                self.name,
+                session_key,
+                outcome,
+            )
 
         # 被新消息打断/合并时：旧轮常以 FAILURE + 空回复收口（gateway 把
         # interrupt 后的空结果标成 FAILURE，或 delivery 半途失败）。此时
@@ -7095,6 +7114,11 @@ class GrixAdapter(BasePlatformAdapter):
                     return cleaned
             return False
 
+        state = self._active_state()
+        # 先打标记：cancel 触发的 complete 钩子可能以 FAILURE 收尾（hard-interrupt
+        # 竞态），必须在钩子里看到此标记并强制 canceled。
+        state.user_stopped_session_keys.add(session_key)
+
         # 先硬中断 runner 里正在跑的 agent 线程：cancel_session_processing 只取消
         # asyncio 包装任务，agent 循环跑在线程里，不打中断标志会继续调用模型和
         # 起后台进程（停止后仍在跑发布脚本的根因）。
@@ -7106,13 +7130,14 @@ class GrixAdapter(BasePlatformAdapter):
             discard_pending=True,
         )
 
-        # 停止即终态：被丢弃的排队事件（discard_pending 消费 pending 时移交到
-        # next_run）与残留未归属事件统一以 canceled 收口，避免后端悬挂。
-        # 运行中轮次的事件由其 complete 钩子（CANCELLED 结局）自行收口；
-        # 仍在派发途中（inflight）的事件不动，交给它自己的派发链路。
-        state = self._active_state()
+        # 停止即终态：运行中 / 排队 / 未归属事件一律以 canceled 收口，避免
+        # complete 钩子晚到时再报 failed。派发途中（inflight）的事件不动。
         inflight = self._inflight_dispatch_event_ids.get(session_key) or ()
-        for registry in (state.session_next_run_event_ids, state.session_open_event_ids):
+        for registry in (
+            state.session_running_event_ids,
+            state.session_next_run_event_ids,
+            state.session_open_event_ids,
+        ):
             ids = registry.pop(session_key, [])
             kept = [eid for eid in ids if eid in inflight]
             if kept:
