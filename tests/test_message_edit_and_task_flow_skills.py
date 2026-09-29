@@ -92,6 +92,15 @@ def test_task_flow_scope_is_multi_agent_only():
     assert "multi-agent" in PLUGIN_SKILLS["grix-task-flow"]["description"]
 
 
+def test_task_flow_markdown_drops_every_task_scope():
+    md_files = sorted((SKILLS_ROOT / "grix-task-flow").rglob("*.md"))
+    assert md_files
+    for path in md_files:
+        text = " ".join(path.read_text(encoding="utf-8").split()).lower()
+        assert "applies it to every task" not in text, path
+        assert "every task it receives" not in text, path
+
+
 def test_task_flow_arms_watchdog_via_scheduled_trigger():
     # Hermes now has a scheduled-trigger/webhook equivalent (grix-scheduled-
     # trigger); the skill must call into it rather than disclosing a gap.

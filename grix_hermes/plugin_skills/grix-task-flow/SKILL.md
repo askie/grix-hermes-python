@@ -44,8 +44,8 @@ Read those first if you have not used them; this skill only calls into them.
 
 ## When to split vs. do it directly
 
-Before acting on any task — your own first turn on the user's ask, or a node
-task someone else dispatched to you — judge it against these signals. None of
+When a task may need other agents — your own first turn on the user's ask, or
+a node task someone else dispatched to you — judge it against these signals. None of
 them require the sender to have said anything like "coordinate this":
 
 Split it when one or more of these is true:
@@ -394,9 +394,10 @@ your dispatcher never reads your flowchart message directly.
 - There is no automatic watchdog wake-up on Hermes today — say so plainly to
   the owner instead of implying one exists; recheck state opportunistically
   whenever this session is next woken.
-- Splitting is a per-task judgment call every agent makes for itself, not
-  something only a "coordinator" agent does or something a specific phrase
-  triggers.
+- Whether to split is a judgment each agent makes for its own piece of work
+  (including a node dispatched to it), not something only a "coordinator"
+  agent does or something a specific phrase triggers. Ordinary Q&A and
+  single-file, single-step, or single-session work is done directly.
 - Recursion is capped at layer 3: an agent that receives a task stating
   `层级：N` with `N ≥ 3` must do the work directly, never split further.
 - Never dispatch a sub-node back to your own dispatcher, and never relay a
