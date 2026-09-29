@@ -81,6 +81,17 @@ def test_task_flow_skill_frontmatter_and_required_sections():
         assert camel not in TASK_FLOW
 
 
+def test_task_flow_scope_is_multi_agent_only():
+    # Mirrors the connector's narrowed scope: only genuine multi-agent work
+    # triggers the skill; ordinary Q&A and single-session tasks do not.
+    frontmatter = TASK_FLOW.split("---", 2)[1]
+    assert "genuinely multi-agent" in frontmatter
+    assert "Do not trigger for ordinary Q&A" in frontmatter
+    assert "every agent applies to every task" not in TASK_FLOW
+    assert "Every agent applies it to every task" not in TASK_FLOW
+    assert "multi-agent" in PLUGIN_SKILLS["grix-task-flow"]["description"]
+
+
 def test_task_flow_arms_watchdog_via_scheduled_trigger():
     # Hermes now has a scheduled-trigger/webhook equivalent (grix-scheduled-
     # trigger); the skill must call into it rather than disclosing a gap.

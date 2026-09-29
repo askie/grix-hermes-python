@@ -1,14 +1,18 @@
 ---
 name: grix-task-flow
-description: A general skill every agent applies to every task it receives (not a coordinator-only skill) — first judge for yourself whether to do the task directly or split it into nodes; if you split, inventory the owner's agents via grix_invoke, fill any capability gap via grix-admin (or the egg_search/egg_get actions), plan and dispatch nodes with grix_invoke's dispatch_agent action, and track everything by editing one mermaid flowchart message in place (message-edit skill, grix_invoke's message_edit action) as each [dispatch-result] receipt comes in. It is recursive — a dispatched agent applies the same judgment to its own node and reports its own sub-flow's outcome back up via report_dispatch_result.
-trigger: 在开始任何有一定规模的任务之前——无论这个任务是 owner/用户直接给的，还是另一个 Agent 派发给你的节点任务——先自行判断是直接做还是拆成子节点。不由某句特定措辞触发（比如"你来统筹"）；每次都基于任务本身的形状做判断
+description: "Coordinate genuinely multi-agent work using grix_invoke's dispatch_agent action and track it by editing one flowchart via grix_invoke's message_edit action. Skip ordinary Q&A and single-file, single-step, or single-session tasks; layer 3+ works directly."
+trigger: "When the work needs multiple agents, crosses machines or directories, has a capability gap, or contains parallel nodes. Do not trigger for ordinary Q&A or single-file, single-step, or single-session tasks."
 ---
 
 # Grix Task Flow
 
+Use this skill only when work genuinely needs coordination across multiple
+agents. Ordinary Q&A, single-file, single-step, and single-session tasks do
+not trigger it.
+
 **This is not a "team lead" skill reserved for whichever agent happens to
-receive the user's request.** Every agent applies it to every task, and the
-same judgment recurses: the top-level agent may decide to split the user's
+receive the user's request.** Any agent whose work fits the scope above uses
+it, and the same judgment recurses: the top-level agent may decide to split the user's
 ask into nodes and dispatch them; an agent that receives one of those nodes
 independently judges whether *its* piece should be done directly or split
 further into its own sub-nodes, using this same skill again in its own

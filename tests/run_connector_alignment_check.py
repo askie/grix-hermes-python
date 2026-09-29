@@ -226,6 +226,14 @@ for phrase in ["When to split", "Recursion safety", "层级", "Watchdog"]:
 check("grix-task-flow has trigger", bool(re.search(r"^trigger:\s*\S", TASK_FLOW, re.M)))
 check("grix-task-flow has no camelCase param leakage",
       not [c for c in CAMEL if c in TASK_FLOW])
+TASK_FLOW_FRONTMATTER = TASK_FLOW.split("---", 2)[1]
+check("grix-task-flow description scoped to multi-agent work",
+      "genuinely multi-agent" in TASK_FLOW_FRONTMATTER)
+check("grix-task-flow trigger excludes ordinary Q&A / single-session tasks",
+      "Do not trigger for ordinary Q&A" in TASK_FLOW_FRONTMATTER)
+check("grix-task-flow no longer claims every agent applies it to every task",
+      "every agent applies to every task" not in TASK_FLOW
+      and "Every agent applies it to every task" not in TASK_FLOW)
 
 
 # ── 6. grix-scheduled-trigger covers all four platform schedulers ──────────

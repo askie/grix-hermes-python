@@ -97,10 +97,10 @@ PLUGIN_SKILLS = {
     },
     "grix-task-flow": {
         "description": (
-            "Per-task judgment every agent applies for itself: do a task "
-            "directly or split it into nodes dispatched to other agents, "
-            "tracked by editing one mermaid flowchart message in place. "
-            "Recursive and depth-capped."
+            "Coordinate genuinely multi-agent work: dispatch nodes to other "
+            "agents and track them by editing one mermaid flowchart message "
+            "in place. Skip ordinary Q&A and single-file, single-step, or "
+            "single-session tasks; layer 3+ works directly."
         ),
         "tools": ["grix_invoke"],
     },
