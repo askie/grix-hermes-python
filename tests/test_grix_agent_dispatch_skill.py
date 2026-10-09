@@ -139,7 +139,14 @@ def test_keeps_final_result_as_fallback_instead_of_message_history():
 def test_documents_blocked_intermediate_callback():
     assert "blocked" in DISPATCH
     assert "waiting_approval" in DISPATCH or "等待审批" in DISPATCH
-    assert "keep this session alive" in DISPATCH or "保持本会话" in DISPATCH
+    assert "end the current execution" in DISPATCH
+    assert "completed work" in DISPATCH
+    assert "blocking question/approval" in DISPATCH
+    assert "next steps" in DISPATCH
+    assert "evidence paths" in DISPATCH
+    assert "dispatch_blocked:" in DISPATCH
+    assert "keep this session alive" not in DISPATCH
+    assert "previous `blocked` does not suppress" in DISPATCH
     assert "进入 blocked" in DISPATCH
     assert "when blocked" in DISPATCH
 

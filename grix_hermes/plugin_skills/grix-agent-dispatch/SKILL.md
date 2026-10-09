@@ -136,13 +136,27 @@ Do not omit any of the six.
 
 ### When to call
 
-- On waiting for approval or a question (`blocked`): call once immediately,
-  then **keep this session alive and wait for the user — do not end**; after
-  you reach a terminal state, call once more with `completed` or `failed`.
-- `completed` / `failed`: call once each; after a successful write-back the
-  session may end normally.
-- Do not call again with the same `status`.
-- Do not poll; do not expect the dispatcher to check on you.
+- `blocked` (missing input or approval): save a checkpoint with completed work,
+  the blocking question/approval, next steps, evidence paths and the callback
+  pointer. Set this work session through `grix_invoke(action="chat_state_update", params={...})` to
+  `waiting_question` or `waiting_approval`, with `reason` beginning
+  `dispatch_blocked:` and a concise blocker. If unavailable/rejected, include
+  that error in the checkpoint; do not retry or invent a wire state.
+- Send `blocked` once for this checkpoint, then **end the current execution
+  turn**. Retain the session and recovery context, not a running turn. Never
+  use sleep, polling, heartbeat tools or repeated state queries to keep a
+  blocked turn alive. The owner's later reply resumes from the checkpoint.
+- Current protocol limitation: a terminal event overwrites chat `waiting_*`.
+  The connector closes this explicitly marked blocked turn as canceled/idle
+  rather than successful business completion. Hermes may show a completed
+  execution turn; that is not completion of the dispatched task. Preserve
+  `blocked` in the callback and checkpoint; never claim the task succeeded.
+- After resuming the same task, report its eventual `completed` or `failed`
+  once. A previous `blocked` does not suppress this terminal callback.
+- `completed` / `failed`: report once; the session may then end normally.
+- Deduplicate by task/checkpoint and status: do not resend unchanged blocked
+  evidence or the same terminal result. New owner input may create a new
+  checkpoint. Do not poll or expect the dispatcher to check on you.
 
 ### Implementation (format + send)
 
