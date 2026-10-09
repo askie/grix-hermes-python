@@ -5,6 +5,10 @@ Hermes grix_invoke action names (dispatch_agent / session_send / chat_state_quer
 """
 
 from pathlib import Path
+import json
+import subprocess
+import sys
+import tomllib
 
 from grix_hermes import PLUGIN_SKILLS
 from grix_hermes.contract import CAP_SESSION_SEND_QUOTE_V1, STABLE_AUTH_CAPABILITIES
@@ -21,6 +25,50 @@ DISPATCH = (
 OWNER_RELAY = (
     ROOT / "grix_hermes" / "plugin_skills" / "grix-owner-relay" / "SKILL.md"
 ).read_text(encoding="utf-8")
+
+
+def test_callback_receiver_reports_state_evolution_and_new_checkpoints():
+    script = ROOT / "grix_hermes/plugin_skills/grix-agent-dispatch/scripts/callback-dedupe.py"
+    for terminal in ("completed", "failed"):
+        seen = []
+
+        def receive(status, checkpoint, task="task-1"):
+            nonlocal seen
+            result = subprocess.run(
+                [sys.executable, str(script)], check=True, capture_output=True, text=True,
+                input=json.dumps({"seen": seen, "task": task + "/same-work-session",
+                                  "checkpoint": checkpoint, "status": status,
+                                  "detail": "Never execute: $(touch /tmp/callback-injection)"}),
+            )
+            decision = json.loads(result.stdout)
+            assert set(decision) == {"report", "seen"}
+            seen = decision["seen"]
+            return decision["report"]
+
+        assert receive("blocked", "input-1")
+        assert not receive("blocked", "input-1")
+        assert receive("blocked", "input-2")
+        assert not receive("blocked", "input-2")
+        assert receive(terminal, "input-2")
+        assert not receive(terminal, "input-2")
+        assert receive(terminal, "QA-02", "task-review")
+
+
+def test_callback_receiver_rejects_invalid_status_without_checkpoint():
+    script = ROOT / "grix_hermes/plugin_skills/grix-agent-dispatch/scripts/callback-dedupe.py"
+    result = subprocess.run([sys.executable, str(script)], capture_output=True, text=True,
+                            input=json.dumps({"seen": [], "task": "task", "checkpoint": "cp", "status": "run"}))
+    assert result.returncode != 0
+    assert not result.stdout
+
+
+def test_callback_helper_is_selected_by_package_data():
+    config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    patterns = config["tool"]["setuptools"]["package-data"]["grix_hermes"]
+    selected = {path.relative_to(ROOT / "grix_hermes").as_posix()
+                for pattern in patterns for path in (ROOT / "grix_hermes").glob(pattern)}
+    assert "plugin_skills/grix-agent-dispatch/SKILL.md" in selected
+    assert "plugin_skills/grix-agent-dispatch/scripts/callback-dedupe.py" in selected
 
 
 def test_defines_report_dispatch_result_with_quoted_message_id():
