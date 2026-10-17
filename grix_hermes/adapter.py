@@ -498,8 +498,94 @@ def _toolbar_models_for_provider(models: Iterable[Any], provider: str) -> List[D
     return filtered or all_models
 
 
-def _configured_toolbar_providers(config: Dict[str, Any]) -> Set[str]:
-    """Return provider slugs explicitly present in the active Hermes config."""
+_EXPLICIT_LOGIN_SOURCES = frozenset(
+    {"device_code", "loopback_pkce", "hermes_pkce", "manual"}
+)
+
+
+def _hermes_secret_env(hermes_home: Optional[str] = None) -> Dict[str, str]:
+    """Process env plus the profile ``.env``. File values fill keys the process lacks."""
+    secrets = {key: value for key, value in os.environ.items() if isinstance(value, str)}
+    home = Path(hermes_home or os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+    try:
+        text = (home / ".env").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return secrets
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        name = name.strip()
+        value = value.strip().strip('"').strip("'")
+        if name and value and name not in secrets:
+            secrets[name] = value
+    return secrets
+
+
+def _provider_entry_has_credentials(entry: Any, secrets: Dict[str, str]) -> bool:
+    """True when a ``providers:`` entry has a real key, not just a catalog stub."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("enabled") is False:
+        return False
+    for key in ("api_key", "key", "token", "access_token"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip() and not _looks_like_placeholder_api_key(value):
+            return True
+    for key in ("key_env", "api_key_env"):
+        env_name = str(entry.get(key) or "").strip()
+        if not env_name:
+            continue
+        secret = str(secrets.get(env_name) or "").strip()
+        if secret and not _looks_like_placeholder_api_key(secret):
+            return True
+    return False
+
+
+def _load_profile_auth_store(hermes_home: Optional[str]) -> Dict[str, Any]:
+    home = Path(hermes_home or os.environ.get("HERMES_HOME") or "~/.hermes").expanduser()
+    try:
+        payload = json.loads((home / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError, TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _provider_has_explicit_login(slug: str, hermes_home: Optional[str]) -> bool:
+    """True for a Hermes login (device code / manual key), not an ambient env key."""
+    slug_norm = str(slug or "").strip().lower()
+    if not slug_norm:
+        return False
+    store = _load_profile_auth_store(hermes_home)
+    active = str(store.get("active_provider") or "").strip().lower()
+    if active and active == slug_norm:
+        return True
+    pool = store.get("credential_pool")
+    entries: Any = None
+    if isinstance(pool, dict):
+        for key, value in pool.items():
+            if str(key).strip().lower() == slug_norm:
+                entries = value
+                break
+    if isinstance(entries, dict):
+        entries = [entries]
+    if not isinstance(entries, list):
+        return False
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        source = str(entry.get("source") or "").strip().lower()
+        if source in _EXPLICIT_LOGIN_SOURCES or source.startswith("manual:"):
+            return True
+    return False
+
+
+def _configured_toolbar_providers(
+    config: Dict[str, Any],
+    hermes_home: Optional[str] = None,
+) -> Set[str]:
+    """Provider slugs the user configured: credentialed entries, custom endpoints, active model."""
     configured: Set[str] = set()
     raw_model = config.get("model")
     if isinstance(raw_model, dict):
@@ -507,16 +593,24 @@ def _configured_toolbar_providers(config: Dict[str, Any]) -> Set[str]:
         if provider:
             configured.add(provider)
 
-    for section_name in ("providers", "custom_providers"):
-        section = config.get(section_name)
-        if not isinstance(section, dict):
-            continue
-        for raw_slug in section:
+    secrets = _hermes_secret_env(hermes_home)
+    providers = config.get("providers")
+    if isinstance(providers, dict):
+        for raw_slug, raw_provider in providers.items():
             slug = str(raw_slug or "").strip()
-            if not slug:
+            if slug and _provider_entry_has_credentials(raw_provider, secrets):
+                configured.add(slug)
+
+    custom = config.get("custom_providers")
+    if isinstance(custom, dict):
+        for raw_slug, raw_provider in custom.items():
+            slug = str(raw_slug or "").strip()
+            if not slug or not isinstance(raw_provider, dict):
+                continue
+            if raw_provider.get("enabled") is False:
                 continue
             configured.add(slug)
-            if section_name == "custom_providers" and not slug.startswith("custom:"):
+            if not slug.startswith("custom:"):
                 configured.add(f"custom:{slug}")
     return configured
 
@@ -567,14 +661,18 @@ def _configured_toolbar_fallback_models(
     config: Dict[str, Any],
     configured_model: str,
     configured_provider: str,
+    hermes_home: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     entries = _fallback_toolbar_models(configured_model, configured_provider)
     seen = {
         (str(entry.get("provider") or ""), str(entry.get("id") or ""))
         for entry in entries
     }
+    configured = _configured_toolbar_providers(config, hermes_home)
     for model_id, provider_slug, provider_label in _configured_toolbar_model_entries(config):
         model_id = str(model_id or "").strip()
+        if provider_slug not in configured:
+            continue
         key = (provider_slug, model_id)
         if not model_id or key in seen:
             continue
@@ -599,11 +697,12 @@ def resolve_toolbar_available_models(
     config = _load_hermes_config(hermes_home)
     configured_model = resolve_configured_model(hermes_home)
     configured_provider = resolve_configured_provider(hermes_home)
-    configured_providers = _configured_toolbar_providers(config)
+    configured_providers = _configured_toolbar_providers(config, hermes_home)
     fallback_models = _configured_toolbar_fallback_models(
         config,
         configured_model,
         configured_provider,
+        hermes_home,
     )
 
     try:
@@ -629,27 +728,20 @@ def resolve_toolbar_available_models(
     if not isinstance(rows, list):
         return fallback_models
 
-    # Providers signed in through `hermes auth add` (built-in slugs such as
-    # opencode-go) never appear in config.yaml sections; asking Hermes whether
-    # the slug is explicitly configured keeps them switchable from the toolbar
-    # without shadowing the built-in provider definition via `providers:`.
+    # `hermes auth` logins (device code / a pasted key) are configured even when
+    # they never land in config.yaml. Ambient env keys are not: those providers
+    # show up only after the user writes them into this profile.
     configured_providers = set(configured_providers)
-    try:
-        from hermes_cli.auth import is_provider_explicitly_configured
-    except Exception:
-        is_provider_explicitly_configured = None
-    if is_provider_explicitly_configured is not None:
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            slug = str(row.get("slug") or row.get("id") or row.get("provider") or "").strip()
-            if not slug or slug in configured_providers:
-                continue
-            try:
-                if is_provider_explicitly_configured(slug):
-                    configured_providers.add(slug)
-            except Exception:
-                continue
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        slug = str(row.get("slug") or row.get("id") or row.get("provider") or "").strip()
+        if not slug or slug in configured_providers:
+            continue
+        if row.get("authenticated") is False or str(row.get("source") or "") == "canonical":
+            continue
+        if _provider_has_explicit_login(slug, hermes_home):
+            configured_providers.add(slug)
 
     entries: List[Dict[str, Any]] = []
     seen: Set[Tuple[str, str]] = set()
@@ -689,6 +781,8 @@ def resolve_toolbar_available_models(
     if configured_model and (configured_provider, configured_model) not in seen:
         add_entry(configured_model, configured_provider, "")
     for model_id, provider_slug, provider_label in _configured_toolbar_model_entries(config):
+        if provider_slug not in configured_providers:
+            continue
         add_entry(model_id, provider_slug, provider_label)
 
     entries.sort(

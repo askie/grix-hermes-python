@@ -420,8 +420,12 @@ def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkey
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "model:\n  default: deepseek-v4-flash\n  provider: opencode-go\n"
-        "providers:\n  deepseek-api:\n    default_model: deepseek-v4-flash\n"
-        "  nvidia:\n    name: NVIDIA\n    default_model: openai/gpt-oss-120b\n",
+        "providers:\n  deepseek-api:\n    api_key: sk-deepseek\n"
+        "    default_model: deepseek-v4-flash\n"
+        "  nvidia:\n    name: NVIDIA\n    api_key: sk-nvidia\n"
+        "    default_model: openai/gpt-oss-120b\n"
+        "  zai:\n    name: Z.AI\n    key_env: ZAI_API_KEY\n"
+        "    default_model: glm-5\n",
         encoding="utf-8",
     )
     hermes_pkg = types.ModuleType("hermes_cli")
@@ -433,7 +437,7 @@ def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkey
             "provider": "opencode-go",
             "model": "deepseek-v4-flash",
             "providers": [
-                {"slug": "zai", "name": "Z.AI", "models": ["glm-5"]},
+                {"slug": "zai", "name": "Z.AI", "models": ["glm-5"], "authenticated": True},
                 {
                     "slug": "deepseek-api",
                     "name": "DeepSeek API",
@@ -444,6 +448,13 @@ def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkey
                     "name": "OpenCode Go",
                     "models": ["deepseek-v4-pro", "deepseek-v4-flash"],
                 },
+                {
+                    "slug": "openrouter",
+                    "name": "OpenRouter",
+                    "source": "canonical",
+                    "authenticated": False,
+                    "models": ["openai/gpt-4"],
+                },
             ],
         }
 
@@ -451,6 +462,7 @@ def test_resolve_toolbar_available_models_uses_hermes_inventory(tmp_path, monkey
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_pkg)
     monkeypatch.setitem(sys.modules, "hermes_cli.inventory", inventory)
 
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
     models = adapter_mod.resolve_toolbar_available_models(str(tmp_path))
 
     assert models == [
@@ -489,7 +501,14 @@ def test_resolve_toolbar_models_includes_auth_store_providers(tmp_path, monkeypa
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         "model:\n  default: deepseek-v4-flash\n  provider: grix\n"
-        "providers:\n  grix:\n    default_model: deepseek-v4-flash\n",
+        "providers:\n  grix:\n    api_key: sk-grix\n    default_model: deepseek-v4-flash\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "auth.json").write_text(
+        '{"active_provider": "openai-codex", "credential_pool": {'
+        '"opencode-go": [{"source": "manual"}],'
+        '"opencode-free": [{"source": "env:OPENCODE_FREE_API_KEY"}]'
+        "}}",
         encoding="utf-8",
     )
     hermes_pkg = types.ModuleType("hermes_cli")
@@ -500,18 +519,17 @@ def test_resolve_toolbar_models_includes_auth_store_providers(tmp_path, monkeypa
             {"slug": "grix", "name": "Grix", "models": ["deepseek-v4-flash"]},
             {"slug": "opencode-go", "name": "OpenCode Go", "models": ["kimi-k3"]},
             {"slug": "opencode-free", "name": "OpenCode Free", "models": ["hy3-free"]},
+            {"slug": "openai-codex", "name": "ChatGPT", "models": ["gpt-5"]},
         ],
     }
-    auth = types.ModuleType("hermes_cli.auth")
-    auth.is_provider_explicitly_configured = lambda slug: slug == "opencode-go"
     monkeypatch.setitem(sys.modules, "hermes_cli", hermes_pkg)
     monkeypatch.setitem(sys.modules, "hermes_cli.inventory", inventory)
-    monkeypatch.setitem(sys.modules, "hermes_cli.auth", auth)
 
     models = adapter_mod.resolve_toolbar_available_models(str(tmp_path))
 
     assert [(m["id"], m["provider"]) for m in models] == [
         ("kimi-k3", "opencode-go"),
+        ("gpt-5", "openai-codex"),
         ("deepseek-v4-flash", "grix"),
     ]
 
@@ -551,8 +569,9 @@ def test_resolve_toolbar_models_uses_configured_defaults_when_inventory_fails(
 ):
     (tmp_path / "config.yaml").write_text(
         "model:\n  default: deepseek-v4-flash\n  provider: opencode-go\n"
-        "providers:\n  nvidia:\n    name: NVIDIA\n"
-        "    default_model: openai/gpt-oss-120b\n",
+        "providers:\n  nvidia:\n    name: NVIDIA\n    api_key: sk-nvidia\n"
+        "    default_model: openai/gpt-oss-120b\n"
+        "  empty:\n    name: Empty\n    default_model: missing-model\n",
         encoding="utf-8",
     )
     hermes_pkg = types.ModuleType("hermes_cli")
