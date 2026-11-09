@@ -231,7 +231,7 @@ _CURRENT_REPLY_SESSION_KEY: ContextVar[Optional[str]] = ContextVar(
     "grix_hermes_current_reply_session_key", default=None
 )
 
-_ROUTE_SESSION_KEY_PREFIX = "agent:main:grix:"
+_ROUTE_SESSION_KEY_PREFIX = "agent:"
 _EVENT_DEDUP_WINDOW_SECONDS = 300
 _EVENT_DEDUP_MAX_SIZE = 1000
 
@@ -1182,9 +1182,14 @@ def _lookup_grix_session_origin(session_key: str) -> Optional[Dict[str, Optional
     return {"chat_id": chat_id, "thread_id": thread_id}
 
 
+def _is_route_session_key(value: str) -> bool:
+    parts = str(value or "").strip().split(":")
+    return len(parts) >= 5 and parts[0] == "agent" and parts[2] == _PLATFORM_VALUE
+
+
 def _parse_route_session_key(value: str) -> Optional[Dict[str, Optional[str]]]:
     parts = str(value or "").strip().split(":")
-    if len(parts) < 5 or parts[:3] != ["agent", "main", "grix"]:
+    if len(parts) < 5 or parts[0] != "agent" or parts[2] != _PLATFORM_VALUE:
         return None
 
     chat_type = parts[3]
@@ -1223,7 +1228,7 @@ async def resolve_grix_target(
         if hinted_thread_id:
             resolved_thread_id = hinted_thread_id
 
-    if raw_target.startswith(_ROUTE_SESSION_KEY_PREFIX):
+    if _is_route_session_key(raw_target) or raw_target.startswith(_ROUTE_SESSION_KEY_PREFIX):
         if source_hint is None:
             persisted_source_hint = _lookup_grix_session_origin(raw_target)
             if persisted_source_hint is not None:
@@ -1521,6 +1526,31 @@ class GrixAdapter(BasePlatformAdapter):
 
     def _active_state(self) -> _OwnerState:
         return self._state_for(self._active_owner_key())
+
+    def _source_session_key(self, source: Any) -> str:
+        """Adapter-level session key for ``source``, profile-namespaced like the agent run."""
+        try:
+            return super()._source_session_key(source)
+        except (AttributeError, TypeError):
+            pass
+        canonicalize = getattr(self, "_canonicalize", None)
+        if callable(canonicalize):
+            canonicalize(source)
+        extra = getattr(self.config, "extra", {}) or {}
+        profile_fn = getattr(self, "_session_key_profile", None)
+        profile = (
+            profile_fn(source)
+            if callable(profile_fn)
+            else getattr(self, "_owner_profile", None)
+        )
+        if not profile:
+            profile = getattr(source, "profile", None)
+        return build_session_key(
+            source,
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+            profile=profile,
+        )
 
     def _clean_stale_streaming_previews(self, state: _OwnerState) -> None:
         """清理超时的流式 preview buffer，避免跨轮次/崩溃后残留导致误发。"""
@@ -3077,11 +3107,7 @@ class GrixAdapter(BasePlatformAdapter):
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
         if raw_message.get("_grix_kind") not in ("message", "card_action"):
             return
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._source_session_key(event.source)
         state = self._active_state()
         owner_key = self._active_owner_key()
         prior_toolbar = state.toolbar_active_work.get(session_key)
@@ -3229,11 +3255,7 @@ class GrixAdapter(BasePlatformAdapter):
         raw_message = event.raw_message if isinstance(event.raw_message, dict) else {}
         if raw_message.get("_grix_kind") not in ("message", "card_action"):
             return
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._source_session_key(event.source)
         # 认领本轮任务要收口的事件：触发事件本身 + 排队消费时移交给本轮的事件
         # （next_run，含被合并后 event_id 丢失的排队消息）。不抓取其他 open
         # 事件——它们可能属于未来轮次（刚入队/防抖中），提前认领会提前收口。
@@ -5424,11 +5446,7 @@ class GrixAdapter(BasePlatformAdapter):
             thread_id=message.thread_id,
             chat_topic=message.chat_topic,
         )
-        session_key = build_session_key(
-            source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._source_session_key(source)
         prev_session_key = self._active_state().user_dm_session_keys.get(str(message.sender_id or "")) if message.chat_type == "dm" and message.sender_id else None
         prev_session_id = self._active_state().user_dm_session_ids.get(str(message.sender_id or "")) if message.chat_type == "dm" and message.sender_id else None
         self._active_state().latest_sources[message.session_id] = source
@@ -5805,11 +5823,7 @@ class GrixAdapter(BasePlatformAdapter):
         if not session_key:
             source = self._active_state().latest_sources.get(edit.session_id)
             if source:
-                session_key = build_session_key(
-                    source,
-                    group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-                    thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-                )
+                session_key = self._source_session_key(source)
 
         # 排队中（尚未运行）的消息被编辑：文本冻结在 QueueItem.payload 的
         # 入站消息里，就地替换，轮到它执行时用的就是编辑后的内容。
@@ -5952,11 +5966,7 @@ class GrixAdapter(BasePlatformAdapter):
         source = self._active_state().message_sources.get((revoke.session_id, revoke.message_id))
         session_key = self._active_state().message_session_keys.get((revoke.session_id, revoke.message_id))
         if not session_key and source is not None:
-            session_key = build_session_key(
-                source,
-                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            )
+            session_key = self._source_session_key(source)
 
         if self._client:
             await self._active_client().acknowledge_event(
@@ -7108,11 +7118,7 @@ class GrixAdapter(BasePlatformAdapter):
             _r_message, source, session_key = running_item.payload
         else:
             source = self._resolve_stop_source(stop)
-            session_key = build_session_key(
-                source,
-                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            )
+            session_key = self._source_session_key(source)
         logger.info(
             "[%s] GRIX event_stop received event_id=%s stop_id=%s session_id=%s session_key=%s "
             "trigger_msg_id=%s stream_msg_id=%s reason=%s active_sessions=%s",
@@ -7354,15 +7360,7 @@ class GrixAdapter(BasePlatformAdapter):
         for key in active_keys or []:
             _add(key)
         try:
-            built = build_session_key(
-                source,
-                group_sessions_per_user=self.config.extra.get(
-                    "group_sessions_per_user", True
-                ),
-                thread_sessions_per_user=self.config.extra.get(
-                    "thread_sessions_per_user", False
-                ),
-            )
+            built = self._source_session_key(source)
         except Exception:
             built = ""
         _add(built)
